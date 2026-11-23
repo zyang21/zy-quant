@@ -342,9 +342,19 @@
   <div class="two-col">
     <div class="card">
       <div class="section-hdr">
-        <h2>Step 3 & 4 · Active Positions & Server-Side Protective Stops</h2>
-        <span style="font-size:12px;color:var(--muted);">Reconciled with SQLite WAL & FutuOpenD</span>
+        <h2>Step 3 & 4 · Live / Paper Runtime Performance & Positions</h2>
+        <span style="font-size:12px;color:var(--muted);">Real-Time Futu Quotes + SQLite WAL Ledger</span>
       </div>
+      <div class="kpi-strip">
+        <div class="kpi-box"><div class="k">Live Net Return</div><div class="v" id="liveReturn">—</div></div>
+        <div class="kpi-box"><div class="k">Live Gross PnL</div><div class="v" id="liveGross">—</div></div>
+        <div class="kpi-box"><div class="k">Futu Fees+Slip</div><div class="v neg" id="liveFees">—</div></div>
+        <div class="kpi-box"><div class="k">Closed / Win%</div><div class="v" id="liveWin">—</div></div>
+        <div class="kpi-box"><div class="k">Live Max DD</div><div class="v" id="liveDD">—</div></div>
+      </div>
+      <svg id="liveEquitySvg" class="chart" style="height:120px;margin-bottom:12px;" viewBox="0 0 600 120" preserveAspectRatio="none"></svg>
+
+      <div style="font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px;">Open Positions</div>
       <table>
         <thead>
           <tr>
@@ -361,6 +371,24 @@
         </thead>
         <tbody id="posBody"></tbody>
       </table>
+
+      <div style="font-size:12px;font-weight:600;color:var(--muted);margin:14px 0 6px;">Closed Live / Paper Trades</div>
+      <div style="max-height:170px;overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th>Sym</th>
+              <th>Setup</th>
+              <th class="num">Qty</th>
+              <th class="num">Entry → Exit</th>
+              <th class="num">Fee</th>
+              <th class="num">Net PnL</th>
+              <th>Exit Model</th>
+            </tr>
+          </thead>
+          <tbody id="liveClosedBody"></tbody>
+        </table>
+      </div>
     </div>
 
     <div class="card">
@@ -466,7 +494,34 @@
 
       renderWatchlist(data.watchlist || []);
       renderPositions(data.positions || []);
+      renderLivePerformance(sp, data.closed_trades || []);
       renderEvents(data.events || []);
+    }
+
+    function renderLivePerformance(sp, closedTrades) {
+      const retPct = Number(sp.net_return_pct || 0);
+      const retEl = document.getElementById('liveReturn');
+      retEl.textContent = `${retPct >= 0 ? '+' : ''}${retPct.toFixed(2)}%`;
+      retEl.className = `v ${retPct >= 0 ? 'pos' : 'neg'}`;
+      const gross = Number(sp.gross_pnl_usd || 0);
+      document.getElementById('liveGross').textContent = `${gross >= 0 ? '+' : ''}$${gross.toFixed(2)}`;
+      document.getElementById('liveFees').textContent = `-$${Number(sp.total_fees_usd || 0).toFixed(2)}`;
+      document.getElementById('liveWin').textContent =
+        `${sp.total_closed_trades || 0} / ${Number(sp.win_rate_pct || 0).toFixed(0)}%`;
+      document.getElementById('liveDD').textContent = `-${Number(sp.max_drawdown_pct || 0).toFixed(2)}%`;
+
+      drawCurveOn('liveEquitySvg', sp.equity_curve || [], sp.starting_equity_usd || 10000, 120);
+
+      const tb = document.getElementById('liveClosedBody');
+      tb.innerHTML = closedTrades.map(t => `<tr>
+        <td><strong>${t.symbol}</strong></td>
+        <td>${t.setup === 'VWAP_PULLBACK' ? 'VWAP' : t.setup}</td>
+        <td class="num">${t.shares}</td>
+        <td class="num">$${Number(t.entry_price).toFixed(2)} → $${Number(t.exit_price).toFixed(2)}</td>
+        <td class="num neg">-$${Number(t.fee_usd).toFixed(2)}</td>
+        <td class="num ${t.net_pnl_usd >= 0 ? 'pos' : 'neg'}">${t.net_pnl_usd >= 0 ? '+' : ''}$${Number(t.net_pnl_usd).toFixed(2)} (${Number(t.r_multiple).toFixed(2)}R)</td>
+        <td style="font-size:11px;color:var(--muted)">${t.exit_reason}</td>
+      </tr>`).join('') || `<tr><td colspan="7" style="text-align:center;color:var(--muted);padding:12px;">No closed runtime trades yet.</td></tr>`;
     }
 
     function renderWatchlist(rows) {
@@ -629,13 +684,18 @@
     }
 
     function drawCurve(points, baseEq) {
-      const svg = document.getElementById('equitySvg');
+      drawCurveOn('equitySvg', points, baseEq, 180);
+    }
+
+    function drawCurveOn(svgId, points, baseEq, H) {
+      const svg = document.getElementById(svgId);
+      if (!svg) return;
       if (!points.length) { svg.innerHTML = ''; return; }
       const vals = points.map(p => p.equity_usd);
       const minV = Math.min(baseEq, ...vals) * 0.998;
       const maxV = Math.max(baseEq, ...vals) * 1.002;
       const span = Math.max(1e-6, maxV - minV);
-      const W = 600, H = 180;
+      const W = 600;
       const coords = points.map((p, i) => {
         const x = (i / Math.max(1, points.length - 1)) * (W - 20) + 10;
         const y = H - 14 - ((p.equity_usd - minV) / span) * (H - 28);

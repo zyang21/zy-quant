@@ -5,7 +5,7 @@ import os
 import socket
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from zy_quant.gateway.base import BrokerExecutionAdapter, MarketDataAdapter
@@ -55,7 +55,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._futu_mod: Any = None
         self._rpc_lock = threading.RLock()
         self._cap_dist_supported: bool = True
-        self._kline_cache: Dict[tuple[str, str], tuple[float, List[Bar]]] = {}
+        self._kline_cache: Dict[tuple[str, str, int], tuple[float, List[Bar]]] = {}
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def reconfigure(
@@ -176,7 +176,10 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     # --- Market Data ---
     def get_bars(self, symbol: str, timeframe: str = "15m", days: int = 30) -> List[Bar]:
         if self.is_connected() and not symbol.startswith("^"):
-            cache_key = (symbol, timeframe)
+            # Convert trading days to calendar days so `start` always anchors near the window
+            # and pages right up to today's latest real-time candle!
+            cal_days = max(8, int(days * 1.6) + 4) if timeframe == "15m" else max(45, int(days * 1.6) + 10)
+            cache_key = (symbol, timeframe, cal_days)
             now_mono = time.monotonic()
             cached = self._kline_cache.get(cache_key)
             if cached and (now_mono - cached[0]) < 45.0:
@@ -185,27 +188,38 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             ft = self._futu_mod
             ktype = ft.KLType.K_15M if timeframe == "15m" else ft.KLType.K_DAY
             code = to_futu_us_code(symbol)
-            max_cnt = min(500, days * 28) if timeframe == "15m" else max(30, days)
+            start_date = (datetime.now(timezone.utc) - timedelta(days=cal_days)).strftime("%Y-%m-%d")
+
+            frames = []
+            page_key = None
             with self._rpc_lock:
-                ret, df, _ = self._quote_ctx.request_history_kline(
-                    code, ktype=ktype, max_count=max_cnt
-                )
-            if ret == ft.RET_OK and df is not None and not df.empty:
-                out: List[Bar] = []
-                for _, row in df.iterrows():
-                    ts_str = str(row["time_key"]).replace(" ", "T")
-                    ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
-                    out.append(
-                        Bar(
-                            symbol=symbol,
-                            timestamp=ts,
-                            open=float(row["open"]),
-                            high=float(row["high"]),
-                            low=float(row["low"]),
-                            close=float(row["close"]),
-                            volume=float(row["volume"]),
-                        )
+                for _ in range(4):
+                    ret, df, page_key = self._quote_ctx.request_history_kline(
+                        code, start=start_date, ktype=ktype, max_count=1000, page_req_key=page_key
                     )
+                    if ret != ft.RET_OK or df is None or df.empty:
+                        break
+                    frames.append(df)
+                    if page_key is None:
+                        break
+
+            if frames:
+                out: List[Bar] = []
+                for frame in frames:
+                    for _, row in frame.iterrows():
+                        ts_str = str(row["time_key"]).replace(" ", "T")
+                        ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+                        out.append(
+                            Bar(
+                                symbol=symbol,
+                                timestamp=ts,
+                                open=float(row["open"]),
+                                high=float(row["high"]),
+                                low=float(row["low"]),
+                                close=float(row["close"]),
+                                volume=float(row["volume"]),
+                            )
+                        )
                 self._kline_cache[cache_key] = (now_mono, out)
                 return out
         return self.fallback.get_bars(symbol, timeframe=timeframe, days=days)

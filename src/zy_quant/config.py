@@ -94,6 +94,7 @@ class RegimeConfig(BaseModel):
     vix_red_threshold: float = 30.0
     sharp_intraday_drop_pct: float = -0.012
     green_scan_interval_minutes: int = 15
+    yellow_watchlist_interval_minutes: int = 45
     rest_watchlist_interval_minutes: int = 120
 
 

@@ -134,7 +134,7 @@ class MarketRegimeDetector:
             spy_price=spy_px,
             spy_sma20=spy_sma20,
             vix_level=vix_level,
-            recommended_scan_minutes=self.cfg.rest_watchlist_interval_minutes,
-            reason="Mixed index regime (QQQ split between VWAP/SMA20 or elevated VIX) -> Hold stops, 2h watchlist scan",
+            recommended_scan_minutes=self.cfg.yellow_watchlist_interval_minutes,
+            reason="Mixed index regime (QQQ split between VWAP/SMA20 or elevated VIX) -> Hold stops (3m), 45m watchlist scan",
             evaluated_at=now,
         )

@@ -9,8 +9,9 @@ regime:
   vix_yellow_threshold: 24.0           # Caution regime
   vix_red_threshold: 30.0              # Panic regime -> lock all new buys
   sharp_intraday_drop_pct: -0.012      # QQQ intraday drop <= -1.2% -> RED light
-  green_scan_interval_minutes: 15      # Active trading scan every 15 minutes
-  rest_watchlist_interval_minutes: 120 # On RED/YELLOW empty-position days: refresh RS & watchlist every 2 hours (0 orders)
+  green_scan_interval_minutes: 15      # GREEN: Active trading & watchlist scan every 15 minutes
+  yellow_watchlist_interval_minutes: 45 # YELLOW (consolidation): Watchlist refresh every 45m (regime/stops still checked every 3m)
+  rest_watchlist_interval_minutes: 120 # RED (bear/panic): Watchlist RS refresh every 2 hours (0 orders)
 
 # Step 3: 15-Minute Entry Setups (Triggered ONLY when Regime == GREEN)
 entry:

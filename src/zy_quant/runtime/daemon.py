@@ -167,13 +167,8 @@ class TradingDaemon:
         open_positions = self.store.get_positions()
 
         # Decide whether watchlist refresh is due:
-        # - GREEN: refresh every cycle (15m)
-        # - RED/YELLOW: refresh every `rest_watchlist_interval_minutes` (2 hours = 120m) to capture RS leaders!
-        watchlist_interval = (
-            timedelta(minutes=self.settings.strategy_cfg.regime.green_scan_interval_minutes)
-            if regime.light == RegimeLight.GREEN
-            else timedelta(minutes=self.settings.strategy_cfg.regime.rest_watchlist_interval_minutes)
-        )
+        # - GREEN: 15m | YELLOW: 45m | RED: 120m (2 hours)
+        watchlist_interval = timedelta(minutes=regime.recommended_scan_minutes)
         watchlist_refreshed = False
         if (
             self._last_watchlist_scan_at is None
