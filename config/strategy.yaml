@@ -1,0 +1,57 @@
+# 4-Step Strategy, Regime Cadence, and Scientific Exit Formulas
+
+# Step 1: Market Regime Traffic Light (SPY / QQQ + VIX)
+regime:
+  primary_benchmark: "QQQ"
+  secondary_benchmark: "SPY"
+  volatility_symbol: "^VIX"
+  daily_sma_period: 20
+  vix_yellow_threshold: 24.0           # Caution regime
+  vix_red_threshold: 30.0              # Panic regime -> lock all new buys
+  sharp_intraday_drop_pct: -0.012      # QQQ intraday drop <= -1.2% -> RED light
+  green_scan_interval_minutes: 15      # Active trading scan every 15 minutes
+  rest_watchlist_interval_minutes: 120 # On RED/YELLOW empty-position days: refresh RS & watchlist every 2 hours (0 orders)
+
+# Step 3: 15-Minute Entry Setups (Triggered ONLY when Regime == GREEN)
+entry:
+  bar_timeframe: "15m"
+  atr_period: 14
+  ema_fast_period: 9
+  ema_trend_period: 21
+
+  vwap_pullback:
+    enabled: true
+    min_morning_rvol: 1.5              # Prior impulse relative volume >= 1.5x
+    max_pullback_rvol: 1.1             # Pullback volume contraction
+    vwap_touch_band_atr: 0.35          # Low tests within 0.35 * ATR of session VWAP and closes above VWAP
+
+  opening_range_breakout:
+    enabled: true
+    orb_minutes: 30                    # First two 15m bars (09:30 - 10:00 ET) define Opening Range
+    min_breakout_rvol: 1.8             # Breakout candle RVOL >= 1.8x
+    require_positive_big_order_flow: true
+
+# Step 4: Scientific Exit & Expectancy Math
+exit_models:
+  # 1. Wilder ATR Initial Stop: S_init = P_entry - k_sl * ATR_14
+  atr_stop_multiplier: 1.8
+  max_hard_stop_pct: 0.035             # Absolute safety cap (never risk > 3.5% price move on a single stock)
+
+  # 2. Breakeven Ratchet + Chandelier Exit: S_trail(t) = H_max - k_trail * ATR_14(t)
+  breakeven_trigger_r: 1.5             # At +1.5R unrealized gain, lift stop to Entry + RoundTripFee + buffer
+  chandelier_atr_multiplier: 2.8       # Hang Chandelier 2.8 * ATR below highest high since entry
+
+  # 3. Triple-Barrier Time Stop (Marcos Lopez de Prado)
+  time_stop_bars_15m: 16               # 16 x 15m bars (~4 trading hours)
+  time_stop_min_progress_r: 0.30       # Exit stagnant trades if unrealized < +0.30R after 16 bars
+
+  # 4. Positive Mathematical Expectancy Gate: E = p*R - (1-p)*1 - Fee/Risk_USD > min_expectancy_r
+  assumed_base_win_rate: 0.48
+  expected_reward_atr_multiple: 4.2    # Typical multi-bar swing potential measured in 15m ATRs
+  min_expectancy_r: 0.25               # Reject trade if fee-adjusted mathematical expectancy < +0.25R
+
+# Operational Daemon & Safety Watchdogs
+daemon:
+  heartbeat_timeout_seconds: 30
+  max_orders_per_minute: 3             # Anti-runaway loop circuit breaker
+  place_server_side_stop: true         # Submit native protective STOP order to Futu server immediately upon fill

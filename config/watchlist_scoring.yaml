@@ -1,0 +1,105 @@
+# Conservative Institutional & ETF-Anchored Watchlist Scoring Configuration
+# Total weights = 1.00, with 65% anchored on conservative ETF / Institutional / Stability pillars.
+
+hard_filters:
+  min_price_usd: 50.0                  # Avoid low-priced stocks where Futu per-share ($0.0129/sh) fees explode
+  min_avg_daily_dollar_vol: 500000000  # >= $500M daily dollar volume -> ultra-tight 1-2 cent spreads
+  min_institutional_pct: 0.55          # >= 55% institutional ownership required (anti-junk / anti-meme)
+  earnings_blackout_days: 2            # Block entries within +-2 trading days of earnings release
+  max_spread_bps: 8.0                  # Block live entry if real-time bid-ask spread > 8 bps
+
+weights:
+  etf_core_weight: 0.30                # Weight in core index/sector ETFs (SPY, QQQ, XLK, SMH, XLV, XLF)
+  institutional_ownership: 0.20        # SEC 13F aggregate institutional ownership stability score
+  low_drawdown_stability: 0.15         # Low beta + Red-Day Relative Strength (RS vs QQQ when market rests)
+  realtime_big_order_flow: 0.20        # Futu get_capital_distribution() Super-Large + Large net inflow ratio
+  insider_form4_catalyst: 0.15         # SEC EDGAR Form 4 C-suite open-market cash buys (last 14 days)
+
+scoring_thresholds:
+  min_watch_score: 62.0                # Minimum composite score (0-100) to enter active candidate pool
+  top_n_active: 8                      # Only subscribe 15m real-time bars/flow on top N candidates (saves Futu quota)
+  red_day_rs_bonus_cap: 15.0           # Extra bonus within stability bucket for stocks green while QQQ is red
+
+# Pre-vetted liquid US Institutional / ETF Core Universe (all typically >$50 & >$500M ADV)
+# etf_weight_score reflects normalized presence across SPY / QQQ / Sector flagship ETFs (0.0 - 1.0)
+universe:
+  - symbol: "AAPL"
+    sector: "Technology"
+    cik: "0000320193"
+    etf_core_score: 0.98
+    baseline_inst_pct: 0.62
+  - symbol: "MSFT"
+    sector: "Technology"
+    cik: "0000789019"
+    etf_core_score: 0.99
+    baseline_inst_pct: 0.73
+  - symbol: "NVDA"
+    sector: "Semiconductors"
+    cik: "0001045810"
+    etf_core_score: 0.98
+    baseline_inst_pct: 0.67
+  - symbol: "AMZN"
+    sector: "Consumer"
+    cik: "0001018724"
+    etf_core_score: 0.94
+    baseline_inst_pct: 0.64
+  - symbol: "META"
+    sector: "Communication"
+    cik: "0001326801"
+    etf_core_score: 0.92
+    baseline_inst_pct: 0.79
+  - symbol: "GOOGL"
+    sector: "Communication"
+    cik: "0001652044"
+    etf_core_score: 0.93
+    baseline_inst_pct: 0.81
+  - symbol: "AVGO"
+    sector: "Semiconductors"
+    cik: "0001730168"
+    etf_core_score: 0.91
+    baseline_inst_pct: 0.78
+  - symbol: "LLY"
+    sector: "Healthcare"
+    cik: "0000059478"
+    etf_core_score: 0.89
+    baseline_inst_pct: 0.82
+  - symbol: "JPM"
+    sector: "Financials"
+    cik: "0000019617"
+    etf_core_score: 0.88
+    baseline_inst_pct: 0.72
+  - symbol: "COST"
+    sector: "Consumer"
+    cik: "0000909832"
+    etf_core_score: 0.87
+    baseline_inst_pct: 0.69
+  - symbol: "V"
+    sector: "Financials"
+    cik: "0001403161"
+    etf_core_score: 0.86
+    baseline_inst_pct: 0.79
+  - symbol: "UNH"
+    sector: "Healthcare"
+    cik: "0000731766"
+    etf_core_score: 0.85
+    baseline_inst_pct: 0.88
+  - symbol: "AMAT"
+    sector: "Semiconductors"
+    cik: "0000006951"
+    etf_core_score: 0.82
+    baseline_inst_pct: 0.81
+  - symbol: "CAT"
+    sector: "Industrials"
+    cik: "0000018230"
+    etf_core_score: 0.80
+    baseline_inst_pct: 0.71
+  - symbol: "QQQ"
+    sector: "Broad_ETF"
+    cik: "0001067839"
+    etf_core_score: 1.00
+    baseline_inst_pct: 0.75
+  - symbol: "SPY"
+    sector: "Broad_ETF"
+    cik: "0000884394"
+    etf_core_score: 1.00
+    baseline_inst_pct: 0.78

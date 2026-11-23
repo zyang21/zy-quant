@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "zy-quant"
+version = "0.1.0"
+description = "Resilient US Equities Short-Term & Swing Quant Trading System powered by Futu OpenAPI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.30.0",
+    "pydantic>=2.9.0",
+    "pyyaml>=6.0.2",
+    "pandas>=2.2.0",
+    "numpy>=2.0.0",
+    "httpx>=0.27.0",
+    "yfinance>=0.2.50",
+    "futu-api>=9.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.24.0",
+]
+
+[project.scripts]
+zy-quant = "zy_quant.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/zy_quant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_default_fixture_loop_scope = "function"

@@ -1,0 +1,24 @@
+services:
+  zy-quant-daemon:
+    build: .
+    container_name: zy-quant-daemon
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    command: ["zy-quant", "daemon"]
+
+  zy-quant-dashboard:
+    build: .
+    container_name: zy-quant-dashboard
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    command: ["zy-quant", "dashboard", "--host", "0.0.0.0", "--port", "8088"]
