@@ -224,7 +224,8 @@ def trigger_scan(tier_key: str = "tier_1k", check_edgar: bool = False) -> Dict[s
 
 @app.post("/api/backtest")
 def run_backtest(req: BacktestRequest) -> Dict[str, Any]:
-    engine = BacktestEngine(settings, data_adapter)
+    # Use live Futu OpenAPI bars when connected; otherwise fallback adapter
+    engine = BacktestEngine(settings, daemon.gateway)
     result = engine.run(tier_key=req.tier_key, days=max(10, min(58, req.days)))
     _log_event(
         "BACKTEST",

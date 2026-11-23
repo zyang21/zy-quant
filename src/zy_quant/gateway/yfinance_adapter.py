@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 import random
+import socket
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
@@ -12,12 +14,24 @@ from zy_quant.models import Bar, CapitalFlowSnapshot, QuoteSnapshot
 class YahooMarketDataAdapter(MarketDataAdapter):
     """
     Market data adapter using `yfinance` for US 15m & 1d historical/delayed bars,
-    with deterministic synthetic fallback when offline so backtests and CI never fail.
+    with a fast 1.5s circuit-breaker and deterministic synthetic fallback when Yahoo is blocked.
     """
 
     def __init__(self, allow_synthetic_fallback: bool = True) -> None:
         self.allow_synthetic_fallback = allow_synthetic_fallback
         self._bar_cache: Dict[tuple[str, str, int], List[Bar]] = {}
+        self._yahoo_blocked_until: float = 0.0
+
+    def _yahoo_reachable(self) -> bool:
+        now = time.monotonic()
+        if now < self._yahoo_blocked_until:
+            return False
+        try:
+            with socket.create_connection(("query2.finance.yahoo.com", 443), timeout=1.5):
+                return True
+        except OSError:
+            self._yahoo_blocked_until = now + 300.0
+            return False
 
     def get_bars(self, symbol: str, timeframe: str = "15m", days: int = 30) -> List[Bar]:
         cache_key = (symbol, timeframe, days)
@@ -25,30 +39,31 @@ class YahooMarketDataAdapter(MarketDataAdapter):
             return self._bar_cache[cache_key]
 
         bars: List[Bar] = []
-        try:
-            import yfinance as yf
+        if self._yahoo_reachable():
+            try:
+                import yfinance as yf
 
-            interval = "15m" if timeframe == "15m" else "1d"
-            max_days = min(days, 58) if interval == "15m" else max(days, 60)
-            df = yf.Ticker(symbol).history(period=f"{max_days}d", interval=interval, auto_adjust=True)
-            if df is not None and not df.empty:
-                for idx, row in df.iterrows():
-                    ts = idx.to_pydatetime()
-                    if ts.tzinfo is None:
-                        ts = ts.replace(tzinfo=timezone.utc)
-                    bars.append(
-                        Bar(
-                            symbol=symbol,
-                            timestamp=ts,
-                            open=float(row["Open"]),
-                            high=float(row["High"]),
-                            low=float(row["Low"]),
-                            close=float(row["Close"]),
-                            volume=float(row["Volume"]),
+                interval = "15m" if timeframe == "15m" else "1d"
+                max_days = min(days, 58) if interval == "15m" else max(days, 60)
+                df = yf.Ticker(symbol).history(period=f"{max_days}d", interval=interval, auto_adjust=True)
+                if df is not None and not df.empty:
+                    for idx, row in df.iterrows():
+                        ts = idx.to_pydatetime()
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=timezone.utc)
+                        bars.append(
+                            Bar(
+                                symbol=symbol,
+                                timestamp=ts,
+                                open=float(row["Open"]),
+                                high=float(row["High"]),
+                                low=float(row["Low"]),
+                                close=float(row["Close"]),
+                                volume=float(row["Volume"]),
+                            )
                         )
-                    )
-        except Exception:
-            bars = []
+            except Exception:
+                bars = []
 
         if not bars and self.allow_synthetic_fallback:
             bars = self.generate_synthetic_bars(symbol, timeframe=timeframe, days=days)

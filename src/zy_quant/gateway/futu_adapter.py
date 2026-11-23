@@ -268,6 +268,23 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         return self.fallback.get_capital_flow(symbol)
 
     def get_vix_level(self) -> float:
+        if self.is_connected():
+            # Compute annualized 10-day realized volatility of QQQ directly from cached Futu K-lines
+            # so we never block on Yahoo Finance ^VIX when Yahoo is unreachable on local network!
+            qqq_d = self.get_bars("QQQ", timeframe="1d", days=20)
+            if len(qqq_d) >= 11:
+                import math
+
+                rets = [
+                    math.log(qqq_d[i].close / qqq_d[i - 1].close)
+                    for i in range(len(qqq_d) - 10, len(qqq_d))
+                    if qqq_d[i - 1].close > 0
+                ]
+                if len(rets) >= 5:
+                    mean_r = sum(rets) / len(rets)
+                    var_r = sum((r - mean_r) ** 2 for r in rets) / max(1, len(rets) - 1)
+                    hv_annual = math.sqrt(var_r * 252.0) * 100.0
+                    return round(max(11.0, min(80.0, hv_annual * 1.15)), 2)
         return self.fallback.get_vix_level()
 
     # --- Broker Execution ---
