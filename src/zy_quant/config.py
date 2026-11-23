@@ -5,11 +5,14 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 
 
 def default_project_root() -> Path:
-    return Path(__file__).resolve().parents[2]
+    root = Path(__file__).resolve().parents[2]
+    load_dotenv(root / ".env", override=False)
+    return root
 
 
 class TierProfile(BaseModel):

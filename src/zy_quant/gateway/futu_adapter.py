@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -38,24 +39,27 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         host: Optional[str] = None,
         port: Optional[int] = None,
         trd_env: Optional[str] = None,
+        api_token: Optional[str] = None,
         fallback_data: Optional[YahooMarketDataAdapter] = None,
     ) -> None:
         self.host = host or os.getenv("ZY_FUTU_HOST", "127.0.0.1")
         self.port = int(port or os.getenv("ZY_FUTU_PORT", "11111"))
         self.trd_env_name = (trd_env or os.getenv("ZY_TRD_ENV", "SIMULATE")).upper()
+        self.api_token = api_token if api_token is not None else os.getenv("ZY_FUTU_API_TOKEN", "")
         self.trade_pwd_md5 = os.getenv("ZY_FUTU_TRADE_PWD_MD5", "")
         self.fallback = fallback_data or YahooMarketDataAdapter()
 
         self._quote_ctx: Any = None
         self._trade_ctx: Any = None
         self._futu_mod: Any = None
-        self.last_error: str = "Not connected yet — click Connect after launching FutuOpenD"
+        self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def reconfigure(
         self,
         host: Optional[str] = None,
         port: Optional[int] = None,
         trd_env: Optional[str] = None,
+        api_token: Optional[str] = None,
     ) -> bool:
         self.close()
         if host:
@@ -64,6 +68,8 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             self.port = int(port)
         if trd_env:
             self.trd_env_name = trd_env.strip().upper()
+        if api_token is not None:
+            self.api_token = api_token.strip()
         return self.connect()
 
     def _tcp_reachable(self, timeout: float = 0.8) -> bool:
@@ -72,8 +78,8 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 return True
         except OSError as exc:
             self.last_error = (
-                f"Cannot reach FutuOpenD at {self.host}:{self.port} ({exc}). "
-                f"Launch FutuOpenD on your Mac/server and log into your Futu account."
+                f"Cannot reach OpenAPI port {self.host}:{self.port} ({exc}). "
+                f"Enable OpenAPI in 富途牛牛 -> Settings -> OpenAPI (or launch FutuOpenD)."
             )
             return False
 
@@ -83,9 +89,35 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             return False
         try:
             import futu as ft
+            from futu.common.open_context_base import ContextStatus
+
+            ft.SysConfig.set_all_thread_daemon(True)
+            ft.SysConfig.set_client_info("zy-quant", 1)
+            ft.SysConfig.set_token(self.api_token)
 
             self._futu_mod = ft
-            self._quote_ctx = ft.OpenQuoteContext(host=self.host, port=self.port)
+            # Use is_async_connect=True so an Unauthorized/missing token fails fast in <2s
+            # instead of hanging forever inside futu-api's synchronous infinite retry loop.
+            self._quote_ctx = ft.OpenQuoteContext(
+                host=self.host, port=self.port, is_async_connect=True
+            )
+            deadline = time.monotonic() + 2.2
+            ready = False
+            while time.monotonic() < deadline:
+                if getattr(self._quote_ctx, "_status", None) == ContextStatus.READY:
+                    ready = True
+                    break
+                time.sleep(0.1)
+
+            if not ready:
+                self.last_error = (
+                    f"Port {self.host}:{self.port} rejected InitConnect (Unauthorized). "
+                    f"Open 富途牛牛 -> Settings (设置) -> OpenAPI, copy the API Key / 连接密钥, and paste it in the Token field!"
+                )
+                logger.warning(self.last_error)
+                self.close()
+                return False
+
             self._trade_ctx = ft.OpenSecTradeContext(
                 filter_trdmarket=ft.TrdMarket.US,
                 host=self.host,
@@ -101,14 +133,14 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                     return False
             self.last_error = ""
             logger.info(
-                "Connected to FutuOpenD at %s:%s (env=%s)",
+                "Connected to Futu OpenAPI at %s:%s (env=%s)",
                 self.host,
                 self.port,
                 self.trd_env_name,
             )
             return True
         except Exception as exc:
-            self.last_error = f"FutuOpenD handshake failed at {self.host}:{self.port}: {exc}"
+            self.last_error = f"Futu OpenAPI handshake failed at {self.host}:{self.port}: {exc}"
             logger.info("%s — running in offline/fallback mode", self.last_error)
             self.close()
             return False

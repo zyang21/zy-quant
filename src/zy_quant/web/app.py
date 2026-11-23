@@ -65,6 +65,7 @@ class FutuConnectRequest(BaseModel):
     host: str = "127.0.0.1"
     port: int = 11111
     trd_env: str = "SIMULATE"
+    api_token: Optional[str] = None
 
 
 class DaemonToggleRequest(BaseModel):
@@ -153,16 +154,19 @@ def get_overview(tier_key: str = "tier_1k") -> Dict[str, Any]:
 
 @app.post("/api/futu/connect")
 def connect_futu(req: FutuConnectRequest) -> Dict[str, Any]:
-    ok = daemon.gateway.reconfigure(host=req.host, port=req.port, trd_env=req.trd_env)
+    token_arg = req.api_token if (req.api_token is not None and req.api_token != "") else None
+    ok = daemon.gateway.reconfigure(
+        host=req.host, port=req.port, trd_env=req.trd_env, api_token=token_arg
+    )
     rec: Dict[str, Any] = {}
     if ok:
         rec = daemon.startup_reconcile()
         _log_event(
             "FUTU_OK",
-            f"Connected to FutuOpenD at {req.host}:{req.port} ({req.trd_env})",
+            f"Connected to Futu OpenAPI at {req.host}:{req.port} ({req.trd_env})",
         )
     else:
-        _log_event("FUTU_OFFLINE", daemon.gateway.last_error)
+        _log_event("FUTU_AUTH", daemon.gateway.last_error)
     return {
         "ok": ok,
         "broker": daemon.gateway.get_broker_status(),

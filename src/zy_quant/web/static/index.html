@@ -217,14 +217,15 @@
         <span id="dataSourceLabel" style="font-size:12px;color:var(--muted);"></span>
       </div>
       <div class="broker-form">
-        <input id="futuHost" value="127.0.0.1" style="width:105px;" placeholder="Host" />
-        <input id="futuPort" type="number" value="11111" style="width:78px;" placeholder="Port" />
+        <input id="futuHost" value="127.0.0.1" style="width:98px;" placeholder="Host" />
+        <input id="futuPort" type="number" value="11111" style="width:74px;" placeholder="Port" />
+        <input id="futuToken" type="password" value="" style="width:170px;" placeholder="API Key / 连接密钥" title="Copy from 富途牛牛 -> Settings -> OpenAPI" />
         <select id="futuEnv">
           <option value="SIMULATE">SIMULATE (富途模拟盘)</option>
           <option value="REAL">REAL (实盘 - 需解锁密码)</option>
         </select>
         <button id="connectBtn" class="btn-primary" onclick="connectFutu()">Connect & Sync Account</button>
-        <button onclick="toggleGuide()" style="font-size:12px;">How to Connect?</button>
+        <button onclick="toggleGuide()" style="font-size:12px;">Where is API Key?</button>
       </div>
     </div>
 
@@ -237,10 +238,10 @@
     </div>
 
     <div id="futuGuide" class="setup-hint">
-      <strong>3-Step Futu Account Connection (Note: Python connects to <code>FutuOpenD</code>, not the regular Futubull UI app):</strong><br/>
-      1. Download official <strong>FutuOpenD (macOS GUI or CLI)</strong> from <a href="https://www.futunn.com/download/OpenAPI" target="_blank" style="color:var(--accent);">futunn.com/download/OpenAPI</a>.<br/>
-      2. Launch <code>FutuOpenD</code>, log in with your Futubull account (QR scan or ID + 2FA), and keep API port at default <code>127.0.0.1:11111</code>.<br/>
-      3. Keep mode on <code>SIMULATE (富途模拟盘)</code> above and click <strong>Connect & Sync Account</strong> — your Paper/Live Account IDs, USD balance, and real-time institutional capital flow will appear immediately!
+      <strong>How to Connect Your Running <code>富途牛牛.app</code> Built-In OpenAPI:</strong><br/>
+      1. Your <code>富途牛牛.app</code> already has <code>OpenAPIHost</code> listening on <code>127.0.0.1:11111</code>!<br/>
+      2. For security, Futubull Desktop rejects unauthenticated local connections with <code>Unauthorized</code> unless you provide its <strong>API Key / 连接密钥 (Token)</strong>.<br/>
+      3. In <strong>富途牛牛 Desktop → Settings (设置) → OpenAPI</strong>, copy the <strong>连接密钥 / Auth Key / Token</strong>, paste it into the <code>API Key / 连接密钥</code> box above (or save as <code>ZY_FUTU_API_TOKEN=...</code> in <code>~/Dev/zy-quant/.env</code>), and click <strong>Connect & Sync Account</strong>!
     </div>
   </section>
 
@@ -511,10 +512,11 @@
         const host = document.getElementById('futuHost').value;
         const port = parseInt(document.getElementById('futuPort').value || '11111', 10);
         const trd_env = document.getElementById('futuEnv').value;
+        const api_token = document.getElementById('futuToken').value;
         const res = await fetch('/api/futu/connect', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ host, port, trd_env })
+          body: JSON.stringify({ host, port, trd_env, api_token })
         });
         const out = await res.json();
         if (!out.ok) {
