@@ -72,7 +72,10 @@ class TradingDaemon:
     def startup_reconcile(self) -> Dict[str, Any]:
         connected = self.gateway.is_connected() or self.gateway.connect()
         summary = {"futu_connected": connected, "reconciliation": {}}
-        if connected:
+        # Only overwrite SQLite positions from broker when the target trading environment
+        # (e.g. REAL, or an activated Futu SIMULATE sub-account) actually exists on the broker.
+        # In local paper-simulation mode (`PAPER-LOCAL`), SQLite is the source of truth for virtual holdings.
+        if connected and self.gateway._select_acc_id(self.gateway.trd_env_name) != 0:
             broker_pos = self.gateway.get_open_positions()
             rec = self.store.reconcile_broker_positions(broker_pos)
             summary["reconciliation"] = rec
@@ -188,26 +191,39 @@ class TradingDaemon:
             atrs = compute_wilder_atr_series(
                 bars_15m, self.settings.strategy_cfg.entry.atr_period
             )
+            latest_bar = bars_15m[-1]
+            bar_ts_iso = latest_bar.timestamp.isoformat()
+            is_new_bar = pos.metadata.get("last_bar_ts") != bar_ts_iso
+            pos.metadata["last_bar_ts"] = bar_ts_iso
+            pos.metadata["last_mark_price"] = latest_bar.close
+
             prev_stop = pos.current_stop
-            action = self.exit_engine.step_position(pos, bars_15m[-1], atrs[-1], tier)
+            action = self.exit_engine.step_position(
+                pos, latest_bar, atrs[-1], tier, is_new_bar=is_new_bar
+            )
 
             if action.should_exit and action.shares_to_sell > 0:
-                cid = f"EXIT-{sym}-{bars_15m[-1].timestamp.strftime('%Y%m%d%H%M')}-{action.reason.value if action.reason else 'X'}"
+                cid = f"EXIT-{sym}-{latest_bar.timestamp.strftime('%Y%m%d%H%M')}-{action.reason.value if action.reason else 'X'}"
                 if self.store.record_order_intent(
                     cid, sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, action.note
                 ):
                     if pos.broker_stop_order_id and action.shares_to_sell >= pos.shares:
                         self.gateway.cancel_order(pos.broker_stop_order_id)
 
-                    broker_oid = self.gateway.place_limit_order(
-                        sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, remark=cid
+                    has_target_acc = self.gateway._select_acc_id(self.gateway.trd_env_name) != 0
+                    broker_oid = (
+                        self.gateway.place_limit_order(
+                            sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, remark=cid
+                        )
+                        if has_target_acc
+                        else None
                     )
                     sell_fee = self.fee_model.estimate_leg(
                         action.shares_to_sell, action.exit_price, OrderSide.SELL
                     ).total_friction_usd
                     self.store.update_order_status(
                         cid,
-                        OrderStatus.FILLED if broker_oid or not self.gateway.is_connected() else OrderStatus.SUBMITTED,
+                        OrderStatus.FILLED if (broker_oid or not has_target_acc) else OrderStatus.SUBMITTED,
                         broker_order_id=broker_oid or "PAPER-LOCAL",
                         fill_price=action.exit_price,
                         fee_usd=sell_fee,
@@ -249,11 +265,20 @@ class TradingDaemon:
         # 2. New Entry Evaluation — Strictly locked unless Regime == GREEN
         entries_placed: List[str] = []
         if regime.light == RegimeLight.GREEN:
-            acct = self.gateway.get_account_summary()
-            equity = acct["equity_usd"] if acct["equity_usd"] > 0 else tier.reference_equity_usd
-            cash = acct["cash_usd"] if acct["cash_usd"] > 0 else equity - sum(
-                p.shares * p.entry_price for p in open_positions.values()
-            )
+            has_target_acc = self.gateway._select_acc_id(self.gateway.trd_env_name) != 0
+            if has_target_acc and self.gateway.trd_env_name == "REAL":
+                acct = self.gateway.get_account_summary()
+                equity = acct["equity_usd"] if acct["equity_usd"] > 0 else tier.reference_equity_usd
+                cash = acct["cash_usd"]
+            else:
+                # Paper Simulation Mode: size strictly from virtual Tier capital + realized paper PnL
+                realized_all = self.store.realized_pnl_since("2000-01-01T00:00:00")
+                equity = tier.reference_equity_usd + realized_all
+                invested = sum(
+                    p.shares * p.entry_price + float(p.metadata.get("buy_fee_usd", 0.0))
+                    for p in open_positions.values()
+                )
+                cash = max(0.0, equity - invested)
 
             top_n = self.settings.watchlist_cfg.scoring_thresholds.top_n_active
             min_score = self.settings.watchlist_cfg.scoring_thresholds.min_watch_score
@@ -300,15 +325,19 @@ class TradingDaemon:
                 ):
                     continue
 
-                broker_oid = self.gateway.place_limit_order(
-                    sym, OrderSide.BUY, plan.shares, plan.limit_price, remark=cid
+                broker_oid = (
+                    self.gateway.place_limit_order(
+                        sym, OrderSide.BUY, plan.shares, plan.limit_price, remark=cid
+                    )
+                    if has_target_acc
+                    else None
                 )
                 buy_fee = self.fee_model.estimate_leg(
                     plan.shares, plan.entry_price, OrderSide.BUY
                 ).total_friction_usd
                 self.store.update_order_status(
                     cid,
-                    OrderStatus.FILLED if broker_oid or not self.gateway.is_connected() else OrderStatus.SUBMITTED,
+                    OrderStatus.FILLED if (broker_oid or not has_target_acc) else OrderStatus.SUBMITTED,
                     broker_order_id=broker_oid or "PAPER-LOCAL",
                     fill_price=plan.entry_price,
                     fee_usd=buy_fee,
@@ -333,7 +362,12 @@ class TradingDaemon:
                     risk_per_share=plan.risk_per_share,
                     broker_stop_order_id=stop_oid,
                     setup=plan.setup.value,
-                    metadata={"buy_fee_usd": buy_fee, "expectancy_r": plan.expectancy_r},
+                    metadata={
+                        "buy_fee_usd": buy_fee,
+                        "expectancy_r": plan.expectancy_r,
+                        "last_bar_ts": sig.timestamp.isoformat(),
+                        "last_mark_price": plan.entry_price,
+                    },
                 )
                 self.store.upsert_position(new_pos)
                 open_positions[sym] = new_pos
@@ -358,17 +392,16 @@ class TradingDaemon:
                 "timestamp": now.isoformat(),
             },
         )
+        # Check QQQ/SPY regime & open stops frequently (every 3m) during live market hours so we never
+        # miss a YELLOW -> GREEN VWAP crossover, while heavy 14-stock watchlist scoring stays throttled
+        # to 15m (GREEN) / 120m (RED/YELLOW) via `watchlist_interval` above!
         return {
             "regime": regime.light.value,
             "reason": regime.reason,
             "watchlist_refreshed": watchlist_refreshed,
             "entries": entries_placed,
             "exits": exits_triggered,
-            "next_sleep_minutes": (
-                self.settings.strategy_cfg.regime.green_scan_interval_minutes
-                if (regime.light == RegimeLight.GREEN or len(open_positions) > 0)
-                else self.settings.strategy_cfg.regime.rest_watchlist_interval_minutes
-            ),
+            "next_sleep_minutes": 3,
         }
 
     def run_forever(self, tier_override: Optional[str] = None) -> None:

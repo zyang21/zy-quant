@@ -7,13 +7,15 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/caffeinate</string>
-        <string>-i</string>
+        <string>-dimsu</string>
         <string>/bin/sh</string>
         <string>-c</string>
-        <string>exec "$HOME/Dev/zy-quant/.venv/bin/zy-quant" daemon</string>
+        <string>exec "$HOME/Dev/zy-quant/.venv/bin/zy-quant" dashboard --host 127.0.0.1 --port 8088 --auto-daemon --tier tier_10k</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/tmp</string>
+    <key>RunAtLoad</key>
+    <true/>
     <key>KeepAlive</key>
     <true/>
     <key>ThrottleInterval</key>

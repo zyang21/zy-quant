@@ -27,6 +27,8 @@ def main() -> None:
     p_dash = sub.add_parser("dashboard", help="Launch FastAPI Quantitative Control Center UI")
     p_dash.add_argument("--host", default="127.0.0.1")
     p_dash.add_argument("--port", type=int, default=8088)
+    p_dash.add_argument("--auto-daemon", action="store_true", help="Auto-start overnight simulation loop on boot")
+    p_dash.add_argument("--tier", default=None, help="Default account tier: tier_1k | tier_10k | tier_100k")
 
     p_daemon = sub.add_parser("daemon", help="Run resilient 24/7 two-speed background daemon")
     p_daemon.add_argument("--tier", default=None, help="tier_1k | tier_10k | tier_100k")
@@ -50,6 +52,12 @@ def main() -> None:
     settings = AppSettings.load()
 
     if args.cmd == "dashboard":
+        import os
+
+        if args.auto_daemon:
+            os.environ["ZY_AUTO_START_DAEMON"] = "1"
+        if args.tier:
+            os.environ["ZY_ACCOUNT_TIER"] = args.tier
         uvicorn.run("zy_quant.web.app:app", host=args.host, port=args.port, reload=False)
     elif args.cmd == "daemon":
         daemon = TradingDaemon(settings)

@@ -149,12 +149,14 @@ class ScientificExitAndSizingEngine:
         bar: Bar,
         atr_14: float,
         tier: TierProfile,
+        is_new_bar: bool = True,
     ) -> ExitAction:
         """
         Updates ratcheted stop and checks all 3 barriers + Tier 3 ($100k) scale-out on each 15m bar.
         Modifies `pos` in place and returns an `ExitAction`.
         """
-        pos.bars_held_15m += 1
+        if is_new_bar:
+            pos.bars_held_15m += 1
 
         # 1. Lower Barrier Check FIRST (conservative intrabar assumption: check low against active stop)
         if bar.low <= pos.current_stop:
