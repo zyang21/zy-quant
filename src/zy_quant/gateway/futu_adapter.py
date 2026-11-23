@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import socket
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -48,8 +49,38 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._quote_ctx: Any = None
         self._trade_ctx: Any = None
         self._futu_mod: Any = None
+        self.last_error: str = "Not connected yet — click Connect after launching FutuOpenD"
+
+    def reconfigure(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        trd_env: Optional[str] = None,
+    ) -> bool:
+        self.close()
+        if host:
+            self.host = host.strip()
+        if port:
+            self.port = int(port)
+        if trd_env:
+            self.trd_env_name = trd_env.strip().upper()
+        return self.connect()
+
+    def _tcp_reachable(self, timeout: float = 0.8) -> bool:
+        try:
+            with socket.create_connection((self.host, self.port), timeout=timeout):
+                return True
+        except OSError as exc:
+            self.last_error = (
+                f"Cannot reach FutuOpenD at {self.host}:{self.port} ({exc}). "
+                f"Launch FutuOpenD on your Mac/server and log into your Futu account."
+            )
+            return False
 
     def connect(self) -> bool:
+        if not self._tcp_reachable():
+            self.close()
+            return False
         try:
             import futu as ft
 
@@ -64,9 +95,11 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             if self.trd_env_name == "REAL" and self.trade_pwd_md5:
                 ret, data = self._trade_ctx.unlock_trade(password_md5=self.trade_pwd_md5)
                 if ret != ft.RET_OK:
-                    logger.error("Futu unlock_trade failed: %s", data)
+                    self.last_error = f"Futu unlock_trade failed: {data}"
+                    logger.error(self.last_error)
                     self.close()
                     return False
+            self.last_error = ""
             logger.info(
                 "Connected to FutuOpenD at %s:%s (env=%s)",
                 self.host,
@@ -75,7 +108,8 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             )
             return True
         except Exception as exc:
-            logger.info("FutuOpenD not reachable at %s:%s (%s) — running in offline/fallback mode", self.host, self.port, exc)
+            self.last_error = f"FutuOpenD handshake failed at {self.host}:{self.port}: {exc}"
+            logger.info("%s — running in offline/fallback mode", self.last_error)
             self.close()
             return False
 
@@ -174,16 +208,64 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     # --- Broker Execution ---
     def get_account_summary(self) -> Dict[str, float]:
         if not self.is_connected() or self._trade_ctx is None:
-            return {"equity_usd": 0.0, "cash_usd": 0.0, "connected": 0.0}
+            return {
+                "equity_usd": 0.0,
+                "cash_usd": 0.0,
+                "market_val_usd": 0.0,
+                "buying_power_usd": 0.0,
+                "connected": 0.0,
+            }
         ft = self._futu_mod
         ret, df = self._trade_ctx.accinfo_query(trd_env=self._trd_env(), currency=ft.Currency.USD)
         if ret != ft.RET_OK or df is None or df.empty:
-            return {"equity_usd": 0.0, "cash_usd": 0.0, "connected": 1.0}
+            return {
+                "equity_usd": 0.0,
+                "cash_usd": 0.0,
+                "market_val_usd": 0.0,
+                "buying_power_usd": 0.0,
+                "connected": 1.0,
+            }
         row = df.iloc[0]
         return {
             "equity_usd": float(row.get("total_assets", 0.0)),
             "cash_usd": float(row.get("cash", 0.0)),
+            "market_val_usd": float(row.get("market_val", 0.0)),
+            "buying_power_usd": float(row.get("power", 0.0)),
             "connected": 1.0,
+        }
+
+    def get_broker_status(self) -> Dict[str, Any]:
+        connected = self.is_connected()
+        accounts: List[Dict[str, Any]] = []
+        acct_summary = self.get_account_summary() if connected else {
+            "equity_usd": 0.0,
+            "cash_usd": 0.0,
+            "market_val_usd": 0.0,
+            "buying_power_usd": 0.0,
+            "connected": 0.0,
+        }
+        if connected and self._trade_ctx is not None:
+            ft = self._futu_mod
+            ret, df = self._trade_ctx.get_acc_list()
+            if ret == ft.RET_OK and df is not None and not df.empty:
+                for _, row in df.iterrows():
+                    accounts.append(
+                        {
+                            "acc_id": str(row.get("acc_id", "")),
+                            "trd_env": str(row.get("trd_env", "")),
+                            "acc_type": str(row.get("acc_type", "")),
+                            "sim_acc_type": str(row.get("sim_acc_type", "")),
+                        }
+                    )
+        return {
+            "connected": connected,
+            "host": self.host,
+            "port": self.port,
+            "trd_env": self.trd_env_name,
+            "data_source": "FutuOpenD Real-Time" if connected else "Yahoo Finance (Offline Fallback)",
+            "last_error": self.last_error,
+            "account_summary": acct_summary,
+            "accounts": accounts,
         }
 
     def get_open_positions(self) -> Dict[str, Dict[str, float]]:
