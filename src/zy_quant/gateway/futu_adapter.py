@@ -84,8 +84,8 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             return False
 
     def connect(self) -> bool:
+        self.close()
         if not self._tcp_reachable():
-            self.close()
             return False
         try:
             import futu as ft
@@ -122,7 +122,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 filter_trdmarket=ft.TrdMarket.US,
                 host=self.host,
                 port=self.port,
-                security_firm=ft.SecurityFirm.FUTUSECURITIES,
+                security_firm=ft.SecurityFirm.NONE,
             )
             if self.trd_env_name == "REAL" and self.trade_pwd_md5:
                 ret, data = self._trade_ctx.unlock_trade(password_md5=self.trade_pwd_md5)
@@ -159,8 +159,9 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         if self._quote_ctx is None or self._futu_mod is None:
             return False
         try:
-            ret, _ = self._quote_ctx.get_global_state()
-            return ret == self._futu_mod.RET_OK
+            from futu.common.open_context_base import ContextStatus
+
+            return getattr(self._quote_ctx, "_status", None) == ContextStatus.READY
         except Exception:
             return False
 
@@ -238,6 +239,22 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         return self.fallback.get_vix_level()
 
     # --- Broker Execution ---
+    def _select_acc_id(self) -> int:
+        if not self.is_connected() or self._trade_ctx is None:
+            return 0
+        ft = self._futu_mod
+        ret, df = self._trade_ctx.get_acc_list()
+        if ret != ft.RET_OK or df is None or df.empty:
+            return 0
+        env_rows = df[df["trd_env"] == self.trd_env_name]
+        if env_rows.empty:
+            return 0
+        if self.trd_env_name == "SIMULATE" and "sim_acc_type" in env_rows.columns:
+            stock_sim = env_rows[env_rows["sim_acc_type"] == "STOCK"]
+            if not stock_sim.empty:
+                return int(stock_sim.iloc[0]["acc_id"])
+        return int(env_rows.iloc[0]["acc_id"])
+
     def get_account_summary(self) -> Dict[str, float]:
         if not self.is_connected() or self._trade_ctx is None:
             return {
@@ -248,7 +265,13 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 "connected": 0.0,
             }
         ft = self._futu_mod
-        ret, df = self._trade_ctx.accinfo_query(trd_env=self._trd_env(), currency=ft.Currency.USD)
+        acc_id = self._select_acc_id()
+        ret, df = self._trade_ctx.accinfo_query(
+            trd_env=self._trd_env(), acc_id=acc_id, currency=ft.Currency.USD
+        )
+        if ret != ft.RET_OK or df is None or df.empty:
+            # SIMULATE paper accounts don't support currency conversion; retry default currency
+            ret, df = self._trade_ctx.accinfo_query(trd_env=self._trd_env(), acc_id=acc_id)
         if ret != ft.RET_OK or df is None or df.empty:
             return {
                 "equity_usd": 0.0,
@@ -258,11 +281,20 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 "connected": 1.0,
             }
         row = df.iloc[0]
+
+        def _f(val: Any) -> float:
+            try:
+                return float(val) if val not in (None, "N/A", "") else 0.0
+            except (TypeError, ValueError):
+                return 0.0
+
+        equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
+        cash = _f(row.get("us_cash")) if _f(row.get("us_cash")) > 0 else _f(row.get("cash"))
         return {
-            "equity_usd": float(row.get("total_assets", 0.0)),
-            "cash_usd": float(row.get("cash", 0.0)),
-            "market_val_usd": float(row.get("market_val", 0.0)),
-            "buying_power_usd": float(row.get("power", 0.0)),
+            "equity_usd": equity,
+            "cash_usd": cash,
+            "market_val_usd": _f(row.get("market_val")),
+            "buying_power_usd": _f(row.get("power")),
             "connected": 1.0,
         }
 
@@ -294,7 +326,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             "host": self.host,
             "port": self.port,
             "trd_env": self.trd_env_name,
-            "data_source": "FutuOpenD Real-Time" if connected else "Yahoo Finance (Offline Fallback)",
+            "data_source": "Futu OpenAPI Real-Time" if connected else "Yahoo Finance (Offline Fallback)",
             "last_error": self.last_error,
             "account_summary": acct_summary,
             "accounts": accounts,
@@ -304,7 +336,8 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         if not self.is_connected() or self._trade_ctx is None:
             return {}
         ft = self._futu_mod
-        ret, df = self._trade_ctx.position_list_query(trd_env=self._trd_env())
+        acc_id = self._select_acc_id()
+        ret, df = self._trade_ctx.position_list_query(trd_env=self._trd_env(), acc_id=acc_id)
         if ret != ft.RET_OK or df is None or df.empty:
             return {}
         holdings: Dict[str, Dict[str, float]] = {}

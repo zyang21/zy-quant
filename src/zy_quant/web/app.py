@@ -43,6 +43,10 @@ def _log_event(kind: str, detail: str) -> None:
 
 
 _log_event("BOOT", "Control Center initialized (default safe mode: SIMULATE)")
+if daemon.gateway.api_token:
+    if daemon.gateway.connect():
+        daemon.startup_reconcile()
+        _log_event("FUTU_OK", f"Auto-connected to Futu OpenAPI ({daemon.gateway.trd_env_name})")
 
 
 class HaltRequest(BaseModel):
@@ -160,6 +164,17 @@ def connect_futu(req: FutuConnectRequest) -> Dict[str, Any]:
     )
     rec: Dict[str, Any] = {}
     if ok:
+        # Persist non-secret host/port/env + local token in gitignored .env (chmod 600) so restarts auto-connect
+        env_path = settings.root_dir / ".env"
+        lines = [
+            f"ZY_FUTU_HOST={daemon.gateway.host}",
+            f"ZY_FUTU_PORT={daemon.gateway.port}",
+            f"ZY_TRD_ENV={daemon.gateway.trd_env_name}",
+            f"ZY_FUTU_API_TOKEN={daemon.gateway.api_token}",
+        ]
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        env_path.chmod(0o600)
+
         rec = daemon.startup_reconcile()
         _log_event(
             "FUTU_OK",

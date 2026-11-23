@@ -70,7 +70,7 @@ class TradingDaemon:
         self._last_watchlist_scan_at: Optional[datetime] = None
 
     def startup_reconcile(self) -> Dict[str, Any]:
-        connected = self.gateway.connect()
+        connected = self.gateway.is_connected() or self.gateway.connect()
         summary = {"futu_connected": connected, "reconciliation": {}}
         if connected:
             broker_pos = self.gateway.get_open_positions()
