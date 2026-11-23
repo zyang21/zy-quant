@@ -397,8 +397,8 @@
         futuBadge.textContent = `CONNECTED (${b.host}:${b.port} · ${b.trd_env})`;
         futuBadge.className = 'pill pill-GREEN';
         const accts = (b.accounts || []).map(a => `${a.trd_env}:${a.acc_id}`).join(', ') || 'Connected';
-        document.getElementById('futuAccounts').textContent = accts;
         const s = b.account_summary || {};
+        document.getElementById('futuAccounts').textContent = s.note ? `${accts} (${s.note})` : accts;
         document.getElementById('futuEquity').textContent = `$${Number(s.equity_usd || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}`;
         document.getElementById('futuCash').textContent = `$${Number(s.cash_usd || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}`;
         document.getElementById('futuMktVal').textContent = `$${Number(s.market_val_usd || 0).toLocaleString(undefined, {minimumFractionDigits: 2})}`;

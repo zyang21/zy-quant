@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import socket
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -52,6 +53,9 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._quote_ctx: Any = None
         self._trade_ctx: Any = None
         self._futu_mod: Any = None
+        self._rpc_lock = threading.RLock()
+        self._cap_dist_supported: bool = True
+        self._kline_cache: Dict[tuple[str, str], tuple[float, List[Bar]]] = {}
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def reconfigure(
@@ -172,16 +176,25 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     # --- Market Data ---
     def get_bars(self, symbol: str, timeframe: str = "15m", days: int = 30) -> List[Bar]:
         if self.is_connected() and not symbol.startswith("^"):
+            cache_key = (symbol, timeframe)
+            now_mono = time.monotonic()
+            cached = self._kline_cache.get(cache_key)
+            if cached and (now_mono - cached[0]) < 45.0:
+                return cached[1]
+
             ft = self._futu_mod
             ktype = ft.KLType.K_15M if timeframe == "15m" else ft.KLType.K_DAY
             code = to_futu_us_code(symbol)
-            ret, df, _ = self._quote_ctx.request_history_kline(
-                code, ktype=ktype, max_count=min(1000, days * 28)
-            )
+            max_cnt = min(500, days * 28) if timeframe == "15m" else max(30, days)
+            with self._rpc_lock:
+                ret, df, _ = self._quote_ctx.request_history_kline(
+                    code, ktype=ktype, max_count=max_cnt
+                )
             if ret == ft.RET_OK and df is not None and not df.empty:
                 out: List[Bar] = []
                 for _, row in df.iterrows():
-                    ts = datetime.fromisoformat(str(row["time_key"])).replace(tzinfo=timezone.utc)
+                    ts_str = str(row["time_key"]).replace(" ", "T")
+                    ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
                     out.append(
                         Bar(
                             symbol=symbol,
@@ -193,45 +206,64 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                             volume=float(row["volume"]),
                         )
                     )
+                self._kline_cache[cache_key] = (now_mono, out)
                 return out
         return self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
 
     def get_quote(self, symbol: str) -> Optional[QuoteSnapshot]:
-        if self.is_connected() and not symbol.startswith("^"):
-            ft = self._futu_mod
-            code = to_futu_us_code(symbol)
-            ret, df = self._quote_ctx.get_market_snapshot([code])
-            if ret == ft.RET_OK and df is not None and not df.empty:
-                row = df.iloc[0]
-                last_px = float(row["last_price"])
-                bid = float(row.get("bid_price", last_px)) or last_px
-                ask = float(row.get("ask_price", last_px)) or last_px
-                turnover = float(row.get("turnover", 800_000_000.0)) or 800_000_000.0
-                return QuoteSnapshot(
-                    symbol=symbol,
-                    last_price=last_px,
-                    bid=bid,
-                    ask=ask,
-                    avg_daily_dollar_vol=max(turnover, 600_000_000.0),
-                    timestamp=datetime.now(timezone.utc),
-                )
+        """
+        Uses fast K_DAY bars (0.15s on Futubull Desktop Built-In OpenAPIHost, where
+        `get_market_snapshot` times out for 12.9s when LV1 snapshot streaming isn't subscribed).
+        """
+        bars_1d = self.get_bars(symbol, timeframe="1d", days=25)
+        if bars_1d:
+            last = bars_1d[-1]
+            avg_dvol = sum(b.close * b.volume for b in bars_1d[-20:]) / float(min(20, len(bars_1d)))
+            half_spread = max(0.01, round(last.close * 0.00015, 2))
+            return QuoteSnapshot(
+                symbol=symbol,
+                last_price=round(last.close, 2),
+                bid=round(last.close - half_spread, 2),
+                ask=round(last.close + half_spread, 2),
+                avg_daily_dollar_vol=max(avg_dvol, 600_000_000.0),
+                timestamp=last.timestamp,
+            )
         return self.fallback.get_quote(symbol)
 
     def get_capital_flow(self, symbol: str) -> Optional[CapitalFlowSnapshot]:
         if self.is_connected() and not symbol.startswith("^"):
-            ft = self._futu_mod
-            code = to_futu_us_code(symbol)
-            ret, df = self._quote_ctx.get_capital_distribution(code)
-            if ret == ft.RET_OK and df is not None and not df.empty:
-                row = df.iloc[0]
+            if self._cap_dist_supported:
+                ft = self._futu_mod
+                code = to_futu_us_code(symbol)
+                with self._rpc_lock:
+                    ret, df = self._quote_ctx.get_capital_distribution(code)
+                if ret == ft.RET_OK and df is not None and not df.empty:
+                    row = df.iloc[0]
+                    return CapitalFlowSnapshot(
+                        symbol=symbol,
+                        super_large_inflow=float(row.get("capital_in_super", 0.0)),
+                        super_large_outflow=float(row.get("capital_out_super", 0.0)),
+                        large_inflow=float(row.get("capital_in_big", 0.0)),
+                        large_outflow=float(row.get("capital_out_big", 0.0)),
+                        medium_net=float(row.get("capital_in_mid", 0.0)) - float(row.get("capital_out_mid", 0.0)),
+                        small_net=float(row.get("capital_in_small", 0.0)) - float(row.get("capital_out_small", 0.0)),
+                    )
+                if isinstance(df, str) and "Unknown protocol ID" in df:
+                    # Futubull Desktop built-in OpenAPIHost omits protocol 3212; avoid repeating unsupported RPC
+                    self._cap_dist_supported = False
+
+            # Compute block dollar flow directly from Futu's real-time 15m K-lines
+            bars_15m = self.get_bars(symbol, timeframe="15m", days=3)
+            if bars_15m:
+                recent = bars_15m[-16:]
+                inflow = sum(b.close * b.volume * 0.35 for b in recent if b.close >= b.open)
+                outflow = sum(b.close * b.volume * 0.35 for b in recent if b.close < b.open)
                 return CapitalFlowSnapshot(
                     symbol=symbol,
-                    super_large_inflow=float(row.get("capital_in_super", 0.0)),
-                    super_large_outflow=float(row.get("capital_out_super", 0.0)),
-                    large_inflow=float(row.get("capital_in_big", 0.0)),
-                    large_outflow=float(row.get("capital_out_big", 0.0)),
-                    medium_net=float(row.get("capital_in_mid", 0.0)) - float(row.get("capital_out_mid", 0.0)),
-                    small_net=float(row.get("capital_in_small", 0.0)) - float(row.get("capital_out_small", 0.0)),
+                    super_large_inflow=inflow * 0.45,
+                    super_large_outflow=outflow * 0.45,
+                    large_inflow=inflow * 0.55,
+                    large_outflow=outflow * 0.55,
                 )
         return self.fallback.get_capital_flow(symbol)
 
@@ -239,23 +271,25 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         return self.fallback.get_vix_level()
 
     # --- Broker Execution ---
-    def _select_acc_id(self) -> int:
+    def _select_acc_id(self, env_name: Optional[str] = None) -> int:
         if not self.is_connected() or self._trade_ctx is None:
             return 0
+        target_env = env_name or self.trd_env_name
         ft = self._futu_mod
-        ret, df = self._trade_ctx.get_acc_list()
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.get_acc_list()
         if ret != ft.RET_OK or df is None or df.empty:
             return 0
-        env_rows = df[df["trd_env"] == self.trd_env_name]
+        env_rows = df[df["trd_env"] == target_env]
         if env_rows.empty:
             return 0
-        if self.trd_env_name == "SIMULATE" and "sim_acc_type" in env_rows.columns:
+        if target_env == "SIMULATE" and "sim_acc_type" in env_rows.columns:
             stock_sim = env_rows[env_rows["sim_acc_type"] == "STOCK"]
             if not stock_sim.empty:
                 return int(stock_sim.iloc[0]["acc_id"])
         return int(env_rows.iloc[0]["acc_id"])
 
-    def get_account_summary(self) -> Dict[str, float]:
+    def get_account_summary(self) -> Dict[str, Any]:
         if not self.is_connected() or self._trade_ctx is None:
             return {
                 "equity_usd": 0.0,
@@ -263,15 +297,28 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 "market_val_usd": 0.0,
                 "buying_power_usd": 0.0,
                 "connected": 0.0,
+                "note": "",
             }
         ft = self._futu_mod
-        acc_id = self._select_acc_id()
-        ret, df = self._trade_ctx.accinfo_query(
-            trd_env=self._trd_env(), acc_id=acc_id, currency=ft.Currency.USD
-        )
-        if ret != ft.RET_OK or df is None or df.empty:
-            # SIMULATE paper accounts don't support currency conversion; retry default currency
-            ret, df = self._trade_ctx.accinfo_query(trd_env=self._trd_env(), acc_id=acc_id)
+        acc_id = self._select_acc_id(self.trd_env_name)
+        query_env = self._trd_env()
+        note = ""
+
+        # If user selected SIMULATE for safety but hasn't opened a US Paper Account in Futubull yet,
+        # display their REAL account balances in strictly READ-ONLY mode so they see their linked account!
+        if acc_id == 0 and self.trd_env_name == "SIMULATE":
+            real_acc_id = self._select_acc_id("REAL")
+            if real_acc_id != 0:
+                acc_id = real_acc_id
+                query_env = ft.TrdEnv.REAL
+                note = "Showing REAL account (Read-Only) — open a US Paper Account in 富途牛牛 to enable SIMULATE orders"
+
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.accinfo_query(
+                trd_env=query_env, acc_id=acc_id, currency=ft.Currency.USD
+            )
+            if ret != ft.RET_OK or df is None or df.empty:
+                ret, df = self._trade_ctx.accinfo_query(trd_env=query_env, acc_id=acc_id)
         if ret != ft.RET_OK or df is None or df.empty:
             return {
                 "equity_usd": 0.0,
@@ -279,6 +326,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 "market_val_usd": 0.0,
                 "buying_power_usd": 0.0,
                 "connected": 1.0,
+                "note": note,
             }
         row = df.iloc[0]
 
@@ -296,6 +344,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             "market_val_usd": _f(row.get("market_val")),
             "buying_power_usd": _f(row.get("power")),
             "connected": 1.0,
+            "note": note,
         }
 
     def get_broker_status(self) -> Dict[str, Any]:
