@@ -41,7 +41,7 @@ class WebServerConfig(BaseModel):
 
 
 class RuntimeSettingsConfig(BaseModel):
-    account_tier: str = "tier_10k"
+    account_tier: Optional[str] = None
     allow_synthetic_fallback: bool = False
     futu: FutuConnectionConfig = Field(default_factory=FutuConnectionConfig)
     web: WebServerConfig = Field(default_factory=WebServerConfig)
@@ -195,7 +195,7 @@ class AppSettings(BaseModel):
 
     @property
     def active_tier_key(self) -> str:
-        return os.getenv("ZY_ACCOUNT_TIER") or self.runtime_cfg.account_tier or self.tiers_cfg.active_tier
+        return self.runtime_cfg.account_tier or os.getenv("ZY_ACCOUNT_TIER") or self.tiers_cfg.active_tier
 
     @property
     def active_tier_profile(self) -> TierProfile:
@@ -230,14 +230,15 @@ class AppSettings(BaseModel):
             futu_dict["trade_pwd_md5"] = os.environ["ZY_FUTU_TRADE_PWD_MD5"]
         runtime_raw["futu"] = futu_dict
 
-        if os.getenv("ZY_ACCOUNT_TIER"):
+        if not runtime_raw.get("account_tier") and os.getenv("ZY_ACCOUNT_TIER"):
             runtime_raw["account_tier"] = os.environ["ZY_ACCOUNT_TIER"]
 
         runtime_cfg = RuntimeSettingsConfig.model_validate(runtime_raw)
 
         with open(cfg_dir / "tiers.yaml", "r", encoding="utf-8") as f:
             tiers_raw = yaml.safe_load(f)
-        tiers_raw["active_tier"] = runtime_cfg.account_tier
+        if runtime_cfg.account_tier:
+            tiers_raw["active_tier"] = runtime_cfg.account_tier
         with open(cfg_dir / "watchlist_scoring.yaml", "r", encoding="utf-8") as f:
             watch_raw = yaml.safe_load(f)
         with open(cfg_dir / "strategy.yaml", "r", encoding="utf-8") as f:

@@ -371,14 +371,16 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         query_env = self._trd_env()
         note = ""
 
-        # If user selected SIMULATE for safety but hasn't opened a US Paper Account in Futubull yet,
-        # display their REAL account balances in strictly READ-ONLY mode so they see their linked account!
-        if acc_id == 0 and self.trd_env_name == "SIMULATE":
-            real_acc_id = self._select_acc_id("REAL")
-            if real_acc_id != 0:
-                acc_id = real_acc_id
-                query_env = ft.TrdEnv.REAL
-                note = "Showing REAL account (Read-Only) — open a US Paper Account in 富途牛牛 to enable SIMULATE orders"
+        # Strict environment isolation: when in SIMULATE mode, NEVER read or expose REAL account funds.
+        if acc_id == 0:
+            return {
+                "equity_usd": 0.0,
+                "cash_usd": 0.0,
+                "market_val_usd": 0.0,
+                "buying_power_usd": 0.0,
+                "connected": 1.0,
+                "note": "Virtual Paper Ledger",
+            }
 
         with self._rpc_lock:
             ret, df = self._trade_ctx.accinfo_query(

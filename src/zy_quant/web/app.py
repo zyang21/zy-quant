@@ -113,11 +113,19 @@ class ControlCenterApplication:
                     break
                 await asyncio.sleep(1)
 
+    def refresh_config_if_needed(self) -> None:
+        """Hot-reloads config/settings.json & config/*.yaml so tier/strategy edits take effect immediately."""
+        fresh = AppSettings.load(self.settings.root_dir)
+        self.settings = fresh
+        self.daemon.settings = fresh
+        self.portfolio_svc.settings = fresh
+
     def get_sanitized_connection_status(self) -> Dict[str, Any]:
         """Returns broker connection health & data integrity alerts without exposing secrets."""
         raw = self.daemon.gateway.get_broker_status()
         connected = bool(raw.get("connected"))
         env_mode = str(raw.get("trd_env", "SIMULATE"))
+        is_simulated = env_mode != "REAL"
         acct = raw.get("account_summary") or {}
         fb = self.daemon.gateway.fallback
         fallback_alert = ""
@@ -130,11 +138,12 @@ class ControlCenterApplication:
                 fallback_alert = "Futu OpenAPI is disconnected — real-time market data unavailable."
         return {
             "connected": connected,
-            "execution_mode": "Paper Simulation" if env_mode == "SIMULATE" else "Live Execution",
+            "is_simulated": is_simulated,
+            "execution_mode": "Paper Simulation" if is_simulated else "Live Execution",
             "data_feed": "Futu Real-Time Feed" if connected else ("Synthetic Fake Data" if fb.used_synthetic else "Fallback / Offline"),
             "is_fallback_or_fake": not connected or fb.used_synthetic,
             "fallback_alert": fallback_alert,
-            "linked_broker_equity_usd": round(float(acct.get("equity_usd", 0.0)), 2),
+            "linked_broker_equity_usd": 0.0 if is_simulated else round(float(acct.get("equity_usd", 0.0)), 2),
         }
 
     def get_strategy_summary(self) -> Dict[str, Any]:
@@ -204,6 +213,7 @@ def serve_spa() -> FileResponse:
 @app.get("/api/dashboard")
 @app.get("/api/overview")
 def get_dashboard() -> Dict[str, Any]:
+    ctx.refresh_config_if_needed()
     regime = ctx.store.get_flag("latest_regime")
     if regime is None:
         snap = ctx.daemon.evaluate_regime()
@@ -251,6 +261,7 @@ def get_trade_history(
 
 @app.post("/api/backtest")
 def run_strategy_backtest(req: BacktestRequest) -> Dict[str, Any]:
+    ctx.refresh_config_if_needed()
     engine = BacktestEngine(ctx.settings, ctx.daemon.gateway)
     result = engine.run(
         tier_key=ctx.settings.active_tier_key,
