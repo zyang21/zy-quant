@@ -89,6 +89,7 @@ def test_triple_barrier_time_stop_exits_dead_trade() -> None:
     tier_10k = settings.tiers_cfg.get_active("tier_10k")
     now = datetime.now(timezone.utc)
 
+    max_bars = settings.strategy_cfg.exit_models.time_stop_bars_15m
     pos = OpenPosition(
         symbol="AAPL",
         sector="Technology",
@@ -100,9 +101,9 @@ def test_triple_barrier_time_stop_exits_dead_trade() -> None:
         current_stop=216.0,
         highest_price=220.5,
         risk_per_share=4.0,
-        bars_held_15m=15,
+        bars_held_15m=max_bars - 1,
     )
-    # 16th bar closes flat at $220.20 (+0.05R < +0.30R required) -> Time Barrier exits!
+    # Final allowed bar closes flat at $220.20 (+0.05R < min_progress_r) -> Time Barrier exits!
     flat_bar = Bar("AAPL", now, open=220.1, high=220.4, low=219.8, close=220.2, volume=200_000)
     act = engine.step_position(pos, flat_bar, atr_14=1.8, tier=tier_10k)
     assert act.should_exit is True
