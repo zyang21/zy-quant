@@ -19,6 +19,7 @@ from zy_quant.backtest.engine import BacktestEngine
 from zy_quant.config import AppSettings
 from zy_quant.fees import FutuUSFeeModel
 from zy_quant.gateway.yfinance_adapter import YahooMarketDataAdapter
+from zy_quant.intel.market_hours import get_us_market_session
 from zy_quant.runtime.daemon import TradingDaemon
 from zy_quant.storage.state_store import StateStore
 
@@ -114,13 +115,20 @@ class DaemonToggleRequest(BaseModel):
 
 async def _embedded_daemon_loop() -> None:
     global _auto_loop_enabled
+    was_closed_logged = False
     while _auto_loop_enabled:
         try:
-            res = await asyncio.to_thread(daemon.run_cycle, _active_tier_key, False)
-            _log_event(
-                "CYCLE",
-                f"Regime={res['regime']} | Entries={len(res['entries'])} | Exits={len(res['exits'])} | Next={res['next_sleep_minutes']}m",
-            )
+            res = await asyncio.to_thread(daemon.run_cycle, _active_tier_key, False, False)
+            if not res.get("market_open", True):
+                if not was_closed_logged:
+                    _log_event("MARKET_CLOSED", res.get("session_message", "US Market Closed — auto-scan paused"))
+                    was_closed_logged = True
+            else:
+                was_closed_logged = False
+                _log_event(
+                    "CYCLE",
+                    f"Regime={res['regime']} | Entries={len(res['entries'])} | Exits={len(res['exits'])} | Next={res['next_sleep_minutes']}m",
+                )
             sleep_s = max(30, int(res["next_sleep_minutes"] * 60))
         except Exception as exc:
             _log_event("ERROR", f"Daemon cycle error: {exc}")
@@ -218,9 +226,11 @@ def get_overview(tier_key: Optional[str] = None) -> Dict[str, Any]:
     )
 
     broker_status = daemon.gateway.get_broker_status()
+    session_status = asdict(get_us_market_session())
 
     return {
         "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "market_session": session_status,
         "auto_loop_running": _auto_loop_enabled,
         "active_tier_key": _active_tier_key,
         "active_tier": tier.model_dump(),
@@ -305,9 +315,9 @@ async def toggle_daemon(req: DaemonToggleRequest) -> Dict[str, Any]:
 
 @app.post("/api/scan")
 def trigger_scan(tier_key: str = "tier_1k", check_edgar: bool = False) -> Dict[str, Any]:
-    # Force immediate watchlist & regime refresh when operator clicks Scan manually
+    # Force immediate watchlist & regime refresh when operator clicks Scan manually (even when market closed)
     daemon._last_watchlist_scan_at = None
-    cycle = daemon.run_cycle(tier_override=tier_key, check_edgar=check_edgar)
+    cycle = daemon.run_cycle(tier_override=tier_key, check_edgar=check_edgar, force_when_closed=True)
     _log_event(
         "SCAN",
         f"Manual scan finished: Regime={cycle['regime']}, Watchlist refreshed={cycle['watchlist_refreshed']}, Entries={len(cycle['entries'])}",

@@ -10,6 +10,7 @@ from zy_quant.config import AppSettings
 from zy_quant.fees import FutuUSFeeModel
 from zy_quant.gateway.futu_adapter import FutuGatewayAdapter
 from zy_quant.intel.edgar_form4 import SecEdgarForm4Scanner
+from zy_quant.intel.market_hours import get_us_market_session
 from zy_quant.intel.regime import MarketRegimeDetector
 from zy_quant.intel.watchlist_scorer import ConservativeWatchlistScorer
 from zy_quant.models import (
@@ -154,9 +155,45 @@ class TradingDaemon:
         self._last_watchlist_scan_at = datetime.now(timezone.utc)
         return self.store.get_watchlist_scores()
 
-    def run_cycle(self, tier_override: Optional[str] = None, check_edgar: bool = False) -> Dict[str, Any]:
+    def run_cycle(
+        self,
+        tier_override: Optional[str] = None,
+        check_edgar: bool = False,
+        force_when_closed: bool = False,
+    ) -> Dict[str, Any]:
         """Executes a single deterministic daemon tick safely."""
         now = datetime.now(timezone.utc)
+        session = get_us_market_session(now)
+
+        # Automatic background loop pauses all scans while US Regular Trading Hours are closed
+        if not session.is_open and not force_when_closed:
+            sleep_m = max(1, min(15, session.minutes_until_open))
+            self.store.set_flag(
+                "daemon_heartbeat",
+                {
+                    "alive": True,
+                    "futu_connected": self.gateway.is_connected(),
+                    "trd_env": self.gateway.trd_env_name,
+                    "market_open": False,
+                    "market_phase": session.phase,
+                    "session_message": session.message,
+                    "open_positions": len(self.store.get_positions()),
+                    "watchlist_refreshed": False,
+                    "timestamp": now.isoformat(),
+                },
+            )
+            return {
+                "market_open": False,
+                "market_phase": session.phase,
+                "session_message": session.message,
+                "regime": "MARKET_CLOSED",
+                "reason": session.message,
+                "watchlist_refreshed": False,
+                "entries": [],
+                "exits": [],
+                "next_sleep_minutes": sleep_m,
+            }
+
         tier = self.settings.tiers_cfg.get_active(tier_override)
 
         # Watchdog check: reconnect FutuOpenD if dropped
@@ -257,9 +294,9 @@ class TradingDaemon:
                     )
                 self.store.upsert_position(pos)
 
-        # 2. New Entry Evaluation — Strictly locked unless Regime == GREEN
+        # 2. New Entry Evaluation — Strictly locked unless Market is OPEN and Regime == GREEN
         entries_placed: List[str] = []
-        if regime.light == RegimeLight.GREEN:
+        if session.is_open and regime.light == RegimeLight.GREEN:
             has_target_acc = self.gateway._select_acc_id(self.gateway.trd_env_name) != 0
             if has_target_acc and self.gateway.trd_env_name == "REAL":
                 acct = self.gateway.get_account_summary()
@@ -381,6 +418,9 @@ class TradingDaemon:
                 "alive": True,
                 "futu_connected": self.gateway.is_connected(),
                 "trd_env": self.gateway.trd_env_name,
+                "market_open": session.is_open,
+                "market_phase": session.phase,
+                "session_message": session.message,
                 "regime": regime.light.value,
                 "open_positions": len(open_positions),
                 "watchlist_refreshed": watchlist_refreshed,
@@ -389,14 +429,17 @@ class TradingDaemon:
         )
         # Check QQQ/SPY regime & open stops frequently (every 3m) during live market hours so we never
         # miss a YELLOW -> GREEN VWAP crossover, while heavy 14-stock watchlist scoring stays throttled
-        # to 15m (GREEN) / 120m (RED/YELLOW) via `watchlist_interval` above!
+        # to 15m (GREEN) / 45m (YELLOW) / 120m (RED) via `watchlist_interval` above!
         return {
+            "market_open": session.is_open,
+            "market_phase": session.phase,
+            "session_message": session.message,
             "regime": regime.light.value,
             "reason": regime.reason,
             "watchlist_refreshed": watchlist_refreshed,
             "entries": entries_placed,
             "exits": exits_triggered,
-            "next_sleep_minutes": 3,
+            "next_sleep_minutes": 3 if session.is_open else max(1, min(15, session.minutes_until_open)),
         }
 
     def run_forever(self, tier_override: Optional[str] = None) -> None:

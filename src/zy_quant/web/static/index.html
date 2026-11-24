@@ -208,6 +208,10 @@
     </div>
   </header>
 
+  <!-- US Market Session Notice Banner (visible when Market Closed) -->
+  <div id="marketClosedBanner" style="display:none;background:rgba(245,158,11,0.13);border:1px solid rgba(245,158,11,0.45);color:#fde68a;border-radius:10px;padding:11px 16px;margin-bottom:14px;font-size:13px;font-weight:500;">
+  </div>
+
   <!-- FutuOpenD Broker & Account Connection Bar -->
   <section class="broker-bar">
     <div class="broker-top">
@@ -476,7 +480,16 @@
       document.getElementById('tierRules').textContent =
         `Cash $${Number(sp.sim_cash_usd ?? 0).toFixed(2)} · Unreal $${Number(sp.unrealized_pnl_usd ?? 0).toFixed(2)} · Realized $${Number(sp.realized_pnl_usd ?? 0).toFixed(2)} · Max ${t.max_concurrent_positions} Pos`;
 
-      // Halt state
+      // US Market Session Banner & Halt state
+      const ms = data.market_session || {};
+      const mBanner = document.getElementById('marketClosedBanner');
+      if (ms.is_open === false) {
+        mBanner.style.display = 'block';
+        mBanner.textContent = `⏸ ${ms.message || 'US Market Closed — Auto-Scan paused until next regular session open.'}`;
+      } else {
+        mBanner.style.display = 'none';
+      }
+
       currentHalted = Boolean(data.halt_state && data.halt_state.halted);
       const haltBtn = document.getElementById('haltBtn');
       const safetyStatus = document.getElementById('safetyStatus');
@@ -485,9 +498,16 @@
         safetyStatus.style.color = 'var(--red)';
         haltBtn.textContent = 'RELEASE KILL-SWITCH';
         haltBtn.className = 'btn-safe';
+      } else if (ms.is_open === false) {
+        safetyStatus.textContent = `PAUSED (MARKET CLOSED)`;
+        safetyStatus.style.color = 'var(--yellow)';
+        document.getElementById('cadenceInfo').textContent = `Next Open: ${ms.next_open_local_str || '22:30'} (${ms.next_open_et_str || '09:30 ET'})`;
+        haltBtn.textContent = 'ENGAGE KILL-SWITCH';
+        haltBtn.className = 'btn-danger';
       } else {
-        safetyStatus.textContent = `${daemonRunning ? 'DAEMON LIVE' : 'STANDBY'} · Cadence ${reg.recommended_scan_minutes || 15}m`;
+        safetyStatus.textContent = `${daemonRunning ? 'DAEMON LIVE' : 'STANDBY'} · Watchlist ${reg.recommended_scan_minutes || 15}m`;
         safetyStatus.style.color = 'var(--green)';
+        document.getElementById('cadenceInfo').textContent = ms.message || 'Green: 15m · Yellow: 45m · Red: 2h RS scan';
         haltBtn.textContent = 'ENGAGE KILL-SWITCH';
         haltBtn.className = 'btn-danger';
       }
