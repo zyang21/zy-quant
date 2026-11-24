@@ -62,7 +62,8 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._futu_mod: Any = None
         self._rpc_lock = threading.RLock()
         self._cap_dist_supported: bool = True
-        self._kline_cache: Dict[tuple[str, str, int], tuple[float, List[Bar]]] = {}
+        self._kline_cache: Dict[tuple[str, str], tuple[float, int, List[Bar]]] = {}
+        self._last_kline_rpc_mono: float = 0.0
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def reconfigure(
@@ -183,14 +184,15 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     # --- Market Data ---
     def get_bars(self, symbol: str, timeframe: str = "15m", days: int = 30) -> List[Bar]:
         if self.is_connected() and not symbol.startswith("^"):
-            # Convert trading days to calendar days so `start` always anchors near the window
-            # and pages right up to today's latest real-time candle!
             cal_days = max(8, int(days * 1.6) + 4) if timeframe == "15m" else max(45, int(days * 1.6) + 10)
-            cache_key = (symbol, timeframe, cal_days)
+            cache_key = (symbol, timeframe)
             now_mono = time.monotonic()
+            ttl = 300.0 if days >= 10 else 45.0
+
             cached = self._kline_cache.get(cache_key)
-            if cached and (now_mono - cached[0]) < 45.0:
-                return cached[1]
+            if cached and (now_mono - cached[0]) < ttl and cached[1] >= cal_days:
+                cutoff_dt = datetime.now(timezone.utc) - timedelta(days=cal_days + 1)
+                return [b for b in cached[2] if b.timestamp >= cutoff_dt]
 
             ft = self._futu_mod
             ktype = ft.KLType.K_15M if timeframe == "15m" else ft.KLType.K_DAY
@@ -201,9 +203,21 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             page_key = None
             with self._rpc_lock:
                 for _ in range(4):
+                    # Pace K-line RPCs under Futu's 60 req / 30s quota (~0.52s min spacing)
+                    elapsed = time.monotonic() - self._last_kline_rpc_mono
+                    if elapsed < 0.52:
+                        time.sleep(0.52 - elapsed)
+                    self._last_kline_rpc_mono = time.monotonic()
+
                     ret, df, page_key = self._quote_ctx.request_history_kline(
                         code, start=start_date, ktype=ktype, max_count=1000, page_req_key=page_key
                     )
+                    if ret != ft.RET_OK and isinstance(df, str) and "frequency" in df.lower():
+                        time.sleep(2.0)
+                        self._last_kline_rpc_mono = time.monotonic()
+                        ret, df, page_key = self._quote_ctx.request_history_kline(
+                            code, start=start_date, ktype=ktype, max_count=1000, page_req_key=page_key
+                        )
                     if ret != ft.RET_OK or df is None or df.empty:
                         break
                     frames.append(df)
@@ -227,8 +241,10 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                                 volume=float(row["volume"]),
                             )
                         )
-                self._kline_cache[cache_key] = (now_mono, out)
+                self._kline_cache[cache_key] = (time.monotonic(), cal_days, out)
                 return out
+            # Never contaminate a connected Futu session with fake synthetic bars
+            return cached[2] if cached else []
         return self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
 
     def get_quote(self, symbol: str) -> Optional[QuoteSnapshot]:
