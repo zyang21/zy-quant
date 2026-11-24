@@ -91,3 +91,12 @@ def test_sanitized_dashboard_and_log_endpoints_hide_infra_secrets() -> None:
     # Static atomic modules served properly
     assert client.get("/static/css/tokens.css").status_code == 200
     assert client.get("/static/js/app.js").status_code == 200
+
+
+def test_separate_simulation_and_real_db_paths() -> None:
+    settings = AppSettings.load()
+    sim_db = settings.resolve_db_path("SIMULATE")
+    real_db = settings.resolve_db_path("REAL")
+    assert sim_db.name == "zy_quant_sim.db"
+    assert real_db.name == "zy_quant_real.db"
+    assert sim_db != real_db

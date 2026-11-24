@@ -201,6 +201,12 @@ class AppSettings(BaseModel):
     def active_tier_profile(self) -> TierProfile:
         return self.tiers_cfg.get_active(self.active_tier_key)
 
+    def resolve_db_path(self, trd_env_override: Optional[str] = None) -> Path:
+        """Separates simulation ledger (`zy_quant_sim.db`) from live trading ledger (`zy_quant_real.db`)."""
+        env = (trd_env_override or self.runtime_cfg.futu.trd_env).strip().upper()
+        filename = "zy_quant_real.db" if env == "REAL" else "zy_quant_sim.db"
+        return self.root_dir / "data" / filename
+
     @classmethod
     def load(cls, root_dir: Optional[Path] = None) -> "AppSettings":
         root = root_dir or default_project_root()
@@ -218,15 +224,15 @@ class AppSettings(BaseModel):
             )
 
         futu_dict = dict(runtime_raw.get("futu", {}))
-        if os.getenv("ZY_FUTU_HOST"):
+        if not futu_dict.get("host") and os.getenv("ZY_FUTU_HOST"):
             futu_dict["host"] = os.environ["ZY_FUTU_HOST"]
-        if os.getenv("ZY_FUTU_PORT"):
+        if not futu_dict.get("port") and os.getenv("ZY_FUTU_PORT"):
             futu_dict["port"] = int(os.environ["ZY_FUTU_PORT"])
-        if os.getenv("ZY_TRD_ENV"):
+        if not futu_dict.get("trd_env") and os.getenv("ZY_TRD_ENV"):
             futu_dict["trd_env"] = os.environ["ZY_TRD_ENV"]
-        if os.getenv("ZY_FUTU_API_TOKEN") and not futu_dict.get("api_token"):
+        if not futu_dict.get("api_token") and os.getenv("ZY_FUTU_API_TOKEN"):
             futu_dict["api_token"] = os.environ["ZY_FUTU_API_TOKEN"]
-        if os.getenv("ZY_FUTU_TRADE_PWD_MD5") and not futu_dict.get("trade_pwd_md5"):
+        if not futu_dict.get("trade_pwd_md5") and os.getenv("ZY_FUTU_TRADE_PWD_MD5"):
             futu_dict["trade_pwd_md5"] = os.environ["ZY_FUTU_TRADE_PWD_MD5"]
         runtime_raw["futu"] = futu_dict
 

@@ -35,7 +35,7 @@ class ControlCenterApplication:
         self.log_buffer = RingBufferLogHandler(capacity=400)
         self._configure_logging()
 
-        self.store = StateStore(self.settings.root_dir / "data" / "zy_quant.db")
+        self.store = StateStore(self.settings.resolve_db_path())
         self.daemon = TradingDaemon(settings=self.settings, store=self.store)
         self.portfolio_svc = PortfolioAnalyticsService(self.settings, self.store)
         self.history_svc = HistoryQueryService(self.store)
@@ -114,13 +114,23 @@ class ControlCenterApplication:
                 await asyncio.sleep(1)
 
     def refresh_config_if_needed(self) -> None:
-        """Hot-reloads config/settings.json & config/*.yaml, including live SIMULATE <-> REAL switches."""
+        """Hot-reloads config/settings.json & config/*.yaml, including live SIMULATE <-> REAL DB & gateway switches."""
         fresh = AppSettings.load(self.settings.root_dir)
         old_futu = self.settings.runtime_cfg.futu
         new_futu = fresh.runtime_cfg.futu
         self.settings = fresh
         self.daemon.settings = fresh
         self.portfolio_svc.settings = fresh
+
+        new_db_path = fresh.resolve_db_path()
+        if new_db_path != self.store.db_path:
+            new_store = StateStore(new_db_path)
+            self.store = new_store
+            self.daemon.store = new_store
+            self.daemon.risk_gate.store = new_store
+            self.portfolio_svc.store = new_store
+            self.history_svc.store = new_store
+            self.logger.info("Switched active ledger database to %s", new_db_path.name)
 
         if (
             new_futu.trd_env.upper() != self.daemon.gateway.trd_env_name

@@ -26,7 +26,10 @@ class QuantCLI:
 
     def __init__(self, settings: Optional[AppSettings] = None) -> None:
         self.settings = settings or AppSettings.load()
-        self.db_path = self.settings.root_dir / "data" / "zy_quant.db"
+        self.db_path = self.settings.resolve_db_path()
+
+    def _store_for_env(self, trd_env: Optional[str] = None) -> StateStore:
+        return StateStore(self.settings.resolve_db_path(trd_env))
 
     def run_dashboard(
         self,
@@ -44,8 +47,8 @@ class QuantCLI:
             os.environ["ZY_ACCOUNT_TIER"] = tier
         uvicorn.run("zy_quant.web.app:app", host=resolved_host, port=resolved_port, reload=False)
 
-    def run_status(self, as_json: bool = False) -> None:
-        store = StateStore(self.db_path)
+    def run_status(self, trd_env: Optional[str] = None, as_json: bool = False) -> None:
+        store = self._store_for_env(trd_env)
         portfolio_svc = PortfolioAnalyticsService(self.settings, store)
         snap = portfolio_svc.build_live_portfolio_snapshot()
         session = get_us_market_session()
@@ -113,8 +116,9 @@ class QuantCLI:
         limit: int,
         show_orders: bool,
         as_json: bool,
+        trd_env: Optional[str] = None,
     ) -> None:
-        store = StateStore(self.db_path)
+        store = self._store_for_env(trd_env)
         history_svc = HistoryQueryService(store)
         res = history_svc.query_history(
             preset=preset,
@@ -245,6 +249,9 @@ class QuantCLI:
                 {
                     "settings_file": str(self.settings.root_dir / "config" / "settings.json"),
                     "local_override_file": str(self.settings.root_dir / "config" / "settings.local.json"),
+                    "active_db_file": str(self.settings.resolve_db_path()),
+                    "sim_db_file": str(self.settings.resolve_db_path("SIMULATE")),
+                    "real_db_file": str(self.settings.resolve_db_path("REAL")),
                     "active_runtime_config": cfg,
                 },
                 indent=2,
@@ -260,6 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_status = sub.add_parser("status", help="Show live market regime, portfolio NAV, watchlist & positions")
+    p_status.add_argument("--env", default=None, choices=["SIMULATE", "REAL"], help="Inspect SIMULATE or REAL ledger")
     p_status.add_argument("--json", action="store_true")
 
     p_dash = sub.add_parser("dashboard", help="Launch Web Quantitative Trading Terminal")
@@ -274,6 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_daemon.add_argument("--edgar", action="store_true")
 
     p_hist = sub.add_parser("history", help="Query closed trades & execution journal across time windows")
+    p_hist.add_argument("--env", default=None, choices=["SIMULATE", "REAL"], help="Query SIMULATE or REAL ledger")
     p_hist.add_argument("--preset", default="ALL", help="24H | 7D | 30D | 90D | YTD | ALL")
     p_hist.add_argument("--from", dest="start_date", default=None, help="Start date YYYY-MM-DD")
     p_hist.add_argument("--to", dest="end_date", default=None, help="End date YYYY-MM-DD")
@@ -317,7 +326,7 @@ def main() -> None:
     cli = QuantCLI()
 
     if args.cmd == "status":
-        cli.run_status(as_json=args.json)
+        cli.run_status(trd_env=args.env, as_json=args.json)
     elif args.cmd == "dashboard":
         logging.getLogger().setLevel(logging.INFO)
         cli.run_dashboard(args.host, args.port, args.auto_daemon, args.tier)
@@ -341,6 +350,7 @@ def main() -> None:
             limit=args.limit,
             show_orders=args.orders,
             as_json=args.json,
+            trd_env=args.env,
         )
     elif args.cmd == "backtest":
         cli.run_backtest(
