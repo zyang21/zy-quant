@@ -4,7 +4,9 @@ import argparse
 import json
 import logging
 import os
+import subprocess
 from dataclasses import asdict
+from pathlib import Path
 from typing import Optional
 
 import uvicorn
@@ -291,6 +293,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("config", help="Display active merged runtime configuration (secrets masked)")
 
+    p_svc = sub.add_parser("service", help="Manage macOS launchd background service (start|stop|restart)")
+    p_svc.add_argument("action", choices=["start", "stop", "restart"], help="Service lifecycle action")
+
     p_fee = sub.add_parser("fee-calc", help="Calculate exact 2026 Futu HK US round-trip friction")
     p_fee.add_argument("--shares", type=float, required=True)
     p_fee.add_argument("--price", type=float, required=True)
@@ -348,6 +353,18 @@ def main() -> None:
         )
     elif args.cmd == "config":
         cli.run_config_show()
+    elif args.cmd == "service":
+        uid = os.getuid()
+        plist = Path.home() / "Library" / "LaunchAgents" / "com.zyquant.daemon.plist"
+        if args.action == "stop":
+            subprocess.run(["launchctl", "bootout", f"gui/{uid}/com.zyquant.daemon"], check=False)
+            print("Background service stopped.")
+        elif args.action == "start":
+            subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], check=False)
+            print("Background service started.")
+        elif args.action == "restart":
+            subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/com.zyquant.daemon"], check=False)
+            print("Background service restarted.")
     elif args.cmd == "fee-calc":
         fm = FutuUSFeeModel()
         print(

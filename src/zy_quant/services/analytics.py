@@ -18,9 +18,12 @@ class PortfolioAnalyticsService:
         self.settings = settings
         self.store = store
 
-    def build_live_portfolio_snapshot(self) -> Dict[str, Any]:
+    def build_live_portfolio_snapshot(
+        self, broker_summary: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
         tier_key = self.settings.active_tier_key
         tier = self.settings.active_tier_profile
+        is_real = self.settings.runtime_cfg.futu.trd_env.upper() == "REAL"
 
         watchlist_rows = self.store.get_watchlist_scores()
         wl_prices = {w["symbol"]: float(w["price"]) for w in watchlist_rows}
@@ -73,10 +76,19 @@ class PortfolioAnalyticsService:
             float(o.get("fee_usd", 0.0)) for o in orders_all if o.get("status") == "FILLED"
         )
 
-        cash_usd = max(0.0, tier.reference_equity_usd + realized_total - invested_cost)
-        equity_usd = cash_usd + mark_val_total
-        net_pnl_usd = equity_usd - tier.reference_equity_usd
-        net_ret_pct = (net_pnl_usd / max(1.0, tier.reference_equity_usd)) * 100.0
+        if is_real and broker_summary and float(broker_summary.get("equity_usd", 0.0)) > 0:
+            equity_usd = float(broker_summary["equity_usd"])
+            cash_usd = float(broker_summary.get("cash_usd", 0.0))
+            base_eq = equity_usd - realized_total - unrealized_total
+            if base_eq <= 0:
+                base_eq = equity_usd
+        else:
+            base_eq = tier.reference_equity_usd
+            cash_usd = max(0.0, base_eq + realized_total - invested_cost)
+            equity_usd = cash_usd + mark_val_total
+
+        net_pnl_usd = equity_usd - base_eq
+        net_ret_pct = (net_pnl_usd / max(1.0, base_eq)) * 100.0
         wins = sum(1 for t in closed_all if float(t.get("net_pnl_usd", 0.0)) > 0)
         win_rate = (wins / len(closed_all) * 100.0) if closed_all else 0.0
 
@@ -107,7 +119,7 @@ class PortfolioAnalyticsService:
         return {
             "portfolio": {
                 "profile_label": tier.label,
-                "starting_equity_usd": round(tier.reference_equity_usd, 2),
+                "starting_equity_usd": round(base_eq, 2),
                 "equity_usd": round(equity_usd, 2),
                 "cash_usd": round(cash_usd, 2),
                 "market_value_usd": round(mark_val_total, 2),

@@ -114,11 +114,34 @@ class ControlCenterApplication:
                 await asyncio.sleep(1)
 
     def refresh_config_if_needed(self) -> None:
-        """Hot-reloads config/settings.json & config/*.yaml so tier/strategy edits take effect immediately."""
+        """Hot-reloads config/settings.json & config/*.yaml, including live SIMULATE <-> REAL switches."""
         fresh = AppSettings.load(self.settings.root_dir)
+        old_futu = self.settings.runtime_cfg.futu
+        new_futu = fresh.runtime_cfg.futu
         self.settings = fresh
         self.daemon.settings = fresh
         self.portfolio_svc.settings = fresh
+
+        if (
+            new_futu.trd_env.upper() != self.daemon.gateway.trd_env_name
+            or new_futu.host != old_futu.host
+            or new_futu.port != old_futu.port
+            or new_futu.trade_pwd_md5 != old_futu.trade_pwd_md5
+        ):
+            self.daemon.gateway.trade_pwd_md5 = new_futu.trade_pwd_md5
+            ok = self.daemon.gateway.reconfigure(
+                host=new_futu.host,
+                port=new_futu.port,
+                trd_env=new_futu.trd_env,
+                api_token=new_futu.api_token or self.daemon.gateway.api_token,
+            )
+            if ok:
+                self.daemon.startup_reconcile()
+            self.logger.info(
+                "Hot-reloaded Futu gateway configuration (env=%s, connected=%s)",
+                new_futu.trd_env.upper(),
+                ok,
+            )
 
     def get_sanitized_connection_status(self) -> Dict[str, Any]:
         """Returns broker connection health & data integrity alerts without exposing secrets."""
@@ -221,7 +244,10 @@ def get_dashboard() -> Dict[str, Any]:
         if not ctx.store.get_watchlist_scores():
             ctx.daemon.refresh_watchlist(snap, check_edgar=False)
 
-    live_snap = ctx.portfolio_svc.build_live_portfolio_snapshot()
+    raw_broker = ctx.daemon.gateway.get_broker_status()
+    live_snap = ctx.portfolio_svc.build_live_portfolio_snapshot(
+        broker_summary=raw_broker.get("account_summary")
+    )
     session_status = asdict(get_us_market_session())
     conn_status = ctx.get_sanitized_connection_status()
 
