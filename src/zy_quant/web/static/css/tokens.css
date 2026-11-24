@@ -1,0 +1,37 @@
+:root {
+  /* Binance Pro Obsidian Surfaces + Apple Subtle Elevation */
+  --bg-canvas: #0b0e11;
+  --bg-surface: #14181d;
+  --bg-elevated: #1b2028;
+  --bg-hover: #232a34;
+  --bg-glass: rgba(20, 24, 29, 0.82);
+
+  /* Hairline Borders */
+  --border-subtle: rgba(255, 255, 255, 0.07);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  /* Typography Colors */
+  --text-primary: #eaecef;
+  --text-secondary: #929aa5;
+  --text-tertiary: #5e6673;
+
+  /* Trading Semantic Palette (Binance Emerald / Coral / Amber / Apple Blue) */
+  --up: #0ecb81;
+  --up-bg: rgba(14, 203, 129, 0.12);
+  --down: #f6465d;
+  --down-bg: rgba(246, 70, 93, 0.12);
+  --warn: #f0b90b;
+  --warn-bg: rgba(240, 185, 11, 0.12);
+  --accent: #2997ff;
+  --accent-bg: rgba(41, 151, 255, 0.14);
+
+  /* Typography Stack */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Inter", system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* Radii & Shadows */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --shadow-card: 0 8px 24px rgba(0, 0, 0, 0.28);
+}

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -13,6 +14,36 @@ def default_project_root() -> Path:
     root = Path(__file__).resolve().parents[2]
     load_dotenv(root / ".env", override=False)
     return root
+
+
+def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(merged.get(k), dict):
+            merged[k] = _deep_merge(merged[k], v)
+        else:
+            merged[k] = v
+    return merged
+
+
+class FutuConnectionConfig(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 11111
+    trd_env: str = "SIMULATE"
+    api_token: str = ""
+    trade_pwd_md5: str = ""
+
+
+class WebServerConfig(BaseModel):
+    host: str = "127.0.0.1"
+    port: int = 8088
+    auto_start_daemon: bool = True
+
+
+class RuntimeSettingsConfig(BaseModel):
+    account_tier: str = "tier_10k"
+    futu: FutuConnectionConfig = Field(default_factory=FutuConnectionConfig)
+    web: WebServerConfig = Field(default_factory=WebServerConfig)
 
 
 class TierProfile(BaseModel):
@@ -38,7 +69,7 @@ class TierProfile(BaseModel):
 
 
 class TiersConfig(BaseModel):
-    active_tier: str = "tier_1k"
+    active_tier: str = "tier_10k"
     tiers: Dict[str, TierProfile]
 
     def get_active(self, override: Optional[str] = None) -> TierProfile:
@@ -148,22 +179,64 @@ class StrategyConfig(BaseModel):
 
 class AppSettings(BaseModel):
     root_dir: Path
+    runtime_cfg: RuntimeSettingsConfig
     tiers_cfg: TiersConfig
     watchlist_cfg: WatchlistScoringConfig
     strategy_cfg: StrategyConfig
+
+    @property
+    def active_tier_key(self) -> str:
+        return os.getenv("ZY_ACCOUNT_TIER") or self.runtime_cfg.account_tier or self.tiers_cfg.active_tier
+
+    @property
+    def active_tier_profile(self) -> TierProfile:
+        return self.tiers_cfg.get_active(self.active_tier_key)
 
     @classmethod
     def load(cls, root_dir: Optional[Path] = None) -> "AppSettings":
         root = root_dir or default_project_root()
         cfg_dir = root / "config"
+
+        # Load unified JSON runtime settings + optional gitignored settings.local.json + env fallbacks
+        runtime_raw: Dict[str, Any] = {}
+        settings_json = cfg_dir / "settings.json"
+        if settings_json.exists():
+            runtime_raw = json.loads(settings_json.read_text(encoding="utf-8"))
+        local_json = cfg_dir / "settings.local.json"
+        if local_json.exists():
+            runtime_raw = _deep_merge(
+                runtime_raw, json.loads(local_json.read_text(encoding="utf-8"))
+            )
+
+        futu_dict = dict(runtime_raw.get("futu", {}))
+        if os.getenv("ZY_FUTU_HOST"):
+            futu_dict["host"] = os.environ["ZY_FUTU_HOST"]
+        if os.getenv("ZY_FUTU_PORT"):
+            futu_dict["port"] = int(os.environ["ZY_FUTU_PORT"])
+        if os.getenv("ZY_TRD_ENV"):
+            futu_dict["trd_env"] = os.environ["ZY_TRD_ENV"]
+        if os.getenv("ZY_FUTU_API_TOKEN") and not futu_dict.get("api_token"):
+            futu_dict["api_token"] = os.environ["ZY_FUTU_API_TOKEN"]
+        if os.getenv("ZY_FUTU_TRADE_PWD_MD5") and not futu_dict.get("trade_pwd_md5"):
+            futu_dict["trade_pwd_md5"] = os.environ["ZY_FUTU_TRADE_PWD_MD5"]
+        runtime_raw["futu"] = futu_dict
+
+        if os.getenv("ZY_ACCOUNT_TIER"):
+            runtime_raw["account_tier"] = os.environ["ZY_ACCOUNT_TIER"]
+
+        runtime_cfg = RuntimeSettingsConfig.model_validate(runtime_raw)
+
         with open(cfg_dir / "tiers.yaml", "r", encoding="utf-8") as f:
             tiers_raw = yaml.safe_load(f)
+        tiers_raw["active_tier"] = runtime_cfg.account_tier
         with open(cfg_dir / "watchlist_scoring.yaml", "r", encoding="utf-8") as f:
             watch_raw = yaml.safe_load(f)
         with open(cfg_dir / "strategy.yaml", "r", encoding="utf-8") as f:
             strat_raw = yaml.safe_load(f)
+
         return cls(
             root_dir=root,
+            runtime_cfg=runtime_cfg,
             tiers_cfg=TiersConfig.model_validate(tiers_raw),
             watchlist_cfg=WatchlistScoringConfig.model_validate(watch_raw),
             strategy_cfg=StrategyConfig.model_validate(strat_raw),

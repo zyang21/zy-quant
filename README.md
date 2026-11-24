@@ -33,25 +33,48 @@ Resilient US Equities Intraday & Short-Swing Quantitative Trading System built f
 - **SQLite WAL Idempotent Ledger & Startup Reconciliation:** Prevents duplicate orders across restarts and reconciles live `FutuOpenD` positions automatically on boot.
 - **Hard Mandate Circuit Breakers:** Persistent global Kill-Switch (`HALT`), daily max loss lock, and 60-second runaway burst breaker.
 
-## Quickstart
+## Configuration (`config/settings.json`)
+
+All infrastructure, endpoint, and tier settings live in `config/settings.json` (secrets such as `api_token` go in gitignored `config/settings.local.json` or `.env`, and are never exposed on the web UI):
+
+```json
+{
+  "account_tier": "tier_10k",
+  "futu": {
+    "host": "127.0.0.1",
+    "port": 11111,
+    "trd_env": "SIMULATE",
+    "api_token": "",
+    "trade_pwd_md5": ""
+  },
+  "web": {
+    "host": "127.0.0.1",
+    "port": 8088,
+    "auto_start_daemon": true
+  }
+}
+```
+
+## CLI & Web Terminal Quickstart
 
 ```bash
-# Install in isolated virtual environment
-uv venv --python 3.12
-uv pip install -e ".[dev]"
-
 # Run unit tests
 .venv/bin/pytest
 
-# Calculate exact Futu 2026 US round-trip friction
-.venv/bin/zy-quant fee-calc --shares 25 --price 190
+# Inspect live market regime, portfolio NAV, watchlist & open positions
+.venv/bin/zy-quant status
 
-# Run 15m fee-accurate backtest
-.venv/bin/zy-quant backtest --tier tier_10k --days 30
+# Query trade history & order journal across custom date windows
+.venv/bin/zy-quant history --preset 30D --orders
+.venv/bin/zy-quant history --from 2026-11-01 --to 2026-11-24 --symbol NVDA
 
-# Run a single daemon scan cycle
-.venv/bin/zy-quant daemon --once --tier tier_1k
+# Run 15m fee-accurate backtest over a historical date range
+.venv/bin/zy-quant backtest --days 30
+.venv/bin/zy-quant backtest --from 2026-10-15 --to 2026-11-23 --symbols NVDA,MSFT,META
 
-# Launch Web Quantitative Control Center (http://127.0.0.1:8088)
-.venv/bin/zy-quant dashboard --port 8088
+# Inspect merged runtime configuration (secrets masked)
+.venv/bin/zy-quant config
+
+# Launch 3-Page Web Trading Terminal + Docked Log Console (http://127.0.0.1:8088)
+.venv/bin/zy-quant dashboard
 ```

@@ -222,9 +222,37 @@ class StateStore:
         return int(row["cnt"]) if row else 0
 
     def list_recent_orders(self, limit: int = 30) -> List[Dict[str, Any]]:
+        return self.query_orders(limit=limit)
+
+    def query_orders(
+        self,
+        start_iso: Optional[str] = None,
+        end_iso: Optional[str] = None,
+        symbol: Optional[str] = None,
+        side: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if start_iso:
+            clauses.append("created_at >= ?")
+            params.append(start_iso)
+        if end_iso:
+            clauses.append("created_at <= ?")
+            params.append(end_iso)
+        if symbol:
+            clauses.append("UPPER(symbol) = ?")
+            params.append(symbol.upper())
+        if side:
+            clauses.append("UPPER(side) = ?")
+            params.append(side.upper())
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,)
+                f"SELECT * FROM orders {where_sql} ORDER BY created_at DESC LIMIT ?",
+                params,
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -404,9 +432,37 @@ class StateStore:
         return float(row["s"]) if row else 0.0
 
     def list_closed_trades(self, limit: int = 50) -> List[Dict[str, Any]]:
+        return self.query_closed_trades(limit=limit)
+
+    def query_closed_trades(
+        self,
+        start_iso: Optional[str] = None,
+        end_iso: Optional[str] = None,
+        symbol: Optional[str] = None,
+        exit_reason: Optional[str] = None,
+        limit: int = 500,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        params: List[Any] = []
+        if start_iso:
+            clauses.append("exit_time >= ?")
+            params.append(start_iso)
+        if end_iso:
+            clauses.append("exit_time <= ?")
+            params.append(end_iso)
+        if symbol:
+            clauses.append("UPPER(symbol) = ?")
+            params.append(symbol.upper())
+        if exit_reason:
+            clauses.append("exit_reason = ?")
+            params.append(exit_reason)
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM closed_trades ORDER BY id DESC LIMIT ?", (limit,)
+                f"SELECT * FROM closed_trades {where_sql} ORDER BY exit_time DESC, id DESC LIMIT ?",
+                params,
             ).fetchall()
         return [dict(r) for r in rows]
 

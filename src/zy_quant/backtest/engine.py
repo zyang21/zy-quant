@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from datetime import timedelta
-from typing import Any, Dict, List
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 from zy_quant.config import AppSettings
 from zy_quant.fees import FutuUSFeeModel
@@ -29,9 +29,12 @@ class BacktestResult:
     total_closed_trades: int
     win_rate_pct: float
     avg_r_multiple: float
+    profit_factor: float
     max_drawdown_pct: float
     green_bars: int
     rest_bars: int
+    period_start: str = ""
+    period_end: str = ""
     equity_curve: List[Dict[str, Any]] = field(default_factory=list)
     trades: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -55,28 +58,39 @@ class BacktestEngine:
 
     def run(
         self,
-        tier_key: str = "tier_1k",
+        tier_key: Optional[str] = None,
         symbols: List[str] | None = None,
         days: int = 30,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
     ) -> BacktestResult:
-        tier = self.settings.tiers_cfg.get_active(tier_key)
+        resolved_tier_key = tier_key or self.settings.active_tier_key
+        tier = self.settings.tiers_cfg.get_active(resolved_tier_key)
         initial_eq = tier.reference_equity_usd
         cash = initial_eq
+
+        # If explicit date window provided, compute required lookback days automatically
+        start_d = datetime.fromisoformat(start_date).date() if start_date else None
+        end_d = datetime.fromisoformat(end_date).date() if end_date else None
+        fetch_days = days
+        if start_d is not None:
+            today_d = datetime.utcnow().date()
+            fetch_days = max(days, min(58, (today_d - start_d).days + 8))
 
         universe_map = {u.symbol: u for u in self.settings.watchlist_cfg.universe}
         target_symbols = symbols or [
             u.symbol for u in self.settings.watchlist_cfg.universe if u.sector != "Broad_ETF"
-        ][:6]
+        ][:8]
 
         # Load 15m & daily series
-        qqq_15m = self.data.get_bars("QQQ", timeframe="15m", days=days)
-        qqq_1d = self.data.get_bars("QQQ", timeframe="1d", days=max(60, days + 30))
-        spy_1d = self.data.get_bars("SPY", timeframe="1d", days=max(60, days + 30))
+        qqq_15m = self.data.get_bars("QQQ", timeframe="15m", days=fetch_days)
+        qqq_1d = self.data.get_bars("QQQ", timeframe="1d", days=max(60, fetch_days + 30))
+        spy_1d = self.data.get_bars("SPY", timeframe="1d", days=max(60, fetch_days + 30))
 
         symbol_bars: Dict[str, List[Bar]] = {}
         symbol_atrs: Dict[str, List[float]] = {}
         for sym in target_symbols:
-            b15 = self.data.get_bars(sym, timeframe="15m", days=days)
+            b15 = self.data.get_bars(sym, timeframe="15m", days=fetch_days)
             if len(b15) >= 30:
                 symbol_bars[sym] = b15
                 symbol_atrs[sym] = compute_wilder_atr_series(
@@ -85,7 +99,7 @@ class BacktestEngine:
 
         if not qqq_15m or not symbol_bars:
             return BacktestResult(
-                tier_key=tier_key,
+                tier_key=resolved_tier_key,
                 tier_label=tier.label,
                 initial_equity_usd=initial_eq,
                 final_equity_usd=initial_eq,
@@ -97,6 +111,7 @@ class BacktestEngine:
                 total_closed_trades=0,
                 win_rate_pct=0.0,
                 avg_r_multiple=0.0,
+                profit_factor=0.0,
                 max_drawdown_pct=0.0,
                 green_bars=0,
                 rest_bars=0,
@@ -119,9 +134,15 @@ class BacktestEngine:
         equity_curve: List[Dict[str, Any]] = []
 
         warmup = 25
+        eval_timestamps: List[datetime] = []
         for q_idx in range(warmup, len(qqq_15m)):
             q_bar = qqq_15m[q_idx]
             ts = q_bar.timestamp
+            if start_d and ts.date() < start_d:
+                continue
+            if end_d and ts.date() > end_d:
+                continue
+            eval_timestamps.append(ts)
 
             # Slice daily bars strictly up to current date (point-in-time, no look-ahead)
             q_d_slice = [d for d in qqq_1d if d.timestamp.date() <= ts.date()]
@@ -302,6 +323,13 @@ class BacktestEngine:
             if closed_trades
             else 0.0
         )
+        gross_wins = sum(t["net_pnl_usd"] for t in closed_trades if t["net_pnl_usd"] > 0)
+        gross_losses = abs(sum(t["net_pnl_usd"] for t in closed_trades if t["net_pnl_usd"] < 0))
+        profit_factor = (
+            (gross_wins / gross_losses)
+            if gross_losses > 0.01
+            else (9.99 if gross_wins > 0 else 0.0)
+        )
         fee_drag = (
             (total_fees / abs(gross_pnl_total)) * 100.0
             if abs(gross_pnl_total) > 0.01
@@ -309,7 +337,7 @@ class BacktestEngine:
         )
 
         return BacktestResult(
-            tier_key=tier_key,
+            tier_key=resolved_tier_key,
             tier_label=tier.label,
             initial_equity_usd=round(initial_eq, 2),
             final_equity_usd=round(final_eq, 2),
@@ -321,9 +349,12 @@ class BacktestEngine:
             total_closed_trades=len(closed_trades),
             win_rate_pct=round(win_rate, 1),
             avg_r_multiple=round(avg_r, 2),
+            profit_factor=round(profit_factor, 2),
             max_drawdown_pct=round(max_dd_pct, 2),
             green_bars=green_bars,
             rest_bars=rest_bars,
+            period_start=eval_timestamps[0].strftime("%Y-%m-%d") if eval_timestamps else "",
+            period_end=eval_timestamps[-1].strftime("%Y-%m-%d") if eval_timestamps else "",
             equity_curve=equity_curve,
             trades=closed_trades,
         )

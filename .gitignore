@@ -9,4 +9,5 @@ data/*.db-wal
 data/cache/
 logs/
 .env
+config/*.local.json
 .DS_Store

@@ -8,6 +8,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from zy_quant.config import FutuConnectionConfig
 from zy_quant.gateway.base import BrokerExecutionAdapter, MarketDataAdapter
 from zy_quant.gateway.yfinance_adapter import YahooMarketDataAdapter
 from zy_quant.models import Bar, CapitalFlowSnapshot, OrderSide, QuoteSnapshot
@@ -41,13 +42,19 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         port: Optional[int] = None,
         trd_env: Optional[str] = None,
         api_token: Optional[str] = None,
+        futu_cfg: Optional[FutuConnectionConfig] = None,
         fallback_data: Optional[YahooMarketDataAdapter] = None,
     ) -> None:
-        self.host = host or os.getenv("ZY_FUTU_HOST", "127.0.0.1")
-        self.port = int(port or os.getenv("ZY_FUTU_PORT", "11111"))
-        self.trd_env_name = (trd_env or os.getenv("ZY_TRD_ENV", "SIMULATE")).upper()
-        self.api_token = api_token if api_token is not None else os.getenv("ZY_FUTU_API_TOKEN", "")
-        self.trade_pwd_md5 = os.getenv("ZY_FUTU_TRADE_PWD_MD5", "")
+        cfg = futu_cfg or FutuConnectionConfig()
+        self.host = host or os.getenv("ZY_FUTU_HOST") or cfg.host
+        self.port = int(port or os.getenv("ZY_FUTU_PORT") or cfg.port)
+        self.trd_env_name = (trd_env or os.getenv("ZY_TRD_ENV") or cfg.trd_env).upper()
+        self.api_token = (
+            api_token
+            if api_token is not None
+            else (cfg.api_token or os.getenv("ZY_FUTU_API_TOKEN", ""))
+        )
+        self.trade_pwd_md5 = cfg.trade_pwd_md5 or os.getenv("ZY_FUTU_TRADE_PWD_MD5", "")
         self.fallback = fallback_data or YahooMarketDataAdapter()
 
         self._quote_ctx: Any = None
