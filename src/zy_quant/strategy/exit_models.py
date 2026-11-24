@@ -49,19 +49,22 @@ class ScientificExitAndSizingEngine:
         account_equity_usd: float,
         available_cash_usd: float,
         tier: TierProfile,
+        position_scale: float = 1.0,
     ) -> Tuple[Optional[PositionPlan], str]:
         px = signal.entry_price
         if px <= 0 or signal.atr_14 <= 0:
             return None, "Invalid entry price or ATR"
 
-        # 1. Wilder ATR Initial Stop Distance
-        raw_stop_dist = self.cfg.atr_stop_multiplier * signal.atr_14
+        scale = max(0.25, min(1.0, position_scale))
+
+        # 1. Wilder ATR Initial Stop Distance with noise-band floor (min_stop_pct) & safety ceiling
+        raw_stop_dist = max(self.cfg.atr_stop_multiplier * signal.atr_14, px * self.cfg.min_stop_pct)
         max_stop_dist = px * self.cfg.max_hard_stop_pct
         risk_per_share = min(raw_stop_dist, max_stop_dist)
         initial_stop = round(px - risk_per_share, 2)
         risk_per_share = max(0.01, px - initial_stop)
 
-        # Expected multi-bar reward based on ATR swing potential
+        # Expected multi-bar reward based strictly on actual ATR volatility (never inflated by min_stop_pct)
         expected_move_usd = self.cfg.expected_reward_atr_multiple * signal.atr_14
         expected_move_pct = expected_move_usd / px
         if expected_move_pct < tier.min_expected_move_pct:
@@ -70,9 +73,12 @@ class ScientificExitAndSizingEngine:
                 f"Expected move {expected_move_pct*100:.2f}% < tier minimum {tier.min_expected_move_pct*100:.2f}%",
             )
 
-        # 2. Fixed-Fractional Risk Sizing capped by Tier Max Position Notional & Available Cash
-        max_risk_budget_usd = account_equity_usd * tier.risk_per_trade_pct
-        max_notional_usd = min(available_cash_usd, account_equity_usd * tier.max_position_pct)
+        # 2. Fixed-Fractional Risk Sizing scaled by Regime Conviction (`scale`)
+        max_risk_budget_usd = account_equity_usd * tier.risk_per_trade_pct * scale
+        max_notional_usd = min(
+            available_cash_usd,
+            account_equity_usd * tier.max_position_pct * scale,
+        )
 
         shares_by_risk = max_risk_budget_usd / risk_per_share
         shares_by_notional = max_notional_usd / px

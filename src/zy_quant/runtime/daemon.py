@@ -54,7 +54,10 @@ class TradingDaemon:
     ) -> None:
         self.settings = settings
         self.store = store or StateStore(settings.root_dir / "data" / "zy_quant.db")
-        self.gateway = gateway or FutuGatewayAdapter(futu_cfg=settings.runtime_cfg.futu)
+        self.gateway = gateway or FutuGatewayAdapter(
+            futu_cfg=settings.runtime_cfg.futu,
+            allow_synthetic_fallback=settings.runtime_cfg.allow_synthetic_fallback,
+        )
         self.notifier = notifier or AlertNotifier()
         self.fee_model = FutuUSFeeModel()
 
@@ -294,9 +297,9 @@ class TradingDaemon:
                     )
                 self.store.upsert_position(pos)
 
-        # 2. New Entry Evaluation — Strictly locked unless Market is OPEN and Regime == GREEN
+        # 2. New Entry Evaluation — GREEN (100% scale) or YELLOW (Selective Alpha Leaders @ 65% scale)
         entries_placed: List[str] = []
-        if session.is_open and regime.light == RegimeLight.GREEN:
+        if session.is_open and regime.light in (RegimeLight.GREEN, RegimeLight.YELLOW):
             has_target_acc = self.gateway._select_acc_id(self.gateway.trd_env_name) != 0
             if has_target_acc and self.gateway.trd_env_name == "REAL":
                 acct = self.gateway.get_account_summary()
@@ -312,6 +315,22 @@ class TradingDaemon:
                 )
                 cash = max(0.0, equity - invested)
 
+            pos_scale = (
+                1.0
+                if regime.light == RegimeLight.GREEN
+                else self.settings.strategy_cfg.regime.yellow_position_scale
+            )
+            cooldown_cutoff = (
+                now - timedelta(hours=self.settings.strategy_cfg.entry.cooldown_hours_after_exit)
+            ).isoformat()
+            recent_exits = {
+                t["symbol"]
+                for t in self.store.query_closed_trades(start_iso=cooldown_cutoff, limit=100)
+            }
+            qqq_1d = self.gateway.get_bars(
+                self.settings.strategy_cfg.regime.primary_benchmark, timeframe="1d", days=40
+            )
+
             top_n = self.settings.watchlist_cfg.scoring_thresholds.top_n_active
             min_score = self.settings.watchlist_cfg.scoring_thresholds.min_watch_score
             watchlist = [
@@ -322,9 +341,10 @@ class TradingDaemon:
 
             for item in watchlist:
                 sym = item["symbol"]
-                if sym in open_positions:
+                if sym in open_positions or sym in recent_exits:
                     continue
                 bars_15m = self.gateway.get_bars(sym, timeframe="15m", days=5)
+                bars_1d = self.gateway.get_bars(sym, timeframe="1d", days=40)
                 flow = self.gateway.get_capital_flow(sym)
                 sig = self.signal_engine.evaluate_15m(
                     symbol=sym,
@@ -333,6 +353,8 @@ class TradingDaemon:
                     regime_light=regime.light,
                     watchlist_score=float(item["total_score"]),
                     capital_flow=flow,
+                    stock_daily_bars=bars_1d,
+                    qqq_daily_bars=qqq_1d,
                 )
                 if sig is None:
                     continue
@@ -342,6 +364,7 @@ class TradingDaemon:
                     account_equity_usd=equity,
                     available_cash_usd=max(0.0, cash),
                     tier=tier,
+                    position_scale=pos_scale,
                 )
                 if plan is None or plan_status != "APPROVED":
                     continue

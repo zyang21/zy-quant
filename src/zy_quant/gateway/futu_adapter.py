@@ -43,6 +43,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         trd_env: Optional[str] = None,
         api_token: Optional[str] = None,
         futu_cfg: Optional[FutuConnectionConfig] = None,
+        allow_synthetic_fallback: bool = False,
         fallback_data: Optional[YahooMarketDataAdapter] = None,
     ) -> None:
         cfg = futu_cfg or FutuConnectionConfig()
@@ -55,14 +56,17 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             else (cfg.api_token or os.getenv("ZY_FUTU_API_TOKEN", ""))
         )
         self.trade_pwd_md5 = cfg.trade_pwd_md5 or os.getenv("ZY_FUTU_TRADE_PWD_MD5", "")
-        self.fallback = fallback_data or YahooMarketDataAdapter()
+        self.fallback = fallback_data or YahooMarketDataAdapter(
+            allow_synthetic_fallback=allow_synthetic_fallback
+        )
 
         self._quote_ctx: Any = None
         self._trade_ctx: Any = None
         self._futu_mod: Any = None
         self._rpc_lock = threading.RLock()
         self._cap_dist_supported: bool = True
-        self._kline_cache: Dict[tuple[str, str, int], tuple[float, List[Bar]]] = {}
+        self._kline_cache: Dict[tuple[str, str], tuple[float, int, List[Bar]]] = {}
+        self._last_kline_rpc_mono: float = 0.0
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def reconfigure(
@@ -183,14 +187,15 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     # --- Market Data ---
     def get_bars(self, symbol: str, timeframe: str = "15m", days: int = 30) -> List[Bar]:
         if self.is_connected() and not symbol.startswith("^"):
-            # Convert trading days to calendar days so `start` always anchors near the window
-            # and pages right up to today's latest real-time candle!
             cal_days = max(8, int(days * 1.6) + 4) if timeframe == "15m" else max(45, int(days * 1.6) + 10)
-            cache_key = (symbol, timeframe, cal_days)
+            cache_key = (symbol, timeframe)
             now_mono = time.monotonic()
+            ttl = 300.0 if days >= 10 else 45.0
+
             cached = self._kline_cache.get(cache_key)
-            if cached and (now_mono - cached[0]) < 45.0:
-                return cached[1]
+            if cached and (now_mono - cached[0]) < ttl and cached[1] >= cal_days:
+                cutoff_dt = datetime.now(timezone.utc) - timedelta(days=cal_days + 1)
+                return [b for b in cached[2] if b.timestamp >= cutoff_dt]
 
             ft = self._futu_mod
             ktype = ft.KLType.K_15M if timeframe == "15m" else ft.KLType.K_DAY
@@ -201,9 +206,21 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             page_key = None
             with self._rpc_lock:
                 for _ in range(4):
+                    # Pace K-line RPCs under Futu's 60 req / 30s quota (~0.52s min spacing)
+                    elapsed = time.monotonic() - self._last_kline_rpc_mono
+                    if elapsed < 0.52:
+                        time.sleep(0.52 - elapsed)
+                    self._last_kline_rpc_mono = time.monotonic()
+
                     ret, df, page_key = self._quote_ctx.request_history_kline(
                         code, start=start_date, ktype=ktype, max_count=1000, page_req_key=page_key
                     )
+                    if ret != ft.RET_OK and isinstance(df, str) and "frequency" in df.lower():
+                        time.sleep(2.0)
+                        self._last_kline_rpc_mono = time.monotonic()
+                        ret, df, page_key = self._quote_ctx.request_history_kline(
+                            code, start=start_date, ktype=ktype, max_count=1000, page_req_key=page_key
+                        )
                     if ret != ft.RET_OK or df is None or df.empty:
                         break
                     frames.append(df)
@@ -227,8 +244,20 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                                 volume=float(row["volume"]),
                             )
                         )
-                self._kline_cache[cache_key] = (now_mono, out)
+                self._kline_cache[cache_key] = (time.monotonic(), cal_days, out)
                 return out
+            # Never contaminate a connected Futu session with fake synthetic bars
+            logger.warning(
+                "[DATA WARNING] Futu OpenAPI returned empty KLine for %s (%s); skipping fallback contamination",
+                symbol,
+                timeframe,
+            )
+            return cached[2] if cached else []
+        logger.warning(
+            "[FALLBACK ALERT] Futu OpenAPI disconnected — entering fallback data adapter for %s (%s)",
+            symbol,
+            timeframe,
+        )
         return self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
 
     def get_quote(self, symbol: str) -> Optional[QuoteSnapshot]:
@@ -342,14 +371,16 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         query_env = self._trd_env()
         note = ""
 
-        # If user selected SIMULATE for safety but hasn't opened a US Paper Account in Futubull yet,
-        # display their REAL account balances in strictly READ-ONLY mode so they see their linked account!
-        if acc_id == 0 and self.trd_env_name == "SIMULATE":
-            real_acc_id = self._select_acc_id("REAL")
-            if real_acc_id != 0:
-                acc_id = real_acc_id
-                query_env = ft.TrdEnv.REAL
-                note = "Showing REAL account (Read-Only) — open a US Paper Account in 富途牛牛 to enable SIMULATE orders"
+        # Strict environment isolation: when in SIMULATE mode, NEVER read or expose REAL account funds.
+        if acc_id == 0:
+            return {
+                "equity_usd": 0.0,
+                "cash_usd": 0.0,
+                "market_val_usd": 0.0,
+                "buying_power_usd": 0.0,
+                "connected": 1.0,
+                "note": "Virtual Paper Ledger",
+            }
 
         with self._rpc_lock:
             ret, df = self._trade_ctx.accinfo_query(

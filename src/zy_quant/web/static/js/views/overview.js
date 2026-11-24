@@ -24,7 +24,10 @@ export class OverviewView {
         <section class="panel" style="margin-bottom:0;">
           <div class="panel-header">
             <div>
-              <div class="panel-subtitle">Portfolio Net Asset Value</div>
+              <div style="display:flex;align-items:center;gap:8px;">
+                <span class="panel-subtitle" id="ovNavTitle">Simulated Portfolio Net Asset Value</span>
+                <span id="ovSimAccountBadge"></span>
+              </div>
               <div style="display:flex;align-items:baseline;gap:14px;margin-top:4px;">
                 <span class="hero-equity-val" id="ovEquity">$0.00</span>
                 <span id="ovReturnBadge"></span>
@@ -139,6 +142,14 @@ export class OverviewView {
     const ms = data.market_session || {};
     const conn = data.connection || {};
 
+    const isSim = conn.is_simulated !== false;
+    document.getElementById('ovNavTitle').textContent = isSim
+      ? 'Simulated Portfolio Value (Virtual Paper Funds)'
+      : 'Live Brokerage Portfolio Net Asset Value';
+    document.getElementById('ovSimAccountBadge').innerHTML = isSim
+      ? statusBadge('VIRTUAL PAPER ACCOUNT', 'warn', false)
+      : statusBadge('REAL CAPITAL', 'up', false);
+
     // Portfolio Value & Equity Chart
     document.getElementById('ovEquity').textContent = fmtUsd(p.equity_usd);
     const netRet = Number(p.net_return_pct || 0);
@@ -231,10 +242,9 @@ export class OverviewView {
     `;
 
     document.getElementById('ovSessionSummary').textContent = ms.message || '';
-    document.getElementById('ovLinkedAcct').textContent =
-      conn.linked_broker_equity_usd > 0
-        ? `Broker Account NAV: ${fmtUsd(conn.linked_broker_equity_usd)} (Read-Only Reference)`
-        : conn.execution_mode || '';
+    document.getElementById('ovLinkedAcct').textContent = isSim
+      ? 'Execution Mode: Paper Simulation (Real Brokerage Funds Isolated)'
+      : `Live Brokerage Account NAV: ${fmtUsd(conn.linked_broker_equity_usd)}`;
 
     // Watchlist Table
     const wl = data.watchlist || [];

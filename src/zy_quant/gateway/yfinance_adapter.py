@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 import random
 import socket
@@ -10,17 +11,23 @@ from typing import Dict, List, Optional
 from zy_quant.gateway.base import MarketDataAdapter
 from zy_quant.models import Bar, CapitalFlowSnapshot, QuoteSnapshot
 
+logger = logging.getLogger(__name__)
+
 
 class YahooMarketDataAdapter(MarketDataAdapter):
     """
-    Market data adapter using `yfinance` for US 15m & 1d historical/delayed bars,
-    with a fast 1.5s circuit-breaker and deterministic synthetic fallback when Yahoo is blocked.
+    Market data adapter using `yfinance` for US 15m & 1d historical/delayed bars.
+    Synthetic fake data is DISABLED by default (`allow_synthetic_fallback=False`) and
+    always emits explicit WARNING alerts whenever any fallback path is entered.
     """
 
-    def __init__(self, allow_synthetic_fallback: bool = True) -> None:
+    def __init__(self, allow_synthetic_fallback: bool = False) -> None:
         self.allow_synthetic_fallback = allow_synthetic_fallback
         self._bar_cache: Dict[tuple[str, str, int], List[Bar]] = {}
         self._yahoo_blocked_until: float = 0.0
+        self.used_synthetic: bool = False
+        self.used_yahoo_fallback: bool = False
+        self.fallback_warnings: List[str] = []
 
     def _yahoo_reachable(self) -> bool:
         now = time.monotonic()
@@ -62,11 +69,29 @@ class YahooMarketDataAdapter(MarketDataAdapter):
                                 volume=float(row["Volume"]),
                             )
                         )
-            except Exception:
+                if bars:
+                    self.used_yahoo_fallback = True
+                    msg = f"[LOCAL/YAHOO FALLBACK] Loaded {len(bars)} {timeframe} bars for {symbol} via Yahoo Finance (Futu OpenAPI offline)"
+                    logger.warning(msg)
+                    if msg not in self.fallback_warnings:
+                        self.fallback_warnings.append(msg)
+            except Exception as exc:
+                logger.warning("[DATA FALLBACK] Yahoo Finance fetch failed for %s: %s", symbol, exc)
                 bars = []
 
-        if not bars and self.allow_synthetic_fallback:
-            bars = self.generate_synthetic_bars(symbol, timeframe=timeframe, days=days)
+        if not bars:
+            if self.allow_synthetic_fallback:
+                self.used_synthetic = True
+                msg = f"[SYNTHETIC FAKE DATA] Generated synthetic {timeframe} bars for {symbol} (non-real market data!)"
+                logger.warning(msg)
+                if msg not in self.fallback_warnings:
+                    self.fallback_warnings.append(msg)
+                bars = self.generate_synthetic_bars(symbol, timeframe=timeframe, days=days)
+            else:
+                msg = f"[NO REAL MARKET DATA] Both Futu OpenAPI and Yahoo Finance unavailable for {symbol} ({timeframe}); synthetic fake data is disabled."
+                logger.error(msg)
+                if msg not in self.fallback_warnings:
+                    self.fallback_warnings.append(msg)
 
         self._bar_cache[cache_key] = bars
         return bars

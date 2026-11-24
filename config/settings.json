@@ -1,5 +1,6 @@
 {
-  "account_tier": "tier_10k",
+  "account_tier": "tier_1k",
+  "allow_synthetic_fallback": false,
   "futu": {
     "host": "127.0.0.1",
     "port": 11111,

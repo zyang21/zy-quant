@@ -35,6 +35,9 @@ class BacktestResult:
     rest_bars: int
     period_start: str = ""
     period_end: str = ""
+    data_source: str = "FUTU_REALTIME"
+    is_synthetic_data: bool = False
+    data_warnings: List[str] = field(default_factory=list)
     equity_curve: List[Dict[str, Any]] = field(default_factory=list)
     trades: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -88,14 +91,35 @@ class BacktestEngine:
         spy_1d = self.data.get_bars("SPY", timeframe="1d", days=max(60, fetch_days + 30))
 
         symbol_bars: Dict[str, List[Bar]] = {}
+        symbol_daily: Dict[str, List[Bar]] = {}
         symbol_atrs: Dict[str, List[float]] = {}
+        missing_symbols: List[str] = []
         for sym in target_symbols:
             b15 = self.data.get_bars(sym, timeframe="15m", days=fetch_days)
+            b1d = self.data.get_bars(sym, timeframe="1d", days=max(60, fetch_days + 30))
             if len(b15) >= 30:
                 symbol_bars[sym] = b15
+                symbol_daily[sym] = b1d
                 symbol_atrs[sym] = compute_wilder_atr_series(
                     b15, self.settings.strategy_cfg.entry.atr_period
                 )
+            else:
+                missing_symbols.append(sym)
+
+        fb = getattr(self.data, "fallback", self.data)
+        used_synth = bool(getattr(fb, "used_synthetic", False))
+        used_yahoo = bool(getattr(fb, "used_yahoo_fallback", False))
+        is_futu_live = bool(getattr(self.data, "is_connected", lambda: False)())
+        data_source = (
+            "SYNTHETIC_FAKE"
+            if used_synth
+            else ("FUTU_REALTIME" if is_futu_live else ("YAHOO_FALLBACK" if used_yahoo else "MISSING_DATA"))
+        )
+        warnings_list: List[str] = list(getattr(fb, "fallback_warnings", []))[-5:]
+        if missing_symbols:
+            warnings_list.append(
+                f"Skipped symbols with insufficient real market bars: {', '.join(missing_symbols)}"
+            )
 
         if not qqq_15m or not symbol_bars:
             return BacktestResult(
@@ -115,6 +139,9 @@ class BacktestEngine:
                 max_drawdown_pct=0.0,
                 green_bars=0,
                 rest_bars=0,
+                data_source=data_source,
+                is_synthetic_data=used_synth,
+                data_warnings=warnings_list or ["No real market data available — connect FutuOpenD / 富途牛牛."],
             )
 
         # Index bars by timestamp for chronological simulation
@@ -123,6 +150,7 @@ class BacktestEngine:
             bar_lookup[sym] = {b.timestamp: (i, b) for i, b in enumerate(blist)}
 
         positions: Dict[str, OpenPosition] = {}
+        last_exit_time: Dict[str, datetime] = {}
         closed_trades: List[Dict[str, Any]] = []
         buy_timestamps: List[Any] = []
         total_fees = 0.0
@@ -152,11 +180,24 @@ class BacktestEngine:
             if not s_d_slice:
                 s_d_slice = spy_1d[:20]
 
+            # Compute dynamic point-in-time 10-day realized QQQ volatility (replaces hardcoded 17.5)
+            vix_est = 18.0
+            if len(q_d_slice) >= 11:
+                rets = [
+                    math.log(q_d_slice[k].close / q_d_slice[k - 1].close)
+                    for k in range(len(q_d_slice) - 10, len(q_d_slice))
+                    if q_d_slice[k - 1].close > 0
+                ]
+                if len(rets) >= 5:
+                    m_r = sum(rets) / len(rets)
+                    v_r = sum((r - m_r) ** 2 for r in rets) / max(1, len(rets) - 1)
+                    vix_est = max(11.0, min(80.0, math.sqrt(v_r * 252.0) * 100.0 * 1.10))
+
             regime = self.regime_detector.evaluate(
                 qqq_intraday_15m=qqq_15m[max(0, q_idx - 40) : q_idx + 1],
                 qqq_daily=q_d_slice,
                 spy_daily=s_d_slice,
-                vix_level=17.5,
+                vix_level=vix_est,
             )
             if regime.light == RegimeLight.GREEN:
                 green_bars += 1
@@ -210,6 +251,7 @@ class BacktestEngine:
 
                     pos.shares = round(pos.shares - action.shares_to_sell, 6)
                     if pos.shares <= 1e-5:
+                        last_exit_time[sym] = ts
                         del positions[sym]
 
             # Mark-to-market current portfolio equity
@@ -232,8 +274,8 @@ class BacktestEngine:
                     }
                 )
 
-            # 2. Entry scan ONLY when Regime == GREEN and frequency/slot caps permit
-            if regime.light != RegimeLight.GREEN:
+            # 2. Entry scan when Regime is GREEN (100% scale) or YELLOW (Selective Alpha Leaders @ 65% scale)
+            if regime.light == RegimeLight.RED:
                 continue
             if len(positions) >= tier.max_concurrent_positions:
                 continue
@@ -245,8 +287,27 @@ class BacktestEngine:
             if buys_7d >= tier.max_trades_per_week:
                 continue
 
-            for sym in target_symbols:
+            cooldown_td = timedelta(hours=self.settings.strategy_cfg.entry.cooldown_hours_after_exit)
+            pos_scale = (
+                1.0
+                if regime.light == RegimeLight.GREEN
+                else self.settings.strategy_cfg.regime.yellow_position_scale
+            )
+
+            # Rank candidate symbols by point-in-time 20-day Relative Strength (mirrors live Watchlist Scorer)
+            def _rs_20d(sym_key: str) -> float:
+                d_hist = [d for d in symbol_daily.get(sym_key, []) if d.timestamp.date() <= ts.date()]
+                if len(d_hist) < 2:
+                    return 0.0
+                lb = min(20, len(d_hist) - 1)
+                return (d_hist[-1].close - d_hist[-1 - lb].close) / max(0.01, d_hist[-1 - lb].close)
+
+            ranked_symbols = sorted(target_symbols, key=_rs_20d, reverse=True)
+
+            for sym in ranked_symbols:
                 if sym in positions or sym not in bar_lookup:
+                    continue
+                if sym in last_exit_time and (ts - last_exit_time[sym]) < cooldown_td:
                     continue
                 pair = bar_lookup[sym].get(ts)
                 if pair is None:
@@ -255,6 +316,7 @@ class BacktestEngine:
                 if s_idx < warmup:
                     continue
 
+                sym_d_slice = [d for d in symbol_daily.get(sym, []) if d.timestamp.date() <= ts.date()]
                 sec_meta = universe_map.get(sym)
                 sector = sec_meta.sector if sec_meta else "Technology"
                 sig = self.signal_engine.evaluate_15m(
@@ -263,6 +325,8 @@ class BacktestEngine:
                     bars_15m=symbol_bars[sym][max(0, s_idx - 35) : s_idx + 1],
                     regime_light=regime.light,
                     watchlist_score=78.0,
+                    stock_daily_bars=sym_d_slice,
+                    qqq_daily_bars=q_d_slice,
                 )
                 if sig is None:
                     continue
@@ -276,6 +340,7 @@ class BacktestEngine:
                     account_equity_usd=current_equity,
                     available_cash_usd=cash * 0.992,
                     tier=tier,
+                    position_scale=pos_scale,
                 )
                 if plan is None or status != "APPROVED":
                     continue
@@ -355,6 +420,9 @@ class BacktestEngine:
             rest_bars=rest_bars,
             period_start=eval_timestamps[0].strftime("%Y-%m-%d") if eval_timestamps else "",
             period_end=eval_timestamps[-1].strftime("%Y-%m-%d") if eval_timestamps else "",
+            data_source=data_source,
+            is_synthetic_data=used_synth,
+            data_warnings=warnings_list,
             equity_curve=equity_curve,
             trades=closed_trades,
         )

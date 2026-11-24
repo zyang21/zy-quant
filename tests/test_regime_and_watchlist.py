@@ -24,8 +24,13 @@ def test_regime_traffic_light_and_2h_rest_cadence() -> None:
     assert snap_green.light == RegimeLight.GREEN
     assert snap_green.recommended_scan_minutes == 15
 
-    # Sharp intraday drop or VIX panic -> RED light & 120-minute (2h) watchlist RS refresh cadence!
-    snap_red = det.evaluate(intraday_up, daily_up, daily_up, vix_level=33.0)
+    # Caution VIX -> YELLOW light (45m cadence)
+    snap_yellow = det.evaluate(intraday_up, daily_up, daily_up, vix_level=31.0)
+    assert snap_yellow.light == RegimeLight.YELLOW
+    assert snap_yellow.recommended_scan_minutes == 45
+
+    # Extreme VIX panic -> RED light & 120-minute (2h) watchlist RS refresh cadence!
+    snap_red = det.evaluate(intraday_up, daily_up, daily_up, vix_level=42.0)
     assert snap_red.light == RegimeLight.RED
     assert snap_red.recommended_scan_minutes == 120
 

@@ -41,7 +41,8 @@ class WebServerConfig(BaseModel):
 
 
 class RuntimeSettingsConfig(BaseModel):
-    account_tier: str = "tier_10k"
+    account_tier: Optional[str] = None
+    allow_synthetic_fallback: bool = False
     futu: FutuConnectionConfig = Field(default_factory=FutuConnectionConfig)
     web: WebServerConfig = Field(default_factory=WebServerConfig)
 
@@ -121,9 +122,10 @@ class RegimeConfig(BaseModel):
     secondary_benchmark: str = "SPY"
     volatility_symbol: str = "^VIX"
     daily_sma_period: int = 20
-    vix_yellow_threshold: float = 24.0
-    vix_red_threshold: float = 30.0
+    vix_yellow_threshold: float = 28.0
+    vix_red_threshold: float = 38.0
     sharp_intraday_drop_pct: float = -0.012
+    yellow_position_scale: float = 0.65
     green_scan_interval_minutes: int = 15
     yellow_watchlist_interval_minutes: int = 45
     rest_watchlist_interval_minutes: int = 120
@@ -148,19 +150,26 @@ class EntryConfig(BaseModel):
     atr_period: int = 14
     ema_fast_period: int = 9
     ema_trend_period: int = 21
+    entry_start_hour_et: int = 10
+    entry_end_hour_et: int = 14
+    entry_end_minute_et: int = 30
+    require_stock_above_sma20: bool = True
+    yellow_min_rs_outperformance: float = 0.015
+    cooldown_hours_after_exit: int = 20
     vwap_pullback: VwapPullbackConfig
     opening_range_breakout: OrbConfig
 
 
 class ExitModelsConfig(BaseModel):
-    atr_stop_multiplier: float = 1.8
-    max_hard_stop_pct: float = 0.035
-    breakeven_trigger_r: float = 1.5
-    chandelier_atr_multiplier: float = 2.8
-    time_stop_bars_15m: int = 16
-    time_stop_min_progress_r: float = 0.30
+    atr_stop_multiplier: float = 2.8
+    min_stop_pct: float = 0.015
+    max_hard_stop_pct: float = 0.040
+    breakeven_trigger_r: float = 1.8
+    chandelier_atr_multiplier: float = 4.2
+    time_stop_bars_15m: int = 52
+    time_stop_min_progress_r: float = 0.15
     assumed_base_win_rate: float = 0.48
-    expected_reward_atr_multiple: float = 4.2
+    expected_reward_atr_multiple: float = 6.5
     min_expectancy_r: float = 0.25
 
 
@@ -186,7 +195,7 @@ class AppSettings(BaseModel):
 
     @property
     def active_tier_key(self) -> str:
-        return os.getenv("ZY_ACCOUNT_TIER") or self.runtime_cfg.account_tier or self.tiers_cfg.active_tier
+        return self.runtime_cfg.account_tier or os.getenv("ZY_ACCOUNT_TIER") or self.tiers_cfg.active_tier
 
     @property
     def active_tier_profile(self) -> TierProfile:
@@ -221,14 +230,15 @@ class AppSettings(BaseModel):
             futu_dict["trade_pwd_md5"] = os.environ["ZY_FUTU_TRADE_PWD_MD5"]
         runtime_raw["futu"] = futu_dict
 
-        if os.getenv("ZY_ACCOUNT_TIER"):
+        if not runtime_raw.get("account_tier") and os.getenv("ZY_ACCOUNT_TIER"):
             runtime_raw["account_tier"] = os.environ["ZY_ACCOUNT_TIER"]
 
         runtime_cfg = RuntimeSettingsConfig.model_validate(runtime_raw)
 
         with open(cfg_dir / "tiers.yaml", "r", encoding="utf-8") as f:
             tiers_raw = yaml.safe_load(f)
-        tiers_raw["active_tier"] = runtime_cfg.account_tier
+        if runtime_cfg.account_tier:
+            tiers_raw["active_tier"] = runtime_cfg.account_tier
         with open(cfg_dir / "watchlist_scoring.yaml", "r", encoding="utf-8") as f:
             watch_raw = yaml.safe_load(f)
         with open(cfg_dir / "strategy.yaml", "r", encoding="utf-8") as f:
