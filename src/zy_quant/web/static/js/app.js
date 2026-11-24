@@ -135,6 +135,15 @@ class QuantWorkspaceApp {
       haltBtn.className = 'btn btn-danger';
     }
 
+    // Data Integrity / Fallback Banner (Explicit alert whenever fallback or synthetic data is active)
+    const fbBanner = document.getElementById('fallbackAlertBanner');
+    if (conn.is_fallback_or_fake && conn.fallback_alert) {
+      fbBanner.style.display = 'flex';
+      document.getElementById('fallbackAlertText').textContent = `ALERT: ${conn.fallback_alert}`;
+    } else {
+      fbBanner.style.display = 'none';
+    }
+
     // Closed Market Banner
     const banner = document.getElementById('sessionBanner');
     if (ms.is_open === false) {

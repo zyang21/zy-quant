@@ -35,6 +35,9 @@ class BacktestResult:
     rest_bars: int
     period_start: str = ""
     period_end: str = ""
+    data_source: str = "FUTU_REALTIME"
+    is_synthetic_data: bool = False
+    data_warnings: List[str] = field(default_factory=list)
     equity_curve: List[Dict[str, Any]] = field(default_factory=list)
     trades: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -90,6 +93,7 @@ class BacktestEngine:
         symbol_bars: Dict[str, List[Bar]] = {}
         symbol_daily: Dict[str, List[Bar]] = {}
         symbol_atrs: Dict[str, List[float]] = {}
+        missing_symbols: List[str] = []
         for sym in target_symbols:
             b15 = self.data.get_bars(sym, timeframe="15m", days=fetch_days)
             b1d = self.data.get_bars(sym, timeframe="1d", days=max(60, fetch_days + 30))
@@ -99,6 +103,23 @@ class BacktestEngine:
                 symbol_atrs[sym] = compute_wilder_atr_series(
                     b15, self.settings.strategy_cfg.entry.atr_period
                 )
+            else:
+                missing_symbols.append(sym)
+
+        fb = getattr(self.data, "fallback", self.data)
+        used_synth = bool(getattr(fb, "used_synthetic", False))
+        used_yahoo = bool(getattr(fb, "used_yahoo_fallback", False))
+        is_futu_live = bool(getattr(self.data, "is_connected", lambda: False)())
+        data_source = (
+            "SYNTHETIC_FAKE"
+            if used_synth
+            else ("FUTU_REALTIME" if is_futu_live else ("YAHOO_FALLBACK" if used_yahoo else "MISSING_DATA"))
+        )
+        warnings_list: List[str] = list(getattr(fb, "fallback_warnings", []))[-5:]
+        if missing_symbols:
+            warnings_list.append(
+                f"Skipped symbols with insufficient real market bars: {', '.join(missing_symbols)}"
+            )
 
         if not qqq_15m or not symbol_bars:
             return BacktestResult(
@@ -118,6 +139,9 @@ class BacktestEngine:
                 max_drawdown_pct=0.0,
                 green_bars=0,
                 rest_bars=0,
+                data_source=data_source,
+                is_synthetic_data=used_synth,
+                data_warnings=warnings_list or ["No real market data available — connect FutuOpenD / 富途牛牛."],
             )
 
         # Index bars by timestamp for chronological simulation
@@ -396,6 +420,9 @@ class BacktestEngine:
             rest_bars=rest_bars,
             period_start=eval_timestamps[0].strftime("%Y-%m-%d") if eval_timestamps else "",
             period_end=eval_timestamps[-1].strftime("%Y-%m-%d") if eval_timestamps else "",
+            data_source=data_source,
+            is_synthetic_data=used_synth,
+            data_warnings=warnings_list,
             equity_curve=equity_curve,
             trades=closed_trades,
         )

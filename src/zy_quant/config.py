@@ -42,6 +42,7 @@ class WebServerConfig(BaseModel):
 
 class RuntimeSettingsConfig(BaseModel):
     account_tier: str = "tier_10k"
+    allow_synthetic_fallback: bool = False
     futu: FutuConnectionConfig = Field(default_factory=FutuConnectionConfig)
     web: WebServerConfig = Field(default_factory=WebServerConfig)
 

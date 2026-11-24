@@ -54,7 +54,10 @@ class TradingDaemon:
     ) -> None:
         self.settings = settings
         self.store = store or StateStore(settings.root_dir / "data" / "zy_quant.db")
-        self.gateway = gateway or FutuGatewayAdapter(futu_cfg=settings.runtime_cfg.futu)
+        self.gateway = gateway or FutuGatewayAdapter(
+            futu_cfg=settings.runtime_cfg.futu,
+            allow_synthetic_fallback=settings.runtime_cfg.allow_synthetic_fallback,
+        )
         self.notifier = notifier or AlertNotifier()
         self.fee_model = FutuUSFeeModel()
 

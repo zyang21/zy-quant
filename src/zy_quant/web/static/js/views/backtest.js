@@ -59,6 +59,8 @@ export class BacktestLabView {
           <button class="btn btn-accent" id="btRunBtn">Run Backtest</button>
         </div>
 
+        <div id="btDataIntegrityBanner" style="display:none;padding:10px 14px;margin-bottom:12px;border-radius:8px;background:rgba(246,70,93,0.14);border:1px solid rgba(246,70,93,0.45);color:#ff8093;font-size:12px;font-weight:600;"></div>
+
         <div class="kpi-grid" id="btKpis" style="margin-bottom:14px;"></div>
 
         <svg id="btEquityChart" class="chart" style="width:100%;height:220px;background:#0d1117;border:1px solid var(--border-subtle);border-radius:8px;margin-bottom:16px;"></svg>
@@ -150,8 +152,20 @@ export class BacktestLabView {
       });
 
       if (bt.strategy_summary) this.renderBlueprint(bt.strategy_summary);
+      const srcLabel = bt.data_source === 'FUTU_REALTIME' ? 'Verified Futu Real Historical Bars' : bt.data_source;
       document.getElementById('btWindowLabel').textContent =
-        bt.period_start && bt.period_end ? `Evaluated: ${bt.period_start} → ${bt.period_end}` : '';
+        bt.period_start && bt.period_end
+          ? `${srcLabel} · ${bt.period_start} → ${bt.period_end}`
+          : srcLabel;
+
+      const warnEl = document.getElementById('btDataIntegrityBanner');
+      if (bt.is_synthetic_data || bt.data_source !== 'FUTU_REALTIME' || (bt.data_warnings && bt.data_warnings.length)) {
+        warnEl.style.display = 'block';
+        const details = (bt.data_warnings || []).join(' | ') || `Data source degraded: ${bt.data_source}`;
+        warnEl.textContent = `DATA FALLBACK / INTEGRITY WARNING (${bt.data_source}): ${details}`;
+      } else {
+        warnEl.style.display = 'none';
+      }
 
       const totalBars = (bt.green_bars || 0) + (bt.rest_bars || 0);
       const greenPct = totalBars > 0 ? ((bt.green_bars / totalBars) * 100).toFixed(0) : 0;

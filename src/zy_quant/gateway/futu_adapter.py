@@ -43,6 +43,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         trd_env: Optional[str] = None,
         api_token: Optional[str] = None,
         futu_cfg: Optional[FutuConnectionConfig] = None,
+        allow_synthetic_fallback: bool = False,
         fallback_data: Optional[YahooMarketDataAdapter] = None,
     ) -> None:
         cfg = futu_cfg or FutuConnectionConfig()
@@ -55,7 +56,9 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             else (cfg.api_token or os.getenv("ZY_FUTU_API_TOKEN", ""))
         )
         self.trade_pwd_md5 = cfg.trade_pwd_md5 or os.getenv("ZY_FUTU_TRADE_PWD_MD5", "")
-        self.fallback = fallback_data or YahooMarketDataAdapter()
+        self.fallback = fallback_data or YahooMarketDataAdapter(
+            allow_synthetic_fallback=allow_synthetic_fallback
+        )
 
         self._quote_ctx: Any = None
         self._trade_ctx: Any = None
@@ -244,7 +247,17 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 self._kline_cache[cache_key] = (time.monotonic(), cal_days, out)
                 return out
             # Never contaminate a connected Futu session with fake synthetic bars
+            logger.warning(
+                "[DATA WARNING] Futu OpenAPI returned empty KLine for %s (%s); skipping fallback contamination",
+                symbol,
+                timeframe,
+            )
             return cached[2] if cached else []
+        logger.warning(
+            "[FALLBACK ALERT] Futu OpenAPI disconnected — entering fallback data adapter for %s (%s)",
+            symbol,
+            timeframe,
+        )
         return self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
 
     def get_quote(self, symbol: str) -> Optional[QuoteSnapshot]:
