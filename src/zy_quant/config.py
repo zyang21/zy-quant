@@ -217,6 +217,12 @@ class AppSettings(BaseModel):
         settings_json = cfg_dir / "settings.json"
         if settings_json.exists():
             runtime_raw = json.loads(settings_json.read_text(encoding="utf-8"))
+            futu_tracked = runtime_raw.get("futu", {})
+            if futu_tracked.get("api_token") or futu_tracked.get("trade_pwd_md5"):
+                raise ValueError(
+                    "SECURITY BLOCK: Never store `api_token` or `trade_pwd_md5` in tracked "
+                    "`config/settings.json`! Place secrets in gitignored `config/settings.local.json`."
+                )
         local_json = cfg_dir / "settings.local.json"
         if local_json.exists():
             runtime_raw = _deep_merge(

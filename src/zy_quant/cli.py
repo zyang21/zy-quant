@@ -237,7 +237,26 @@ class QuantCLI:
                 f"${t['entry_price']} -> ${t['exit_price']}  net=${t['net_pnl_usd']:+.2f} ({t['r_multiple']:+.2f}R) [{t['exit_reason']}]"
             )
 
-    def run_config_show(self) -> None:
+    def run_config_show(self, consolidate_local: bool = False) -> None:
+        local_path = self.settings.root_dir / "config" / "settings.local.json"
+        env_path = self.settings.root_dir / ".env"
+        if consolidate_local:
+            futu_cfg = self.settings.runtime_cfg.futu
+            local_payload = {
+                "futu": {
+                    "trd_env": futu_cfg.trd_env,
+                    "api_token": futu_cfg.api_token,
+                    "trade_pwd_md5": futu_cfg.trade_pwd_md5,
+                }
+            }
+            local_path.write_text(
+                json.dumps(local_payload, indent=2) + "\n", encoding="utf-8"
+            )
+            local_path.chmod(0o600)
+            if env_path.exists():
+                env_path.unlink()
+            self.settings = AppSettings.load(self.settings.root_dir)
+
         cfg = self.settings.runtime_cfg.model_dump()
         if cfg["futu"].get("api_token"):
             tok = cfg["futu"]["api_token"]
@@ -300,7 +319,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--symbols", default=None, help="Comma-separated symbols (e.g. NVDA,MSFT)")
     p_bt.add_argument("--json", action="store_true")
 
-    sub.add_parser("config", help="Display active merged runtime configuration (secrets masked)")
+    p_cfg = sub.add_parser("config", help="Display active merged runtime configuration (secrets masked)")
+    p_cfg.add_argument(
+        "--consolidate-local",
+        action="store_true",
+        help="Consolidate .env credentials into gitignored config/settings.local.json (chmod 600)",
+    )
 
     p_svc = sub.add_parser("service", help="Manage macOS launchd background service (start|stop|restart)")
     p_svc.add_argument("action", choices=["start", "stop", "restart"], help="Service lifecycle action")
@@ -362,7 +386,7 @@ def main() -> None:
             as_json=args.json,
         )
     elif args.cmd == "config":
-        cli.run_config_show()
+        cli.run_config_show(consolidate_local=args.consolidate_local)
     elif args.cmd == "service":
         uid = os.getuid()
         plist = Path.home() / "Library" / "LaunchAgents" / "com.zyquant.daemon.plist"

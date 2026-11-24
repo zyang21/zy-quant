@@ -33,19 +33,18 @@ Resilient US Equities Intraday & Short-Swing Quantitative Trading System built f
 - **SQLite WAL Idempotent Ledger & Startup Reconciliation:** Prevents duplicate orders across restarts and reconciles live `FutuOpenD` positions automatically on boot.
 - **Hard Mandate Circuit Breakers:** Persistent global Kill-Switch (`HALT`), daily max loss lock, and 60-second runaway burst breaker.
 
-## Configuration (`config/settings.json`)
+## Configuration (`config/settings.json` + `config/settings.local.json`)
 
-All infrastructure, endpoint, and tier settings live in `config/settings.json` (secrets such as `api_token` go in gitignored `config/settings.local.json` or `.env`, and are never exposed on the web UI):
+Non-secret runtime settings live in tracked `config/settings.json`. Credentials (`api_token` and `trade_pwd_md5`) live **exclusively** in gitignored `config/settings.local.json` (`chmod 600`) — `AppSettings.load()` enforces a hard security block if secrets are ever placed in `config/settings.json`:
 
 ```json
 {
-  "account_tier": "tier_10k",
+  "account_tier": "tier_1k",
+  "allow_synthetic_fallback": false,
   "futu": {
     "host": "127.0.0.1",
     "port": 11111,
-    "trd_env": "SIMULATE",
-    "api_token": "",
-    "trade_pwd_md5": ""
+    "trd_env": "SIMULATE"
   },
   "web": {
     "host": "127.0.0.1",

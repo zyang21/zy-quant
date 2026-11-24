@@ -100,3 +100,19 @@ def test_separate_simulation_and_real_db_paths() -> None:
     assert sim_db.name == "zy_quant_sim.db"
     assert real_db.name == "zy_quant_real.db"
     assert sim_db != real_db
+
+
+def test_security_guard_rejects_secrets_in_tracked_settings_json(tmp_path: Path) -> None:
+    import json
+    import shutil
+    import pytest
+
+    cfg_dir = tmp_path / "config"
+    shutil.copytree(AppSettings.load().root_dir / "config", cfg_dir)
+    leaked = {
+        "account_tier": "tier_1k",
+        "futu": {"host": "127.0.0.1", "port": 11111, "api_token": "SECRET_LEAK"},
+    }
+    (cfg_dir / "settings.json").write_text(json.dumps(leaked), encoding="utf-8")
+    with pytest.raises(ValueError, match="SECURITY BLOCK"):
+        AppSettings.load(tmp_path)

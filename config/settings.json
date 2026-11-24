@@ -4,9 +4,7 @@
   "futu": {
     "host": "127.0.0.1",
     "port": 11111,
-    "trd_env": "SIMULATE",
-    "api_token": "",
-    "trade_pwd_md5": ""
+    "trd_env": "SIMULATE"
   },
   "web": {
     "host": "127.0.0.1",
