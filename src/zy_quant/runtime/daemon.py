@@ -473,6 +473,18 @@ class TradingDaemon:
                         status=term_status,
                         reason=timeout_note,
                     )
+                    # Safety net: if a SELL exit limit order timed out/cancelled while shares remain open,
+                    # re-arm the server-side protective stop immediately so the position is never naked!
+                    if side_str == "SELL" and self.settings.strategy_cfg.daemon.place_server_side_stop:
+                        rem_pos = self.store.get_positions().get(str(fresh["symbol"]))
+                        if rem_pos is not None and rem_pos.shares > 1e-5:
+                            rem_pos.broker_stop_order_id = self.gateway.place_or_update_protective_stop(
+                                rem_pos.symbol,
+                                rem_pos.shares,
+                                rem_pos.current_stop,
+                                rem_pos.broker_stop_order_id,
+                            )
+                            self.store.upsert_position(rem_pos)
                     events.append(
                         f"TTL timeout ({int(elapsed_sec)}s >= {ttl_sec}s): {cid} -> {term_status.value} (filled={filled_sh})"
                     )
@@ -663,10 +675,10 @@ class TradingDaemon:
                             pos.scaled_out = prev_scaled_out
                             pos.current_stop = prev_stop
                             pos.breakeven_armed = prev_be_armed
-                        self.store.upsert_position(pos)
-
                         if pos.broker_stop_order_id and action.shares_to_sell >= pos.shares:
                             self.gateway.cancel_order(pos.broker_stop_order_id)
+                            pos.broker_stop_order_id = None
+                        self.store.upsert_position(pos)
 
                         broker_oid = self.gateway.place_limit_order(
                             sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, remark=cid
@@ -765,7 +777,8 @@ class TradingDaemon:
                 realized_all = self.store.realized_pnl_since("2000-01-01T00:00:00")
                 equity = tier.reference_equity_usd + realized_all
                 invested = sum(
-                    p.shares * p.entry_price + float(p.metadata.get("buy_fee_usd", 0.0))
+                    p.shares * p.entry_price
+                    + float(p.metadata.get("buy_fee_usd", 0.0)) * (p.shares / max(1e-6, p.initial_shares))
                     for p in open_positions.values()
                 )
                 cash = max(0.0, equity - invested - in_flight_reserved_cash)

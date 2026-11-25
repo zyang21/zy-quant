@@ -610,3 +610,57 @@ def test_paper_local_mode_preserves_immediate_virtual_execution(tmp_path: Path) 
     orders = store.query_orders(symbol="NVDA")
     assert orders[0]["status"] == OrderStatus.FILLED.value
     assert orders[0]["broker_order_id"] == "PAPER-LOCAL"
+
+
+def test_unfilled_sell_exit_ttl_timeout_rearms_server_side_protective_stop(tmp_path: Path) -> None:
+    settings = AppSettings.load()
+    store = StateStore(tmp_path / "sell_ttl.db")
+    gw = FakeAsyncBrokerGateway(has_account=True, trd_env="REAL")
+    now_utc = datetime(2026, 11, 25, 15, 5, tzinfo=timezone.utc)
+    _seed_bullish_market_and_watchlist(gw, store, now_utc)
+
+    daemon = TradingDaemon(settings, store=store, gateway=gw, notifier=AlertNotifier())
+    daemon._last_watchlist_scan_at = now_utc
+
+    # 1. Enter NVDA and fill
+    daemon.run_cycle(tier_override="tier_10k", now_override=now_utc)
+    buy_ord = store.get_active_orders(side=OrderSide.BUY)[0]
+    gw.emit_push(
+        BrokerOrderUpdate(
+            broker_order_id=buy_ord["broker_order_id"],
+            symbol="NVDA",
+            side=OrderSide.BUY,
+            order_type="NORMAL",
+            status=OrderStatus.FILLED,
+            raw_status="FILLED_ALL",
+            qty=buy_ord["shares"],
+            price=141.0,
+            filled_shares=buy_ord["shares"],
+            avg_fill_price=141.0,
+            remark=buy_ord["client_order_id"],
+        )
+    )
+    pos = store.get_positions()["NVDA"]
+    assert pos.broker_stop_order_id is not None
+
+    # 2. Force Time-Barrier SELL submission by setting bars_held_15m = time_stop_bars_15m - 1 on a flat bar
+    pos.bars_held_15m = settings.strategy_cfg.exit_models.time_stop_bars_15m - 1
+    store.upsert_position(pos)
+    flat_ts = gw.bars_15m["NVDA"][-1].timestamp + timedelta(minutes=15)
+    gw.bars_15m["NVDA"].append(Bar("NVDA", flat_ts, 141.0, 141.2, 140.8, 141.05, 200_000.0))
+
+    t_sell = now_utc + timedelta(minutes=15)
+    daemon.run_cycle(tier_override="tier_10k", now_override=t_sell)
+    sell_ord = store.get_active_orders(side=OrderSide.SELL)[0]
+    # Old protective stop was cancelled to unlock shares for the SELL limit order
+    assert store.get_positions()["NVDA"].broker_stop_order_id is None
+
+    # 3. After exit_order_ttl_seconds (60s+) with 0 fill, SELL expires AND protective stop is re-armed!
+    gw.protective_stops.clear()
+    daemon.reconcile_open_orders(now=t_sell + timedelta(seconds=75))
+    expired_sell = store.get_order(sell_ord["client_order_id"])
+    assert expired_sell is not None
+    assert expired_sell["status"] == OrderStatus.EXPIRED.value
+    rearmed_pos = store.get_positions()["NVDA"]
+    assert rearmed_pos.broker_stop_order_id is not None
+    assert "NVDA" in gw.protective_stops
