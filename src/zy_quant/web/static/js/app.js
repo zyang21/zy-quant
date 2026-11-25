@@ -113,6 +113,18 @@ class QuantWorkspaceApp {
     const conn = d.connection || {};
     const ms = d.market_session || {};
     const reg = d.regime || {};
+    const git = d.git_revision || {};
+
+    // Git Branch & Revision Pill in Brand Header
+    if (git.branch) {
+      const label = git.commit ? `${git.branch} @ ${git.commit}` : git.branch;
+      const isMain = git.branch === 'main' || git.branch === 'master';
+      document.getElementById('hdrBranchBadge').innerHTML = statusBadge(
+        label,
+        isMain ? 'neutral' : 'warn',
+        false
+      );
+    }
 
     // API Connection Badge (No raw host/IP/key exposed)
     document.getElementById('hdrConnBadge').innerHTML = conn.connected

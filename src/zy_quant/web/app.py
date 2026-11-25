@@ -179,6 +179,31 @@ class ControlCenterApplication:
             "linked_broker_equity_usd": 0.0 if is_simulated else round(float(acct.get("equity_usd", 0.0)), 2),
         }
 
+    def get_git_revision(self) -> Dict[str, str]:
+        """Reads active Git branch and short commit SHA directly from `.git` metadata."""
+        git_dir = self.settings.root_dir / ".git"
+        head_file = git_dir / "HEAD"
+        if not head_file.exists():
+            return {"branch": "unknown", "commit": ""}
+        try:
+            head_val = head_file.read_text(encoding="utf-8").strip()
+            if head_val.startswith("ref: "):
+                ref_rel = head_val[5:].strip()
+                branch = ref_rel.replace("refs/heads/", "")
+                ref_file = git_dir / ref_rel
+                if ref_file.exists():
+                    sha = ref_file.read_text(encoding="utf-8").strip()[:7]
+                    return {"branch": branch, "commit": sha}
+                packed = git_dir / "packed-refs"
+                if packed.exists():
+                    for line in packed.read_text(encoding="utf-8").splitlines():
+                        if not line.startswith("#") and line.endswith(f" {ref_rel}"):
+                            return {"branch": branch, "commit": line.split()[0][:7]}
+                return {"branch": branch, "commit": ""}
+            return {"branch": "detached", "commit": head_val[:7]}
+        except Exception:
+            return {"branch": "unknown", "commit": ""}
+
     def get_strategy_summary(self) -> Dict[str, Any]:
         e = self.settings.strategy_cfg.entry
         x = self.settings.strategy_cfg.exit_models
@@ -263,6 +288,7 @@ def get_dashboard() -> Dict[str, Any]:
 
     return {
         "server_time_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "git_revision": ctx.get_git_revision(),
         "market_session": session_status,
         "connection": conn_status,
         "daemon_running": ctx.auto_loop_enabled,

@@ -74,11 +74,12 @@ def test_sanitized_dashboard_and_log_endpoints_hide_infra_secrets() -> None:
     assert r_dash.status_code == 200
     payload = r_dash.json()
 
-    # Verify zero host/port/api_token leaked in public dashboard JSON
+    # Verify zero host/port/api_token leaked in public dashboard JSON + git branch exposed
     conn = payload["connection"]
     assert "host" not in conn
     assert "port" not in conn
     assert "api_token" not in conn
+    assert payload["git_revision"]["branch"] != ""
 
     r_hist = client.get("/api/history?preset=30D")
     assert r_hist.status_code == 200
