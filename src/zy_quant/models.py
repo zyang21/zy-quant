@@ -20,10 +20,25 @@ class OrderSide(str, Enum):
 class OrderStatus(str, Enum):
     PENDING = "PENDING"
     SUBMITTED = "SUBMITTED"
+    PARTIAL_FILLED = "PARTIAL_FILLED"
+    PARTIAL = "PARTIAL_FILLED"  # Backward-compatible alias
     FILLED = "FILLED"
-    PARTIAL = "PARTIAL"
     CANCELLED = "CANCELLED"
+    EXPIRED = "EXPIRED"
+    FAILED = "FAILED"
     REJECTED = "REJECTED"
+
+    @property
+    def is_active(self) -> bool:
+        return self in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIAL_FILLED,
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        return not self.is_active
 
 
 class SetupType(str, Enum):
@@ -169,6 +184,25 @@ class PositionPlan:
     expected_reward_r: float
     expectancy_r: float
     setup: SetupType
+
+
+@dataclass
+class BrokerOrderUpdate:
+    """Normalized broker order status snapshot from Futu push handler or order_list_query()."""
+
+    broker_order_id: str
+    symbol: str
+    side: OrderSide
+    order_type: str
+    status: OrderStatus
+    raw_status: str
+    qty: float
+    price: float
+    filled_shares: float
+    avg_fill_price: Optional[float] = None
+    remark: str = ""
+    last_err_msg: str = ""
+    updated_time: str = ""
 
 
 @dataclass

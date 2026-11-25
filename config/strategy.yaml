@@ -64,3 +64,5 @@ daemon:
   heartbeat_timeout_seconds: 30
   max_orders_per_minute: 3
   place_server_side_stop: true
+  entry_order_ttl_seconds: 90           # Cancel unfilled/partial limit buy orders after 90s to avoid adverse chasing
+  exit_order_ttl_seconds: 60            # Cancel stale limit sell orders after 60s so next tick re-prices cleanly

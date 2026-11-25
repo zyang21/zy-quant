@@ -1,17 +1,25 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import socket
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from zy_quant.config import FutuConnectionConfig
 from zy_quant.gateway.base import BrokerExecutionAdapter, MarketDataAdapter
 from zy_quant.gateway.yfinance_adapter import YahooMarketDataAdapter
-from zy_quant.models import Bar, CapitalFlowSnapshot, OrderSide, QuoteSnapshot
+from zy_quant.models import (
+    Bar,
+    BrokerOrderUpdate,
+    CapitalFlowSnapshot,
+    OrderSide,
+    OrderStatus,
+    QuoteSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +31,64 @@ def to_futu_us_code(symbol: str) -> str:
 
 def from_futu_us_code(code: str) -> str:
     return code[3:] if code.startswith("US.") else code
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    if val in (None, "N/A", ""):
+        return default
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def map_futu_order_status(raw_status: str, dealt_qty: float = 0.0) -> OrderStatus:
+    """
+    Maps Futu v10.12 OrderStatus strings into internal OrderStatus lifecycle states.
+    Note: CANCELLED_PART occurs when a partial fill's remaining open shares are cancelled;
+    returning terminal CANCELLED with filled_shares > 0 lets the daemon lock in exact dealt_qty.
+    """
+    st = (raw_status or "").strip().upper()
+    if st == "FILLED_ALL":
+        return OrderStatus.FILLED
+    if st in ("FILLED_PART", "CANCELLING_PART"):
+        return OrderStatus.PARTIAL_FILLED
+    if st in ("WAITING_SUBMIT", "SUBMITTING", "SUBMITTED", "UNSUBMITTED", "CANCELLING_ALL"):
+        return OrderStatus.PARTIAL_FILLED if dealt_qty > 0 else OrderStatus.SUBMITTED
+    if st in ("CANCELLED_ALL", "CANCELLED_PART", "DELETED", "FILL_CANCELLED"):
+        return OrderStatus.CANCELLED
+    if st == "TIMEOUT":
+        return OrderStatus.EXPIRED
+    if st in ("FAILED", "SUBMIT_FAILED", "DISABLED"):
+        return OrderStatus.FAILED
+    return OrderStatus.SUBMITTED
+
+
+def parse_futu_order_row(row: Any) -> BrokerOrderUpdate:
+    dealt_qty = _safe_float(row.get("dealt_qty"), 0.0)
+    dealt_avg = _safe_float(row.get("dealt_avg_price"), 0.0)
+    raw_status = str(row.get("order_status", "") or "SUBMITTED").strip().upper()
+    side_str = str(row.get("trd_side", "") or "BUY").strip().upper()
+    side = OrderSide.SELL if side_str == "SELL" else OrderSide.BUY
+    remark_val = row.get("remark", "")
+    err_val = row.get("last_err_msg", "")
+    upd_val = row.get("updated_time", "")
+    return BrokerOrderUpdate(
+        broker_order_id=str(row.get("order_id", "") or ""),
+        symbol=from_futu_us_code(str(row.get("code", "") or "")),
+        side=side,
+        order_type=str(row.get("order_type", "") or "NORMAL"),
+        status=map_futu_order_status(raw_status, dealt_qty),
+        raw_status=raw_status,
+        qty=_safe_float(row.get("qty"), 0.0),
+        price=_safe_float(row.get("price"), 0.0),
+        filled_shares=dealt_qty,
+        avg_fill_price=round(dealt_avg, 4) if dealt_avg > 0 else None,
+        remark="" if remark_val in (None, "N/A") else str(remark_val),
+        last_err_msg="" if err_val in (None, "N/A") else str(err_val),
+        updated_time="" if upd_val in (None, "N/A") else str(upd_val),
+    )
 
 
 class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
@@ -65,9 +131,23 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._futu_mod: Any = None
         self._rpc_lock = threading.RLock()
         self._cap_dist_supported: bool = True
+        self._order_fee_supported: bool = True
+        self._order_callbacks: List[Callable[[BrokerOrderUpdate], Any]] = []
+        self._order_handler: Any = None
         self._kline_cache: Dict[tuple[str, str], tuple[float, int, List[Bar]]] = {}
         self._last_kline_rpc_mono: float = 0.0
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
+
+    def register_order_callback(self, callback: Callable[[BrokerOrderUpdate], Any]) -> None:
+        if callback not in self._order_callbacks:
+            self._order_callbacks.append(callback)
+
+    def _dispatch_order_update(self, update: BrokerOrderUpdate) -> None:
+        for cb in list(self._order_callbacks):
+            try:
+                cb(update)
+            except Exception as exc:
+                logger.exception("Error in order update callback for %s: %s", update.broker_order_id, exc)
 
     def reconfigure(
         self,
@@ -139,6 +219,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 port=self.port,
                 security_firm=ft.SecurityFirm.NONE,
             )
+            self._attach_order_push_handler(ft)
             if self.trd_env_name == "REAL" and self.trade_pwd_md5:
                 ret, data = self._trade_ctx.unlock_trade(password_md5=self.trade_pwd_md5)
                 if ret != ft.RET_OK:
@@ -159,6 +240,30 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             logger.info("%s — running in offline/fallback mode", self.last_error)
             self.close()
             return False
+
+    def _attach_order_push_handler(self, ft: Any) -> None:
+        if self._trade_ctx is None:
+            return
+        adapter_ref = self
+
+        class ZyTradeOrderHandler(ft.TradeOrderHandlerBase):
+            """Real-time Futu order lifecycle push handler (works in both SIMULATE and REAL)."""
+
+            def on_recv_rsp(self, rsp_pb: Any) -> Any:
+                ret_code, content = super().on_recv_rsp(rsp_pb)
+                if ret_code != ft.RET_OK or content is None or getattr(content, "empty", True):
+                    return ret_code, content
+                for _, row in content.iterrows():
+                    row_env = str(row.get("trd_env", "") or "").strip().upper()
+                    if row_env and row_env != adapter_ref.trd_env_name:
+                        continue
+                    upd = parse_futu_order_row(row)
+                    if upd.broker_order_id:
+                        adapter_ref._dispatch_order_update(upd)
+                return ret_code, content
+
+        self._order_handler = ZyTradeOrderHandler()
+        self._trade_ctx.set_handler(self._order_handler)
 
     def close(self) -> None:
         for ctx in (self._quote_ctx, self._trade_ctx):
@@ -221,7 +326,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                         ret, df, page_key = self._quote_ctx.request_history_kline(
                             code, start=start_date, ktype=ktype, max_count=1000, page_req_key=page_key
                         )
-                    if ret != ft.RET_OK or df is None or df.empty:
+                    if ret != ft.RET_OK or df is None or isinstance(df, str) or df.empty:
                         break
                     frames.append(df)
                     if page_key is None:
@@ -356,6 +461,72 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 return int(stock_sim.iloc[0]["acc_id"])
         return int(env_rows.iloc[0]["acc_id"])
 
+    def has_target_account(self) -> bool:
+        return self.is_connected() and self._select_acc_id(self.trd_env_name) != 0
+
+    def sync_open_orders(self, refresh_cache: bool = False) -> List[BrokerOrderUpdate]:
+        """
+        Pull-based order reconciliation fallback via Futu order_list_query().
+        Catches any order status transitions missed during brief socket drops.
+        """
+        if not self.is_connected() or self._trade_ctx is None:
+            return []
+        acc_id = self._select_acc_id(self.trd_env_name)
+        if acc_id == 0:
+            return []
+        ft = self._futu_mod
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.order_list_query(
+                trd_env=self._trd_env(),
+                acc_id=acc_id,
+                refresh_cache=refresh_cache,
+            )
+        if ret != ft.RET_OK or df is None or df.empty:
+            return []
+        updates: List[BrokerOrderUpdate] = []
+        for _, row in df.iterrows():
+            upd = parse_futu_order_row(row)
+            if upd.broker_order_id:
+                updates.append(upd)
+        return updates
+
+    def query_order_fee(self, order_id: str) -> Optional[float]:
+        """
+        Queries exact broker billing fee via order_fee_query() in REAL mode.
+        Gracefully returns None (triggering FutuUSFeeModel fallback) in SIMULATE mode,
+        when Built-In OpenAPIHost returns 'Unknown protocol ID', or before clearing settles.
+        """
+        if (
+            not self.is_connected()
+            or self._trade_ctx is None
+            or not self._order_fee_supported
+            or self.trd_env_name != "REAL"
+            or not order_id
+            or order_id.startswith(("PAPER-", "SIM-"))
+        ):
+            return None
+        acc_id = self._select_acc_id("REAL")
+        if acc_id == 0:
+            return None
+        ft = self._futu_mod
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.order_fee_query(
+                order_id_list=[str(order_id)],
+                trd_env=self._trd_env(),
+                acc_id=acc_id,
+            )
+        if ret != ft.RET_OK:
+            if isinstance(df, str) and "unknown protocol id" in df.lower():
+                logger.warning(
+                    "Futu host does not support order_fee_query protocol; falling back to FutuUSFeeModel"
+                )
+                self._order_fee_supported = False
+            return None
+        if df is None or df.empty:
+            return None
+        fee_val = _safe_float(df.iloc[0].get("fee_amount"), -1.0)
+        return round(fee_val, 4) if fee_val > 0.0 else None
+
     def get_account_summary(self) -> Dict[str, Any]:
         if not self.is_connected() or self._trade_ctx is None:
             return {
@@ -476,17 +647,22 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     ) -> Optional[str]:
         if not self.is_connected() or self._trade_ctx is None:
             return None
+        acc_id = self._select_acc_id(self.trd_env_name)
+        if acc_id == 0:
+            return None
         ft = self._futu_mod
         trd_side = ft.TrdSide.BUY if side == OrderSide.BUY else ft.TrdSide.SELL
-        ret, df = self._trade_ctx.place_order(
-            price=round(limit_price, 2),
-            qty=shares,
-            code=to_futu_us_code(symbol),
-            trd_side=trd_side,
-            order_type=ft.OrderType.NORMAL,
-            trd_env=self._trd_env(),
-            remark=remark[:60],
-        )
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.place_order(
+                price=round(limit_price, 2),
+                qty=shares,
+                code=to_futu_us_code(symbol),
+                trd_side=trd_side,
+                order_type=ft.OrderType.NORMAL,
+                trd_env=self._trd_env(),
+                acc_id=acc_id,
+                remark=remark[:60],
+            )
         if ret != ft.RET_OK or df is None or df.empty:
             logger.error("Futu place_order failed (%s %s): %s", side.value, symbol, df)
             return None
@@ -512,42 +688,58 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         if self.trd_env_name != "REAL":
             return existing_order_id or f"SIM-LOCAL-STOP-{symbol}"
 
+        acc_id = self._select_acc_id("REAL")
+        if acc_id == 0:
+            return existing_order_id
+
         if existing_order_id:
-            ret, _ = self._trade_ctx.modify_order(
-                modify_order_op=ft.ModifyOrderOp.NORMAL,
-                order_id=existing_order_id,
-                qty=shares,
-                price=round(stop_price * 0.995, 2),
-                aux_price=round(stop_price, 2),
-                trd_env=self._trd_env(),
-            )
+            with self._rpc_lock:
+                ret, _ = self._trade_ctx.modify_order(
+                    modify_order_op=ft.ModifyOrderOp.NORMAL,
+                    order_id=existing_order_id,
+                    qty=shares,
+                    price=round(stop_price * 0.995, 2),
+                    aux_price=round(stop_price, 2),
+                    trd_env=self._trd_env(),
+                    acc_id=acc_id,
+                )
             if ret == ft.RET_OK:
                 return existing_order_id
 
-        ret, df = self._trade_ctx.place_order(
-            price=round(stop_price * 0.995, 2),
-            aux_price=round(stop_price, 2),
-            qty=shares,
-            code=to_futu_us_code(symbol),
-            trd_side=ft.TrdSide.SELL,
-            order_type=ft.OrderType.STOP_LIMIT,
-            trd_env=self._trd_env(),
-            remark="zy-quant protective stop",
-        )
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.place_order(
+                price=round(stop_price * 0.995, 2),
+                aux_price=round(stop_price, 2),
+                qty=shares,
+                code=to_futu_us_code(symbol),
+                trd_side=ft.TrdSide.SELL,
+                order_type=ft.OrderType.STOP_LIMIT,
+                trd_env=self._trd_env(),
+                acc_id=acc_id,
+                remark="zy-quant protective stop",
+            )
         if ret != ft.RET_OK or df is None or df.empty:
             logger.error("Failed placing server-side stop for %s: %s", symbol, df)
             return None
         return str(df.iloc[0]["order_id"])
 
     def cancel_order(self, order_id: str) -> bool:
-        if not self.is_connected() or self._trade_ctx is None or order_id.startswith("SIM-"):
+        if (
+            not self.is_connected()
+            or self._trade_ctx is None
+            or not order_id
+            or order_id.startswith(("SIM-", "PAPER-"))
+        ):
             return True
+        acc_id = self._select_acc_id(self.trd_env_name)
         ft = self._futu_mod
-        ret, _ = self._trade_ctx.modify_order(
-            modify_order_op=ft.ModifyOrderOp.CANCEL,
-            order_id=order_id,
-            qty=0,
-            price=0,
-            trd_env=self._trd_env(),
-        )
+        with self._rpc_lock:
+            ret, _ = self._trade_ctx.modify_order(
+                modify_order_op=ft.ModifyOrderOp.CANCEL,
+                order_id=order_id,
+                qty=0,
+                price=0,
+                trd_env=self._trd_env(),
+                acc_id=acc_id,
+            )
         return ret == ft.RET_OK

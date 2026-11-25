@@ -207,10 +207,10 @@ export class TradeHistoryView {
                 <td style="font-family:var(--font-mono);color:var(--text-secondary);">${esc(String(o.created_at || '').slice(0, 19).replace('T', ' '))}</td>
                 <td><strong>${esc(o.symbol)}</strong></td>
                 <td>${statusBadge(o.side, o.side === 'BUY' ? 'up' : 'warn', false)}</td>
-                <td class="num">${o.shares}</td>
-                <td class="num">${fmtUsd(o.fill_price || o.limit_price)}</td>
+                <td class="num">${Number(o.filled_shares || 0) > 0 && Number(o.filled_shares) < Number(o.shares) ? `${o.filled_shares} / ${o.shares}` : o.shares}</td>
+                <td class="num">${fmtUsd(o.avg_fill_price || o.fill_price || o.limit_price)}</td>
                 <td class="num txt-down">-${fmtUsd(o.fee_usd)}</td>
-                <td>${statusBadge(o.status, o.status === 'FILLED' ? 'up' : 'neutral', false)}</td>
+                <td>${statusBadge(o.status, o.status === 'FILLED' ? 'up' : (o.status === 'PARTIAL_FILLED' || o.status === 'SUBMITTED' ? 'warn' : 'neutral'), false)}</td>
                 <td class="txt-muted">${esc(o.reason)}</td>
               </tr>
             `

@@ -41,7 +41,10 @@ class PortfolioAnalyticsService:
             unreal_pct = ((mark_px - p.entry_price) / p.entry_price * 100.0) if p.entry_price > 0 else 0.0
             r_now = (mark_px - p.entry_price) / max(0.01, p.risk_per_share)
             unrealized_total += unreal
-            invested_cost += p.shares * p.entry_price + float(p.metadata.get("buy_fee_usd", 0.0))
+            rem_buy_fee = float(p.metadata.get("buy_fee_usd", 0.0)) * (
+                p.shares / max(1e-6, p.initial_shares)
+            )
+            invested_cost += p.shares * p.entry_price + rem_buy_fee
             mark_val_total += p.shares * mark_px
 
             positions_out.append(
@@ -73,7 +76,9 @@ class PortfolioAnalyticsService:
         realized_total = sum(float(t.get("net_pnl_usd", 0.0)) for t in closed_all)
         closed_gross = sum(float(t.get("gross_pnl_usd", 0.0)) for t in closed_all)
         filled_fees = sum(
-            float(o.get("fee_usd", 0.0)) for o in orders_all if o.get("status") == "FILLED"
+            float(o.get("fee_usd", 0.0))
+            for o in orders_all
+            if o.get("status") in ("FILLED", "PARTIAL_FILLED") or float(o.get("filled_shares") or 0.0) > 0.0
         )
 
         if is_real and broker_summary and float(broker_summary.get("equity_usd", 0.0)) > 0:

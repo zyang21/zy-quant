@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
-from zy_quant.models import Bar, CapitalFlowSnapshot, OrderSide, QuoteSnapshot
+from zy_quant.models import (
+    Bar,
+    BrokerOrderUpdate,
+    CapitalFlowSnapshot,
+    OrderSide,
+    QuoteSnapshot,
+)
 
 
 class MarketDataAdapter(ABC):
@@ -56,3 +62,15 @@ class BrokerExecutionAdapter(ABC):
     @abstractmethod
     def cancel_order(self, order_id: str) -> bool:
         raise NotImplementedError
+
+    def has_target_account(self) -> bool:
+        return False
+
+    def register_order_callback(self, callback: Callable[[BrokerOrderUpdate], Any]) -> None:
+        return None
+
+    def sync_open_orders(self, refresh_cache: bool = False) -> List[BrokerOrderUpdate]:
+        return []
+
+    def query_order_fee(self, order_id: str) -> Optional[float]:
+        return None

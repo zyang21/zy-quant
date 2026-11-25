@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict
@@ -63,8 +64,8 @@ class MandateRiskGate:
                 f"Daily loss circuit breaker active (${daily_pnl:.2f} <= ${max_loss_usd:.2f})",
             )
 
-        # 4. Daily & Weekly Trade Frequency Caps (anti-fee-churn)
-        buys_today = self.store.count_orders_since(day_start, side=OrderSide.BUY)
+        # 4. Daily & Weekly Trade Frequency Caps (anti-fee-churn; 0-fill expired orders do not burn cap)
+        buys_today = self.store.count_trade_budget_orders_since(day_start, side=OrderSide.BUY)
         if buys_today >= tier.max_trades_per_day:
             return RiskDecision(
                 False,
@@ -72,28 +73,48 @@ class MandateRiskGate:
             )
 
         week_start = (ref_now - timedelta(days=7)).isoformat()
-        buys_week = self.store.count_orders_since(week_start, side=OrderSide.BUY)
+        buys_week = self.store.count_trade_budget_orders_since(week_start, side=OrderSide.BUY)
         if buys_week >= tier.max_trades_per_week:
             return RiskDecision(
                 False,
                 f"Weekly trade frequency cap reached ({buys_week}/{tier.max_trades_per_week}) to preserve fee budget",
             )
 
-        # 5. Position Slot & Duplicate Symbol Check
+        # 5. Position Slot & Duplicate Symbol Check (locks in-flight SUBMITTED/PARTIAL_FILLED buy orders!)
+        active_buys = self.store.get_active_orders(side=OrderSide.BUY)
+        pending_buy_symbols = {str(o["symbol"]).upper() for o in active_buys}
+
         if plan.symbol in open_positions:
             return RiskDecision(False, f"Position already open in {plan.symbol}")
-        if len(open_positions) >= tier.max_concurrent_positions:
+        if plan.symbol.upper() in pending_buy_symbols:
             return RiskDecision(
-                False,
-                f"Max concurrent positions reached ({len(open_positions)}/{tier.max_concurrent_positions})",
+                False, f"In-flight BUY order already pending/submitted in {plan.symbol}"
             )
 
-        # 6. Sector Concentration Cap (vital for $100k multi-position portfolio)
+        occupied_symbols = {s.upper() for s in open_positions.keys()} | pending_buy_symbols
+        if len(occupied_symbols) >= tier.max_concurrent_positions:
+            return RiskDecision(
+                False,
+                f"Max concurrent slots reached ({len(occupied_symbols)}/{tier.max_concurrent_positions} including in-flight orders)",
+            )
+
+        # 6. Sector Concentration Cap (includes open positions + remaining unfilled notional of in-flight buys)
         sector_notional = sum(
             p.shares * p.entry_price
             for p in open_positions.values()
             if p.sector == plan.sector
         )
+        for o in active_buys:
+            try:
+                p_meta = json.loads(o.get("plan_json") or "{}")
+            except (TypeError, ValueError):
+                p_meta = {}
+            if p_meta.get("sector") == plan.sector:
+                rem_sh = max(
+                    0.0, float(o.get("shares") or 0.0) - float(o.get("filled_shares") or 0.0)
+                )
+                sector_notional += rem_sh * float(o.get("limit_price") or 0.0)
+
         projected_sector_pct = (sector_notional + plan.notional_usd) / max(1.0, account_equity_usd)
         if projected_sector_pct > tier.max_sector_weight_pct + 1e-6:
             return RiskDecision(

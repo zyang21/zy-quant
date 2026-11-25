@@ -46,11 +46,15 @@ class StateStore:
                     symbol TEXT NOT NULL,
                     side TEXT NOT NULL,
                     shares REAL NOT NULL,
+                    filled_shares REAL NOT NULL DEFAULT 0.0,
+                    reconciled_shares REAL NOT NULL DEFAULT 0.0,
                     limit_price REAL NOT NULL,
                     fill_price REAL,
+                    avg_fill_price REAL,
                     fee_usd REAL DEFAULT 0.0,
                     status TEXT NOT NULL,
                     reason TEXT,
+                    plan_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -108,6 +112,20 @@ class StateStore:
                 );
                 """
             )
+            # Idempotent schema migration for pre-existing SQLite DBs
+            existing_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(orders)").fetchall()
+            }
+            migrations = [
+                ("filled_shares", "REAL NOT NULL DEFAULT 0.0"),
+                ("reconciled_shares", "REAL NOT NULL DEFAULT 0.0"),
+                ("avg_fill_price", "REAL"),
+                ("plan_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ]
+            for col_name, col_def in migrations:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE orders ADD COLUMN {col_name} {col_def}")
 
     # --- Kill-Switch / Flags ---
     def set_halted(self, halted: bool, reason: str = "") -> None:
@@ -162,15 +180,21 @@ class StateStore:
         shares: float,
         limit_price: float,
         reason: str,
+        plan_meta: Optional[Dict[str, Any]] = None,
+        created_at: Optional[datetime] = None,
     ) -> bool:
         """Returns True if inserted cleanly, False if client_order_id already exists (idempotent guard)."""
-        now = datetime.now(timezone.utc).isoformat()
+        now = (created_at or datetime.now(timezone.utc)).isoformat()
+        plan_str = json.dumps(plan_meta or {})
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO orders(client_order_id, symbol, side, shares, limit_price, status, reason, created_at, updated_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO orders(
+                        client_order_id, symbol, side, shares, filled_shares, reconciled_shares,
+                        limit_price, status, reason, plan_json, created_at, updated_at
+                    )
+                    VALUES(?, ?, ?, ?, 0.0, 0.0, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         client_order_id,
@@ -180,6 +204,7 @@ class StateStore:
                         limit_price,
                         OrderStatus.PENDING.value,
                         reason,
+                        plan_str,
                         now,
                         now,
                     ),
@@ -194,25 +219,127 @@ class StateStore:
         status: OrderStatus,
         broker_order_id: Optional[str] = None,
         fill_price: Optional[float] = None,
-        fee_usd: float = 0.0,
+        fee_usd: Optional[float] = None,
+        filled_shares: Optional[float] = None,
+        avg_fill_price: Optional[float] = None,
+        reconciled_shares: Optional[float] = None,
+        reason: Optional[str] = None,
     ) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        eff_avg_px = avg_fill_price if avg_fill_price is not None else fill_price
+        eff_fill_px = fill_price if fill_price is not None else avg_fill_price
+        # Backward compatibility: direct FILLED calls without explicit filled_shares fill 100% of shares
         with self._connect() as conn:
+            if filled_shares is None and status == OrderStatus.FILLED:
+                row = conn.execute(
+                    "SELECT shares, filled_shares FROM orders WHERE client_order_id=?",
+                    (client_order_id,),
+                ).fetchone()
+                if row and float(row["filled_shares"] or 0.0) <= 0.0:
+                    filled_shares = float(row["shares"])
+
             conn.execute(
                 """
                 UPDATE orders
                 SET status=?,
                     broker_order_id=COALESCE(?, broker_order_id),
                     fill_price=COALESCE(?, fill_price),
-                    fee_usd=?,
+                    avg_fill_price=COALESCE(?, avg_fill_price),
+                    fee_usd=COALESCE(?, fee_usd),
+                    filled_shares=COALESCE(?, filled_shares),
+                    reconciled_shares=COALESCE(?, reconciled_shares),
+                    reason=COALESCE(?, reason),
                     updated_at=?
                 WHERE client_order_id=?
                 """,
-                (status.value, broker_order_id, fill_price, fee_usd, now, client_order_id),
+                (
+                    status.value,
+                    broker_order_id,
+                    eff_fill_px,
+                    eff_avg_px,
+                    fee_usd,
+                    filled_shares,
+                    reconciled_shares,
+                    reason,
+                    now,
+                    client_order_id,
+                ),
             )
+
+    def get_order(self, client_order_id: str) -> Optional[Dict[str, Any]]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM orders WHERE client_order_id=?", (client_order_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_order_for_broker_update(
+        self, broker_order_id: str, remark: str = ""
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Matches an incoming Futu push or poll record against local SQLite orders:
+        1. Primary match by broker_order_id
+        2. Fallback match by remark == client_order_id (handles race where Futu push arrives
+           milliseconds before place_order() returns broker_order_id on main thread!)
+        """
+        with self._connect() as conn:
+            if broker_order_id:
+                row = conn.execute(
+                    "SELECT * FROM orders WHERE broker_order_id=?", (str(broker_order_id),)
+                ).fetchone()
+                if row:
+                    return dict(row)
+            if remark:
+                row = conn.execute(
+                    "SELECT * FROM orders WHERE client_order_id=?", (remark.strip(),)
+                ).fetchone()
+                if row:
+                    return dict(row)
+        return None
+
+    def get_active_orders(
+        self, side: Optional[OrderSide] = None, symbol: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Returns in-flight orders (PENDING, SUBMITTED, PARTIAL_FILLED) that lock slots/cash."""
+        clauses = ["status IN ('PENDING', 'SUBMITTED', 'PARTIAL_FILLED')"]
+        params: List[Any] = []
+        if side is not None:
+            clauses.append("side = ?")
+            params.append(side.value)
+        if symbol is not None:
+            clauses.append("UPPER(symbol) = ?")
+            params.append(symbol.upper())
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM orders WHERE {' AND '.join(clauses)} ORDER BY created_at ASC",
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def count_orders_since(self, since_iso: str, side: Optional[OrderSide] = None) -> int:
         query = "SELECT COUNT(*) AS cnt FROM orders WHERE created_at >= ? AND status != 'REJECTED'"
+        params: list[Any] = [since_iso]
+        if side is not None:
+            query += " AND side = ?"
+            params.append(side.value)
+        with self._connect() as conn:
+            row = conn.execute(query, params).fetchone()
+        return int(row["cnt"]) if row else 0
+
+    def count_trade_budget_orders_since(
+        self, since_iso: str, side: Optional[OrderSide] = None
+    ) -> int:
+        """
+        Counts orders toward daily/weekly turnover caps:
+        Includes all active in-flight orders AND any terminal order that filled > 0 shares,
+        while excluding 0-share unfilled orders that expired/cancelled ($0 fee churn).
+        """
+        query = """
+            SELECT COUNT(*) AS cnt FROM orders
+            WHERE created_at >= ?
+              AND status NOT IN ('REJECTED', 'FAILED')
+              AND NOT (status IN ('CANCELLED', 'EXPIRED') AND COALESCE(filled_shares, 0.0) <= 0.0)
+        """
         params: list[Any] = [since_iso]
         if side is not None:
             query += " AND side = ?"
@@ -268,8 +395,11 @@ class StateStore:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     shares=excluded.shares,
+                    initial_shares=excluded.initial_shares,
+                    entry_price=excluded.entry_price,
                     current_stop=excluded.current_stop,
                     highest_price=excluded.highest_price,
+                    risk_per_share=excluded.risk_per_share,
                     bars_held_15m=excluded.bars_held_15m,
                     breakeven_armed=excluded.breakeven_armed,
                     scaled_out=excluded.scaled_out,

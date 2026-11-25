@@ -177,6 +177,8 @@ class DaemonConfig(BaseModel):
     heartbeat_timeout_seconds: int = 30
     max_orders_per_minute: int = 3
     place_server_side_stop: bool = True
+    entry_order_ttl_seconds: int = 90
+    exit_order_ttl_seconds: int = 60
 
 
 class StrategyConfig(BaseModel):
