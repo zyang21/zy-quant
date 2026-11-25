@@ -10,6 +10,7 @@ Prioritized engineering backlog for upgrading `zy-quant` from a single-gateway p
 - **`[P1]` Data Decoupling & Universe Scaling** — Removes Futu API rate-limit bottlenecks (`60 req / 30s`), expands to a 100-stock multi-sector pool, and unlocks multi-year walk-forward backtesting.
 - **`[P2]` Statistical Adaptivity** — Replaces static hardcoded strategy assumptions with self-calibrating mathematical estimators validated out-of-sample.
 - **`[P3]` Cross-Project SQLite Intel Contract** — Read-only schema consumption for the standalone Pre/Post-Market LLM Intel Agent project.
+- **`[P4]` Futu HK `T+0` Rules, Progressive Chandelier & `tier_10k` Scale-Out** — Fixes `+1.8R` profit giveback, removes false US `$25k` PDT constraint for Futu HK accounts, adds conditional EOD/Friday `T+0` exits, and unlocks 50% partial profit lock on `tier_10k`.
 
 ---
 
@@ -103,3 +104,22 @@ Replace fragile static priors in `config/strategy.yaml` with bounded mathematica
   - [ ] `ConservativeWatchlistScorer`: Apply `veto_entry` and clamped `catalyst_score_adj` when `expires_at > now`.
   - [ ] `MandateRiskGate.check_entry()`: Reject new entries during active `macro_blackout_windows`.
   - [ ] Web Dashboard (`overview.js`): Display active Macro Blackout badges and Agent Veto reasons next to watchlist tickers.
+
+---
+
+## `[P4]` Futu HK `T+0` Exit Governance, Progressive Chandelier & `tier_10k` Scale-Out
+**Target Branch:** `feat/futu-hk-t0-and-exit-tuning`
+
+Eliminates the inverted payoff ratio observed in 30d/55d backtests (where `4.2x ATR` Chandelier gave back ~65% of `+1.8R` gains) and replaces the non-applicable US FINRA `$25k` PDT restriction with **Futu HK SFC-regulated infinite `T+0` rules** calibrated strictly by fee-to-notional economics.
+
+### Functions & Tasks
+- [x] **Progressive Profit-Lock & Tightened Chandelier (`config/strategy.yaml`, `strategy/exit_models.py`)**
+  - [x] Arm breakeven-plus-fees stop at `+1.5R` (`breakeven_trigger_r: 1.5` vs `1.8`).
+  - [x] Tighten trailing `chandelier_atr_multiplier` from `4.2` to `2.8` and add progressive profit-floor ratchet (`profit_lock_trigger_r: 1.8`, `profit_lock_floor_ratio: 0.55`) so winners reaching `+1.8R+` lock at least `55%` of peak open gain.
+- [x] **Futu HK Defensive `T+0` EOD & Weekend Shield (`config/tiers.yaml`, `strategy/exit_models.py`, `backtest/engine.py`, `runtime/daemon.py`)**
+  - [x] Add `ExitReason.EOD_T0_FLATTEN` evaluated during the closing 30m window (`session_bar_num >= 25`, `15:30–16:00 ET`).
+  - [x] Cut genuinely failing day-0 setups (`eod_weak_exit_below_r: -0.65`) and losing Friday positions (`friday_min_cushion_r: -0.35`) `T+0` before overnight/weekend gaps, while sparing healthy consolidations (`-0.2R..+0.25R`) from double-fee churn.
+- [x] **Unlock Partial Scale-Out in `tier_10k` (`config/tiers.yaml`, `strategy/exit_models.py`)**
+  - [x] Enable 50% scale-out at `+1.8R` in `tier_10k` (guarded by `min_scale_out_notional_usd: 1500.0` so small lots never pay double minimum fees).
+- [x] **30D & 55D Real Futu Historical Backtest Verification**
+  - [x] Verified on live Futu historical `15m` bars (`2026-08-25 -> 2026-11-24`, QQQ `-11.1%`): `tier_10k` flipped `-$71.21 -> +$178.20` (`PF 1.19`), `tier_100k` flipped `-$1,429.96 -> +$661.00` (`PF 1.08`), and `tier_1k` cut drawdown `-4.45% -> -0.79%` (gross `+$35.00`).

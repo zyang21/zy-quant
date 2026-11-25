@@ -64,6 +64,10 @@ class TierProfile(BaseModel):
     enable_scale_out: bool = False
     scale_out_fraction: float = 0.50
     scale_out_target_r: float = 2.0
+    min_scale_out_notional_usd: float = 1500.0
+    enable_t0_eod_exit: bool = True
+    eod_weak_exit_below_r: Optional[float] = None
+    friday_min_cushion_r: Optional[float] = None
     enable_index_hedge: bool = False
     max_sector_weight_pct: float = 1.0
     order_protection_bps: float = 5.0
@@ -164,8 +168,10 @@ class ExitModelsConfig(BaseModel):
     atr_stop_multiplier: float = 2.8
     min_stop_pct: float = 0.015
     max_hard_stop_pct: float = 0.040
-    breakeven_trigger_r: float = 1.8
-    chandelier_atr_multiplier: float = 4.2
+    breakeven_trigger_r: float = 1.5
+    chandelier_atr_multiplier: float = 2.8
+    profit_lock_trigger_r: float = 1.8
+    profit_lock_floor_ratio: float = 0.55
     time_stop_bars_15m: int = 52
     time_stop_min_progress_r: float = 0.15
     assumed_base_win_rate: float = 0.48

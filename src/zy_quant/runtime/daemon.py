@@ -13,7 +13,7 @@ from zy_quant.fees import FutuUSFeeModel
 from zy_quant.gateway.base import BrokerExecutionAdapter, MarketDataAdapter
 from zy_quant.gateway.futu_adapter import FutuGatewayAdapter
 from zy_quant.intel.edgar_form4 import SecEdgarForm4Scanner
-from zy_quant.intel.market_hours import get_us_market_session
+from zy_quant.intel.market_hours import get_us_market_session, session_close_time
 from zy_quant.intel.regime import MarketRegimeDetector
 from zy_quant.intel.watchlist_scorer import ConservativeWatchlistScorer
 from zy_quant.models import (
@@ -639,8 +639,19 @@ class TradingDaemon:
             prev_stop = pos.current_stop
             prev_scaled_out = pos.scaled_out
             prev_be_armed = pos.breakeven_armed
+            session_bar_num = sum(
+                1 for b in bars_15m if b.timestamp.date() == latest_bar.timestamp.date()
+            )
+            close_t = session_close_time(latest_bar.timestamp.date())
+            total_session_bars = ((close_t.hour * 60 + close_t.minute) - (9 * 60 + 30)) // 15
+            eod_threshold = max(1, total_session_bars - 1)
             action = self.exit_engine.step_position(
-                pos, latest_bar, atrs[-1], tier, is_new_bar=is_new_bar
+                pos,
+                latest_bar,
+                atrs[-1],
+                tier,
+                is_new_bar=is_new_bar,
+                is_eod_window=(session_bar_num >= eod_threshold),
             )
 
             if action.should_exit and action.shares_to_sell > 0:

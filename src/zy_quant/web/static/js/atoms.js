@@ -54,7 +54,8 @@ export function humanizeExitReason(code) {
     BREAKEVEN_STOP: 'Breakeven Capital Guard',
     CHANDELIER_TRAIL: 'Chandelier Trailing Profit Lock',
     TIME_BARRIER: '4h Stagnation Time Exit',
-    SCALE_OUT_2R: 'Partial +2R Profit Lock',
+    EOD_T0_FLATTEN: 'Futu HK T+0 EOD Shield',
+    SCALE_OUT_2R: 'Partial Profit Scale-Out',
     KILL_SWITCH: 'Emergency Kill-Switch',
   };
   return map[code] || code || 'Closed';

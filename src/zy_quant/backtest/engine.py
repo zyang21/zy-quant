@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from zy_quant.config import AppSettings
 from zy_quant.fees import FutuUSFeeModel
 from zy_quant.gateway.base import MarketDataAdapter
+from zy_quant.intel.market_hours import session_close_time
 from zy_quant.intel.regime import MarketRegimeDetector
 from zy_quant.models import Bar, OpenPosition, OrderSide, RegimeLight
 from zy_quant.strategy.exit_models import ScientificExitAndSizingEngine
@@ -204,7 +205,19 @@ class BacktestEngine:
             else:
                 rest_bars += 1
 
-            # 1. Step open positions first (stops, scale-outs, Chandelier ratchets, time barriers)
+            # Detect final 30m of regular or early-close US session (e.g. bar >= 25 normal, >= 13 Black Friday)
+            session_bar_num = sum(
+                1
+                for k in range(max(0, q_idx - 30), q_idx + 1)
+                if qqq_15m[k].timestamp.date() == ts.date()
+            )
+            close_t = session_close_time(ts.date())
+            eod_threshold = max(1, (((close_t.hour * 60 + close_t.minute) - (9 * 60 + 30)) // 15) - 1)
+            is_eod_window = session_bar_num >= eod_threshold or (
+                q_idx + 1 < len(qqq_15m) and qqq_15m[q_idx + 1].timestamp.date() != ts.date()
+            )
+
+            # 1. Step open positions first (stops, scale-outs, Chandelier ratchets, T+0 EOD, time barriers)
             for sym in list(positions.keys()):
                 entry_pair = bar_lookup[sym].get(ts)
                 if entry_pair is None:
@@ -212,7 +225,9 @@ class BacktestEngine:
                 s_idx, s_bar = entry_pair
                 pos = positions[sym]
                 atr_val = symbol_atrs[sym][s_idx]
-                action = self.exit_engine.step_position(pos, s_bar, atr_val, tier)
+                action = self.exit_engine.step_position(
+                    pos, s_bar, atr_val, tier, is_eod_window=is_eod_window
+                )
 
                 if action.should_exit and action.shares_to_sell > 0:
                     sell_fee = self.fee_model.estimate_leg(

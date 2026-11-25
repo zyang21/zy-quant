@@ -19,15 +19,18 @@ tiers:
     edge_to_fee_multiple: 6.5          # Expected gross >= 6.5x round-trip friction (+ E >= 0.25R expectancy)
     allow_overnight_hold: true         # Hold 1-5 days via Chandelier trailing stop to avoid intraday churn fees
     enable_scale_out: false            # Single exit (avoid paying minimum fee twice)
+    enable_t0_eod_exit: true           # Futu HK infinite T+0: cut broken setups before overnight/weekend gaps
+    eod_weak_exit_below_r: -0.65       # Cut failing day-0 setups (< -0.65R) at close without churning healthy consolidations
+    friday_min_cushion_r: -0.35        # Friday weekend shield: exit losing setups (< -0.35R) before weekend headline risk
     enable_index_hedge: false
     max_sector_weight_pct: 1.00
     order_protection_bps: 6.0          # Limit price = ask + 6 bps
 
   tier_10k:
-    label: "Tier 2 — Intraday + Swing ($10,000)"
+    label: "Tier 2 — Futu HK T+0 Hybrid + Scale-Out ($10,000)"
     reference_equity_usd: 10000.0
     max_concurrent_positions: 3
-    max_position_pct: 0.40             # ~$3,300 - $4,000 per trade (~0.11% round-trip friction)
+    max_position_pct: 0.40             # ~$3,300 - $4,000 per trade (~0.10% round-trip friction on Futu HK)
     min_order_notional_usd: 2500.0
     allow_fractional_shares: false
     risk_per_trade_pct: 0.010          # Max 1.0% ($100) equity risk per trade
@@ -37,7 +40,13 @@ tiers:
     min_expected_move_pct: 0.012       # >= 1.2% expected move
     edge_to_fee_multiple: 8.0
     allow_overnight_hold: true
-    enable_scale_out: false
+    enable_scale_out: true             # Futu HK no-$25k-PDT: lock 50% profit at +1.8R, trail 50% risk-free!
+    scale_out_fraction: 0.50
+    scale_out_target_r: 1.8
+    min_scale_out_notional_usd: 1500.0 # Only split sell leg when >= $1,500 notional so $2 min fee is < 13 bps
+    enable_t0_eod_exit: true           # Defensive T+0 overnight/weekend shield
+    eod_weak_exit_below_r: -0.65       # Cut broken day-0 setups (< -0.65R) before overnight gap-down risk
+    friday_min_cushion_r: -0.35        # Cut losing setups (< -0.35R) before weekend gap risk
     enable_index_hedge: false
     max_sector_weight_pct: 0.70
     order_protection_bps: 5.0
@@ -46,7 +55,7 @@ tiers:
     label: "Tier 3 — Pro Multi-Position & Scale-Out ($100,000)"
     reference_equity_usd: 100000.0
     max_concurrent_positions: 6
-    max_position_pct: 0.20             # ~$15,000 - $20,000 per trade (~0.023% round-trip friction; PDT >$25k unlocked)
+    max_position_pct: 0.20             # ~$15,000 - $20,000 per trade (~0.023% round-trip friction on Futu HK)
     min_order_notional_usd: 8000.0
     allow_fractional_shares: false
     risk_per_trade_pct: 0.0075         # 0.75% ($750) equity risk per trade
@@ -56,9 +65,13 @@ tiers:
     min_expected_move_pct: 0.007       # >= 0.70% intraday move is highly profitable net of 2.3 bps fees
     edge_to_fee_multiple: 8.0
     allow_overnight_hold: true
-    enable_scale_out: true             # Sell 50% at +2.0R target, trail remaining 50% with Chandelier Exit
+    enable_scale_out: true             # Sell 50% at +1.8R target, trail remaining 50% with progressive Chandelier
     scale_out_fraction: 0.50
-    scale_out_target_r: 2.0
+    scale_out_target_r: 1.8
+    min_scale_out_notional_usd: 2500.0
+    enable_t0_eod_exit: true
+    eod_weak_exit_below_r: -0.65       # Cut broken day-0 setups (< -0.65R) before overnight gap
+    friday_min_cushion_r: -0.35        # Cut losing setups (< -0.35R) before weekend gap
     enable_index_hedge: true           # Optional QQQ/SQQQ overnight beta hedge when gross exposure > 60%
     max_sector_weight_pct: 0.40        # Strict 40% sector concentration cap
     order_protection_bps: 4.0          # OrderBook-aware marketable limit protection

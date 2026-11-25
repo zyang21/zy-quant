@@ -320,7 +320,9 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                     ret, df, page_key = self._quote_ctx.request_history_kline(
                         code, start=start_date, ktype=ktype, max_count=1000, page_req_key=page_key
                     )
-                    if ret != ft.RET_OK and isinstance(df, str) and "frequency" in df.lower():
+                    if ret != ft.RET_OK and isinstance(df, str) and any(
+                        kw in df.lower() for kw in ("freq", "频繁", "limit", "too many")
+                    ):
                         time.sleep(2.0)
                         self._last_kline_rpc_mono = time.monotonic()
                         ret, df, page_key = self._quote_ctx.request_history_kline(
