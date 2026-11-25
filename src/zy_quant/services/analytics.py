@@ -73,7 +73,9 @@ class PortfolioAnalyticsService:
         realized_total = sum(float(t.get("net_pnl_usd", 0.0)) for t in closed_all)
         closed_gross = sum(float(t.get("gross_pnl_usd", 0.0)) for t in closed_all)
         filled_fees = sum(
-            float(o.get("fee_usd", 0.0)) for o in orders_all if o.get("status") == "FILLED"
+            float(o.get("fee_usd", 0.0))
+            for o in orders_all
+            if o.get("status") in ("FILLED", "PARTIAL_FILLED") or float(o.get("filled_shares") or 0.0) > 0.0
         )
 
         if is_real and broker_summary and float(broker_summary.get("equity_usd", 0.0)) > 0:
