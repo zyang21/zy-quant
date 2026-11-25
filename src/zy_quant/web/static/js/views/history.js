@@ -58,7 +58,8 @@ export class TradeHistoryView {
           <select id="histReason">
             <option value="">All Exit Rules</option>
             <option value="CHANDELIER_TRAIL">Chandelier Trailing Profit</option>
-            <option value="SCALE_OUT_2R">Scale-Out +2R</option>
+            <option value="SCALE_OUT_2R">Scale-Out Profit Lock</option>
+            <option value="EOD_T0_FLATTEN">Futu HK T+0 EOD Shield</option>
             <option value="BREAKEVEN_STOP">Breakeven Guard</option>
             <option value="INITIAL_ATR_STOP">Initial ATR Stop</option>
             <option value="TIME_BARRIER">4h Time Barrier</option>

@@ -156,9 +156,10 @@ class ScientificExitAndSizingEngine:
         atr_14: float,
         tier: TierProfile,
         is_new_bar: bool = True,
+        is_eod_window: bool = False,
     ) -> ExitAction:
         """
-        Updates ratcheted stop and checks all 3 barriers + Tier 3 ($100k) scale-out on each 15m bar.
+        Updates ratcheted stop and checks all barriers + Futu HK T+0 EOD/Friday shield + partial scale-out.
         Modifies `pos` in place and returns an `ExitAction`.
         """
         if is_new_bar:
@@ -168,9 +169,10 @@ class ScientificExitAndSizingEngine:
         if bar.low <= pos.current_stop:
             fill_px = min(bar.open, pos.current_stop) if bar.open < pos.current_stop else pos.current_stop
             if pos.current_stop > pos.entry_price:
+                locked_r = (pos.current_stop - pos.entry_price) / max(0.01, pos.risk_per_share)
                 reason = (
                     ExitReason.CHANDELIER_TRAIL
-                    if pos.highest_price - pos.entry_price >= 2.0 * pos.risk_per_share
+                    if locked_r >= 0.25 or (pos.highest_price - pos.entry_price) >= 1.5 * pos.risk_per_share
                     else ExitReason.BREAKEVEN_STOP
                 )
             else:
@@ -191,7 +193,8 @@ class ScientificExitAndSizingEngine:
         peak_r = (pos.highest_price - pos.entry_price) / max(0.01, pos.risk_per_share)
         curr_r = (bar.close - pos.entry_price) / max(0.01, pos.risk_per_share)
 
-        # 2. Tier 3 ($100k) Scale-Out: Lock in 50% at +2.0R while letting remaining 50% ride Chandelier
+        # 2. Partial Scale-Out (Tier 2 $10k & Tier 3 $100k on Futu HK):
+        # Lock in 50% at scale_out_target_r when half-lot >= min_scale_out_notional_usd
         if (
             tier.enable_scale_out
             and not pos.scaled_out
@@ -200,7 +203,7 @@ class ScientificExitAndSizingEngine:
         ):
             target_px = round(pos.entry_price + tier.scale_out_target_r * pos.risk_per_share, 2)
             sell_qty = float(math.floor(pos.shares * tier.scale_out_fraction))
-            if sell_qty >= 1.0:
+            if sell_qty >= 1.0 and (sell_qty * target_px) >= tier.min_scale_out_notional_usd:
                 pos.scaled_out = True
                 # Immediately arm breakeven stop on remaining shares
                 rt_per_share = (
@@ -227,15 +230,52 @@ class ScientificExitAndSizingEngine:
                 pos.current_stop = max(pos.current_stop, be_px)
                 pos.breakeven_armed = True
 
-        # 4. Chandelier Trailing Stop Ratchet (strictly monotonic upward, active once breakeven armed)
+        # 4. Progressive Profit-Floor + Tightened Chandelier Ratchet (monotonic upward)
         if pos.breakeven_armed and atr_14 > 0:
-            chandelier_stop = round(
-                pos.highest_price - self.cfg.chandelier_atr_multiplier * atr_14, 2
-            )
-            if chandelier_stop < bar.close:
-                pos.current_stop = max(pos.current_stop, chandelier_stop)
+            chandelier_stop = pos.highest_price - self.cfg.chandelier_atr_multiplier * atr_14
+            if peak_r >= self.cfg.profit_lock_trigger_r:
+                # Guarantee at least `profit_lock_floor_ratio` (e.g. 55%) of peak open gain is retained!
+                floor_stop = pos.entry_price + self.cfg.profit_lock_floor_ratio * (
+                    pos.highest_price - pos.entry_price
+                )
+                candidate_stop = round(max(chandelier_stop, floor_stop), 2)
+            else:
+                candidate_stop = round(chandelier_stop, 2)
 
-        # 5. Triple-Barrier Vertical Time Stop (exit dead-money trades early to free capital)
+            if candidate_stop < bar.close:
+                pos.current_stop = max(pos.current_stop, candidate_stop)
+
+        # 5. Futu HK Infinite T+0 Conditional EOD & Weekend Shield (final 30m of session)
+        if is_eod_window and tier.enable_t0_eod_exit and not pos.breakeven_armed:
+            opened_today = pos.entry_time.date() == bar.timestamp.date()
+            if opened_today and tier.eod_weak_exit_below_r is not None and curr_r < tier.eod_weak_exit_below_r:
+                return ExitAction(
+                    should_exit=True,
+                    shares_to_sell=pos.shares,
+                    exit_price=round(bar.close, 2),
+                    reason=ExitReason.EOD_T0_FLATTEN,
+                    updated_stop=pos.current_stop,
+                    note=(
+                        f"Futu HK T+0 EOD exit: day-0 setup at {curr_r:+.2f}R "
+                        f"(< {tier.eod_weak_exit_below_r:+.2f}R overnight threshold)"
+                    ),
+                )
+
+            is_friday = bar.timestamp.weekday() == 4
+            if is_friday and tier.friday_min_cushion_r is not None and curr_r < tier.friday_min_cushion_r:
+                return ExitAction(
+                    should_exit=True,
+                    shares_to_sell=pos.shares,
+                    exit_price=round(bar.close, 2),
+                    reason=ExitReason.EOD_T0_FLATTEN,
+                    updated_stop=pos.current_stop,
+                    note=(
+                        f"Futu HK Friday weekend shield: {curr_r:+.2f}R "
+                        f"(< {tier.friday_min_cushion_r:+.2f}R weekend cushion)"
+                    ),
+                )
+
+        # 6. Triple-Barrier Vertical Time Stop (exit dead-money trades early to free capital)
         if (
             not pos.breakeven_armed
             and pos.bars_held_15m >= self.cfg.time_stop_bars_15m

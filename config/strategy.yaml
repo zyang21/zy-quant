@@ -46,9 +46,11 @@ exit_models:
   min_stop_pct: 0.015                   # Never place a hair-trigger <1.5% stop inside intraday noise
   max_hard_stop_pct: 0.040              # Absolute safety cap (<= 4.0% price distance)
 
-  # 2. Breakeven Ratchet + Wide Swing Chandelier Exit: S_trail(t) = H_max - 4.2 * ATR_14(t)
-  breakeven_trigger_r: 1.8              # Lift stop above round-trip fees at +1.8R
-  chandelier_atr_multiplier: 4.2        # Wide multi-day Chandelier lets trend winners run across sessions
+  # 2. Breakeven Ratchet + Progressive Profit-Lock Chandelier Exit
+  breakeven_trigger_r: 1.5              # Lift stop above round-trip fees at +1.5R (avoids choking early swings while guarding winners)
+  chandelier_atr_multiplier: 2.8        # Tightened from 4.2x -> 2.8x ATR to eliminate 65% open-profit giveback
+  profit_lock_trigger_r: 1.8            # Once peak reaches +1.8R, lock at least 55% of peak open gain
+  profit_lock_floor_ratio: 0.55
 
   # 3. Multi-Session Time Barrier
   time_stop_bars_15m: 52                # ~2 trading sessions (52 x 15m bars) before cutting dead money
