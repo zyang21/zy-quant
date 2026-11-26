@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+from bisect import bisect_left
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from zy_quant.config import AppSettings
@@ -10,6 +11,7 @@ from zy_quant.fees import FutuUSFeeModel
 from zy_quant.gateway.base import MarketDataAdapter
 from zy_quant.intel.market_hours import session_close_time
 from zy_quant.intel.regime import MarketRegimeDetector
+from zy_quant.intel.universe_manager import PointInTimeUniverseFilter
 from zy_quant.models import Bar, OpenPosition, OrderSide, RegimeLight
 from zy_quant.strategy.exit_models import ScientificExitAndSizingEngine
 from zy_quant.strategy.indicators import compute_wilder_atr_series
@@ -60,6 +62,25 @@ class BacktestEngine:
             settings.strategy_cfg.exit_models, self.fee_model
         )
 
+    def _default_backtest_symbols(self, wide_data_available: bool) -> List[str]:
+        non_broad = [
+            u for u in self.settings.watchlist_cfg.universe if u.sector != "Broad_ETF"
+        ]
+        if wide_data_available:
+            return [u.symbol for u in non_broad]
+        # Quota-safe cross-sector Core 12 when running on Futu/Yahoo without Alpaca keys
+        ordered = sorted(non_broad, key=lambda u: u.etf_core_score, reverse=True)
+        picked: List[str] = []
+        sec_counts: Dict[str, int] = {}
+        for u in ordered:
+            if sec_counts.get(u.sector, 0) >= 2:
+                continue
+            picked.append(u.symbol)
+            sec_counts[u.sector] = sec_counts.get(u.sector, 0) + 1
+            if len(picked) >= 12:
+                break
+        return picked
+
     def run(
         self,
         tier_key: Optional[str] = None,
@@ -67,56 +88,122 @@ class BacktestEngine:
         days: int = 30,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
+        pit_filter: Optional[PointInTimeUniverseFilter] = None,
     ) -> BacktestResult:
         resolved_tier_key = tier_key or self.settings.active_tier_key
         tier = self.settings.tiers_cfg.get_active(resolved_tier_key)
         initial_eq = tier.reference_equity_usd
         cash = initial_eq
 
-        # If explicit date window provided, compute required lookback days automatically
-        start_d = datetime.fromisoformat(start_date).date() if start_date else None
-        end_d = datetime.fromisoformat(end_date).date() if end_date else None
+        # Compute full multi-year lookback window (no 58-day ceiling!)
+        now_utc = datetime.now(timezone.utc)
+        start_d = datetime.fromisoformat(start_date[:10]).date() if start_date else None
+        end_d = datetime.fromisoformat(end_date[:10]).date() if end_date else None
         fetch_days = days
         if start_d is not None:
-            today_d = datetime.utcnow().date()
-            fetch_days = max(days, min(58, (today_d - start_d).days + 8))
+            fetch_days = max(days, (now_utc.date() - start_d).days + 10)
+
+        has_batch_api = hasattr(self.data, "get_bars_batch") and bool(
+            getattr(self.data, "has_credentials", lambda: False)()
+        )
+        bar_cache_obj = getattr(self.data, "bar_cache", None)
+        wide_cached = (
+            bar_cache_obj is not None and bar_cache_obj.stats().get("distinct_symbols", 0) >= 25
+        )
 
         universe_map = {u.symbol: u for u in self.settings.watchlist_cfg.universe}
-        target_symbols = symbols or [
-            u.symbol for u in self.settings.watchlist_cfg.universe if u.sector != "Broad_ETF"
-        ][:8]
+        target_symbols = symbols or self._default_backtest_symbols(
+            wide_data_available=(has_batch_api or wide_cached)
+        )
 
-        # Load 15m & daily series
-        qqq_15m = self.data.get_bars("QQQ", timeframe="15m", days=fetch_days)
-        qqq_1d = self.data.get_bars("QQQ", timeframe="1d", days=max(60, fetch_days + 30))
-        spy_1d = self.data.get_bars("SPY", timeframe="1d", days=max(60, fetch_days + 30))
-
+        # Load 15m & daily series (batch mode via Alpaca/BarCache or single-symbol fallback)
         symbol_bars: Dict[str, List[Bar]] = {}
         symbol_daily: Dict[str, List[Bar]] = {}
         symbol_atrs: Dict[str, List[float]] = {}
         missing_symbols: List[str] = []
-        for sym in target_symbols:
-            b15 = self.data.get_bars(sym, timeframe="15m", days=fetch_days)
-            b1d = self.data.get_bars(sym, timeframe="1d", days=max(60, fetch_days + 30))
-            if len(b15) >= 30:
-                symbol_bars[sym] = b15
-                symbol_daily[sym] = b1d
-                symbol_atrs[sym] = compute_wilder_atr_series(
-                    b15, self.settings.strategy_cfg.entry.atr_period
-                )
-            else:
-                missing_symbols.append(sym)
+
+        if hasattr(self.data, "get_bars_batch") and (has_batch_api or wide_cached):
+            end_dt = (
+                datetime(end_d.year, end_d.month, end_d.day, 23, 59, 59, tzinfo=timezone.utc)
+                if end_d
+                else now_utc
+            )
+            start_15m_dt = (
+                datetime(start_d.year, start_d.month, start_d.day, 0, 0, 0, tzinfo=timezone.utc)
+                - timedelta(days=12)
+                if start_d
+                else None
+            )
+            start_1d_dt = (
+                (start_15m_dt - timedelta(days=45))
+                if start_15m_dt is not None
+                else None
+            )
+            all_syms = list(dict.fromkeys(["QQQ", "SPY", *target_symbols]))
+            batch_15m = self.data.get_bars_batch(  # type: ignore[attr-defined]
+                [s for s in all_syms if s != "SPY"],
+                timeframe="15m",
+                days=fetch_days,
+                start_dt=start_15m_dt,
+                end_dt=end_dt,
+            )
+            batch_1d = self.data.get_bars_batch(  # type: ignore[attr-defined]
+                all_syms,
+                timeframe="1d",
+                days=max(60, fetch_days + 35),
+                start_dt=start_1d_dt,
+                end_dt=end_dt,
+            )
+            qqq_15m = batch_15m.get("QQQ", [])
+            qqq_1d = batch_1d.get("QQQ", [])
+            spy_1d = batch_1d.get("SPY", [])
+            for sym in target_symbols:
+                b15 = batch_15m.get(sym, [])
+                b1d = batch_1d.get(sym, [])
+                if len(b15) >= 30:
+                    symbol_bars[sym] = b15
+                    symbol_daily[sym] = b1d
+                    symbol_atrs[sym] = compute_wilder_atr_series(
+                        b15, self.settings.strategy_cfg.entry.atr_period
+                    )
+                else:
+                    missing_symbols.append(sym)
+        else:
+            qqq_15m = self.data.get_bars("QQQ", timeframe="15m", days=fetch_days)
+            qqq_1d = self.data.get_bars("QQQ", timeframe="1d", days=max(60, fetch_days + 30))
+            spy_1d = self.data.get_bars("SPY", timeframe="1d", days=max(60, fetch_days + 30))
+            for sym in target_symbols:
+                b15 = self.data.get_bars(sym, timeframe="15m", days=fetch_days)
+                b1d = self.data.get_bars(sym, timeframe="1d", days=max(60, fetch_days + 30))
+                if len(b15) >= 30:
+                    symbol_bars[sym] = b15
+                    symbol_daily[sym] = b1d
+                    symbol_atrs[sym] = compute_wilder_atr_series(
+                        b15, self.settings.strategy_cfg.entry.atr_period
+                    )
+                else:
+                    missing_symbols.append(sym)
 
         fb = getattr(self.data, "fallback", self.data)
-        used_synth = bool(getattr(fb, "used_synthetic", False))
-        used_yahoo = bool(getattr(fb, "used_yahoo_fallback", False))
-        is_futu_live = bool(getattr(self.data, "is_connected", lambda: False)())
+        sub_fb = getattr(fb, "fallback", fb)
+        used_alpaca = bool(getattr(self.data, "used_alpaca", False))
+        used_synth = bool(getattr(sub_fb, "used_synthetic", False))
+        used_yahoo = bool(getattr(sub_fb, "used_yahoo_fallback", False))
+        is_futu_live = bool(getattr(fb, "is_connected", lambda: False)())
         data_source = (
             "SYNTHETIC_FAKE"
             if used_synth
-            else ("FUTU_REALTIME" if is_futu_live else ("YAHOO_FALLBACK" if used_yahoo else "MISSING_DATA"))
+            else (
+                "ALPACA_MARKET_DATA"
+                if used_alpaca
+                else (
+                    "LOCAL_BAR_CACHE"
+                    if wide_cached and qqq_15m
+                    else ("FUTU_REALTIME" if is_futu_live else ("YAHOO_FALLBACK" if used_yahoo else "MISSING_DATA"))
+                )
+            )
         )
-        warnings_list: List[str] = list(getattr(fb, "fallback_warnings", []))[-5:]
+        warnings_list: List[str] = list(getattr(sub_fb, "fallback_warnings", []))[-5:]
         if missing_symbols:
             warnings_list.append(
                 f"Skipped symbols with insufficient real market bars: {', '.join(missing_symbols)}"
@@ -145,10 +232,16 @@ class BacktestEngine:
                 data_warnings=warnings_list or ["No real market data available — connect FutuOpenD / 富途牛牛."],
             )
 
-        # Index bars by timestamp for chronological simulation
+        # Index bars by timestamp + pre-index daily dates for O(log N) multi-year simulation
         bar_lookup: Dict[str, Dict[Any, tuple[int, Bar]]] = {}
         for sym, blist in symbol_bars.items():
             bar_lookup[sym] = {b.timestamp: (i, b) for i, b in enumerate(blist)}
+
+        qqq_1d_dates = [d.timestamp.date() for d in qqq_1d]
+        spy_1d_dates = [d.timestamp.date() for d in spy_1d]
+        sym_1d_dates: Dict[str, List[Any]] = {
+            sym: [d.timestamp.date() for d in dlist] for sym, dlist in symbol_daily.items()
+        }
 
         positions: Dict[str, OpenPosition] = {}
         last_exit_time: Dict[str, datetime] = {}
@@ -173,13 +266,13 @@ class BacktestEngine:
                 continue
             eval_timestamps.append(ts)
 
-            # Slice daily bars strictly up to current date (point-in-time, no look-ahead)
-            q_d_slice = [d for d in qqq_1d if d.timestamp.date() <= ts.date()]
-            s_d_slice = [d for d in spy_1d if d.timestamp.date() <= ts.date()]
-            if not q_d_slice:
-                q_d_slice = qqq_1d[:20]
-            if not s_d_slice:
-                s_d_slice = spy_1d[:20]
+            # Slice daily bars strictly BEFORE current date (`bisect_left` -> d.date < cur_d)
+            # Eliminates any look-ahead leak of today's 16:00 ET daily close during intraday bars!
+            cur_d = ts.date()
+            q_cut = bisect_left(qqq_1d_dates, cur_d)
+            s_cut = bisect_left(spy_1d_dates, cur_d)
+            q_d_slice = qqq_1d[max(0, q_cut - 35) : q_cut]
+            s_d_slice = spy_1d[max(0, s_cut - 35) : s_cut]
 
             # Compute dynamic point-in-time 10-day realized QQQ volatility (replaces hardcoded 17.5)
             vix_est = 18.0
@@ -309,15 +402,38 @@ class BacktestEngine:
                 else self.settings.strategy_cfg.regime.yellow_position_scale
             )
 
-            # Rank candidate symbols by point-in-time 20-day Relative Strength (mirrors live Watchlist Scorer)
+            # Rank candidate symbols by strictly point-in-time 20-day RS (current 15m close vs prior completed daily bar)
             def _rs_20d(sym_key: str) -> float:
-                d_hist = [d for d in symbol_daily.get(sym_key, []) if d.timestamp.date() <= ts.date()]
-                if len(d_hist) < 2:
+                d_full = symbol_daily.get(sym_key)
+                if not d_full:
                     return 0.0
-                lb = min(20, len(d_hist) - 1)
-                return (d_hist[-1].close - d_hist[-1 - lb].close) / max(0.01, d_hist[-1 - lb].close)
+                idx_end = bisect_left(sym_1d_dates[sym_key], cur_d)
+                if idx_end < 1:
+                    return 0.0
+                pair_now = bar_lookup.get(sym_key, {}).get(ts)
+                c_now = pair_now[1].close if pair_now is not None else d_full[idx_end - 1].close
+                lb = min(20, idx_end)
+                c_prev = max(0.01, d_full[idx_end - lb].close)
+                return (c_now - c_prev) / c_prev
 
-            ranked_symbols = sorted(target_symbols, key=_rs_20d, reverse=True)
+            eligible_pool = [
+                s
+                for s in target_symbols
+                if pit_filter is None or pit_filter.is_member_on(s, cur_d)
+            ]
+            sorted_by_rs = sorted(eligible_pool, key=_rs_20d, reverse=True)
+            top_n_cap = self.settings.watchlist_cfg.scoring_thresholds.top_n_active
+            sec_cap = self.settings.watchlist_cfg.scoring_thresholds.max_per_sector_in_top_n
+            ranked_symbols: List[str] = []
+            sec_rank_counts: Dict[str, int] = {}
+            for s in sorted_by_rs:
+                sec_name = universe_map[s].sector if s in universe_map else "Technology"
+                if sec_rank_counts.get(sec_name, 0) >= sec_cap:
+                    continue
+                ranked_symbols.append(s)
+                sec_rank_counts[sec_name] = sec_rank_counts.get(sec_name, 0) + 1
+                if len(ranked_symbols) >= max(top_n_cap, 12):
+                    break
 
             for sym in ranked_symbols:
                 if sym in positions or sym not in bar_lookup:
@@ -331,7 +447,8 @@ class BacktestEngine:
                 if s_idx < warmup:
                     continue
 
-                sym_d_slice = [d for d in symbol_daily.get(sym, []) if d.timestamp.date() <= ts.date()]
+                d_end = bisect_left(sym_1d_dates.get(sym, []), cur_d)
+                sym_d_slice = symbol_daily.get(sym, [])[max(0, d_end - 35) : d_end]
                 sec_meta = universe_map.get(sym)
                 sector = sec_meta.sector if sec_meta else "Technology"
                 sig = self.signal_engine.evaluate_15m(
@@ -342,6 +459,7 @@ class BacktestEngine:
                     watchlist_score=78.0,
                     stock_daily_bars=sym_d_slice,
                     qqq_daily_bars=q_d_slice,
+                    qqq_curr_price=q_bar.close,
                 )
                 if sig is None:
                     continue

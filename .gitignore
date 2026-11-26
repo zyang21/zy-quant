@@ -6,6 +6,7 @@ __pycache__/
 data/*.db
 data/*.db-shm
 data/*.db-wal
+data/.manual_start
 data/cache/
 logs/
 .env

@@ -6,20 +6,33 @@
     <string>com.zyquant.daemon</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/caffeinate</string>
-        <string>-dimsu</string>
-        <string>/bin/sh</string>
+        <string>/bin/bash</string>
         <string>-c</string>
-        <string>exec "$HOME/Dev/zy-quant/.venv/bin/zy-quant" dashboard</string>
+        <string>exec /bin/bash "$HOME/Dev/zy-quant/deploy/run_daemon.sh"</string>
     </array>
     <key>WorkingDirectory</key>
     <string>/tmp</string>
     <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>ThrottleInterval</key>
-    <integer>5</integer>
+    <false/>
+    <!--
+      Mon-Fri pre-market auto-start check (UTC+8 local time):
+      - 21:20 covers US Daylight Saving Time (09:20 EDT)
+      - 22:20 covers US Standard Time (09:20 EST)
+      run_daemon.sh validates get_us_market_session() to handle DST and skip NYSE holidays.
+    -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>21</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>1</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+    </array>
     <key>StandardOutPath</key>
     <string>/tmp/zy-quant-daemon.out.log</string>
     <key>StandardErrorPath</key>

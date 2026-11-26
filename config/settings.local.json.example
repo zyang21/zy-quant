@@ -3,5 +3,9 @@
     "trd_env": "SIMULATE",
     "api_token": "",
     "trade_pwd_md5": ""
+  },
+  "alpaca": {
+    "api_key": "",
+    "secret_key": ""
   }
 }

@@ -77,3 +77,26 @@ Non-secret runtime settings live in tracked `config/settings.json`. Credentials 
 # Launch 3-Page Web Trading Terminal + Docked Log Console (http://127.0.0.1:8088)
 .venv/bin/zy-quant dashboard
 ```
+
+## macOS Background Service & Power Management (`deploy/`)
+
+`deploy/com.zyquant.daemon.plist` and `deploy/run_daemon.sh` run the Web Terminal + trading scheduler in the background via `launchd` without keeping the Mac awake 24/7 during off-hours:
+
+- **Active Session Sleep Protection:** Uses `caffeinate -is` while running so system/network stay awake while allowing the display to sleep normally.
+- **Pre-Market Auto-Start Safety Net (`StartCalendarInterval`):** Armed for Monday–Friday `21:20` & `22:20` (`UTC+8`, covering both EDT & EST `09:20 ET`). `deploy/run_daemon.sh` checks `get_us_market_session()` so US market holidays and weekend wake coalescing are automatically skipped.
+
+```bash
+# Start full background service immediately (works anytime, including off-hours)
+./deploy/start.sh
+
+# Start with closed-lid (clamshell) mode enabled (sets pmset disablesleep=1)
+./deploy/start.sh --clamshell
+
+# Stop zy-quant & caffeinate cleanly, restore macOS sleep (disablesleep=0),
+# while keeping the launchd pre-market StartCalendarInterval armed
+./deploy/stop.sh
+
+# Optional: wake Mac hardware from deep sleep on AC power 1m before pre-market check
+sudo pmset repeat wakeorpoweron MTWRF 21:19:00   # Summer (EDT)
+sudo pmset repeat wakeorpoweron MTWRF 22:19:00   # Winter (EST)
+```

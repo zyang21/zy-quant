@@ -34,6 +34,14 @@ class FutuConnectionConfig(BaseModel):
     trade_pwd_md5: str = ""
 
 
+class AlpacaDataConfig(BaseModel):
+    enabled: bool = True
+    api_key: str = ""
+    secret_key: str = ""
+    feed: str = "iex"
+    base_url: str = "https://data.alpaca.markets"
+
+
 class WebServerConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 8088
@@ -44,6 +52,7 @@ class RuntimeSettingsConfig(BaseModel):
     account_tier: Optional[str] = None
     allow_synthetic_fallback: bool = False
     futu: FutuConnectionConfig = Field(default_factory=FutuConnectionConfig)
+    alpaca: AlpacaDataConfig = Field(default_factory=AlpacaDataConfig)
     web: WebServerConfig = Field(default_factory=WebServerConfig)
 
 
@@ -103,13 +112,14 @@ class ScoringWeightsConfig(BaseModel):
 class ScoringThresholdsConfig(BaseModel):
     min_watch_score: float = 62.0
     top_n_active: int = 8
+    max_per_sector_in_top_n: int = 3
     red_day_rs_bonus_cap: float = 15.0
 
 
 class UniverseSecurity(BaseModel):
     symbol: str
     sector: str
-    cik: str
+    cik: str = "0000000000"
     etf_core_score: float = Field(ge=0.0, le=1.0)
     baseline_inst_pct: float = Field(ge=0.0, le=1.0)
 
@@ -118,7 +128,8 @@ class WatchlistScoringConfig(BaseModel):
     hard_filters: HardFiltersConfig
     weights: ScoringWeightsConfig
     scoring_thresholds: ScoringThresholdsConfig
-    universe: List[UniverseSecurity]
+    universe_file: Optional[str] = None
+    universe: List[UniverseSecurity] = Field(default_factory=list)
 
 
 class RegimeConfig(BaseModel):
@@ -215,6 +226,9 @@ class AppSettings(BaseModel):
         filename = "zy_quant_real.db" if env == "REAL" else "zy_quant_sim.db"
         return self.root_dir / "data" / filename
 
+    def resolve_bar_cache_path(self) -> Path:
+        return self.root_dir / "data" / "cache" / "market_bars.db"
+
     @classmethod
     def load(cls, root_dir: Optional[Path] = None) -> "AppSettings":
         root = root_dir or default_project_root()
@@ -226,10 +240,17 @@ class AppSettings(BaseModel):
         if settings_json.exists():
             runtime_raw = json.loads(settings_json.read_text(encoding="utf-8"))
             futu_tracked = runtime_raw.get("futu", {})
-            if futu_tracked.get("api_token") or futu_tracked.get("trade_pwd_md5"):
+            alpaca_tracked = runtime_raw.get("alpaca", {})
+            if (
+                futu_tracked.get("api_token")
+                or futu_tracked.get("trade_pwd_md5")
+                or alpaca_tracked.get("api_key")
+                or alpaca_tracked.get("secret_key")
+            ):
                 raise ValueError(
-                    "SECURITY BLOCK: Never store `api_token` or `trade_pwd_md5` in tracked "
-                    "`config/settings.json`! Place secrets in gitignored `config/settings.local.json`."
+                    "SECURITY BLOCK: Never store API credentials (`api_token`, `trade_pwd_md5`, "
+                    "`alpaca.api_key`, `alpaca.secret_key`) in tracked `config/settings.json`! "
+                    "Place secrets in gitignored `config/settings.local.json`."
                 )
         local_json = cfg_dir / "settings.local.json"
         if local_json.exists():
@@ -250,6 +271,17 @@ class AppSettings(BaseModel):
             futu_dict["trade_pwd_md5"] = os.environ["ZY_FUTU_TRADE_PWD_MD5"]
         runtime_raw["futu"] = futu_dict
 
+        alpaca_dict = dict(runtime_raw.get("alpaca", {}))
+        env_apca_key = os.getenv("ZY_ALPACA_API_KEY") or os.getenv("APCA_API_KEY_ID")
+        env_apca_sec = os.getenv("ZY_ALPACA_SECRET_KEY") or os.getenv("APCA_API_SECRET_KEY")
+        if not alpaca_dict.get("api_key") and env_apca_key:
+            alpaca_dict["api_key"] = env_apca_key
+        if not alpaca_dict.get("secret_key") and env_apca_sec:
+            alpaca_dict["secret_key"] = env_apca_sec
+        if not alpaca_dict.get("feed") and os.getenv("ZY_ALPACA_FEED"):
+            alpaca_dict["feed"] = os.environ["ZY_ALPACA_FEED"]
+        runtime_raw["alpaca"] = alpaca_dict
+
         if not runtime_raw.get("account_tier") and os.getenv("ZY_ACCOUNT_TIER"):
             runtime_raw["account_tier"] = os.environ["ZY_ACCOUNT_TIER"]
 
@@ -261,6 +293,17 @@ class AppSettings(BaseModel):
             tiers_raw["active_tier"] = runtime_cfg.account_tier
         with open(cfg_dir / "watchlist_scoring.yaml", "r", encoding="utf-8") as f:
             watch_raw = yaml.safe_load(f)
+
+        # Optionally load external 100-stock sector-balanced universe YAML if configured
+        uni_file = watch_raw.get("universe_file")
+        if uni_file:
+            uni_path = cfg_dir / str(uni_file)
+            if uni_path.exists():
+                with open(uni_path, "r", encoding="utf-8") as uf:
+                    uni_doc = yaml.safe_load(uf) or {}
+                if isinstance(uni_doc, dict) and uni_doc.get("universe"):
+                    watch_raw["universe"] = uni_doc["universe"]
+
         with open(cfg_dir / "strategy.yaml", "r", encoding="utf-8") as f:
             strat_raw = yaml.safe_load(f)
 

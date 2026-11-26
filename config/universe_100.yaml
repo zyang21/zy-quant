@@ -1,0 +1,142 @@
+# 100-Stock Sector-Balanced Institutional Universe + 12 Core Benchmark/Sector ETFs
+# Maintained via quarterly objective rebalance (`zy-quant refresh-universe`):
+#   - Hard Liquidity Floor: ADV_60d >= $500M, Price >= $50, Institutional Ownership >= 55%
+#   - Sector Balance: All 11 GICS pillars represented so capital rotates smoothly into leading sectors
+#   - Hysteresis Buffer: Enter <= Rank 85, Exit > Rank 120 (prevents boundary churn)
+
+universe:
+  # --- Semiconductors & AI Hardware (12) ---
+  - { symbol: "NVDA", sector: "Semiconductors", cik: "0001045810", etf_core_score: 0.98, baseline_inst_pct: 0.67 }
+  - { symbol: "AVGO", sector: "Semiconductors", cik: "0001730168", etf_core_score: 0.92, baseline_inst_pct: 0.78 }
+  - { symbol: "AMD",  sector: "Semiconductors", cik: "0000002488", etf_core_score: 0.88, baseline_inst_pct: 0.71 }
+  - { symbol: "TXN",  sector: "Semiconductors", cik: "0000097476", etf_core_score: 0.85, baseline_inst_pct: 0.85 }
+  - { symbol: "QCOM", sector: "Semiconductors", cik: "0000804328", etf_core_score: 0.86, baseline_inst_pct: 0.74 }
+  - { symbol: "AMAT", sector: "Semiconductors", cik: "0000006951", etf_core_score: 0.84, baseline_inst_pct: 0.81 }
+  - { symbol: "LRCX", sector: "Semiconductors", cik: "0000707549", etf_core_score: 0.83, baseline_inst_pct: 0.84 }
+  - { symbol: "KLAC", sector: "Semiconductors", cik: "0000319201", etf_core_score: 0.82, baseline_inst_pct: 0.87 }
+  - { symbol: "ADI",  sector: "Semiconductors", cik: "0000006281", etf_core_score: 0.81, baseline_inst_pct: 0.86 }
+  - { symbol: "MU",   sector: "Semiconductors", cik: "0000723125", etf_core_score: 0.82, baseline_inst_pct: 0.80 }
+  - { symbol: "MRVL", sector: "Semiconductors", cik: "0001058057", etf_core_score: 0.78, baseline_inst_pct: 0.83 }
+  - { symbol: "ASML", sector: "Semiconductors", cik: "0000937966", etf_core_score: 0.86, baseline_inst_pct: 0.58 }
+
+  # --- Enterprise Technology & Software (15) ---
+  - { symbol: "AAPL", sector: "Technology", cik: "0000320193", etf_core_score: 0.98, baseline_inst_pct: 0.62 }
+  - { symbol: "MSFT", sector: "Technology", cik: "0000789019", etf_core_score: 0.99, baseline_inst_pct: 0.73 }
+  - { symbol: "ORCL", sector: "Technology", cik: "0001341439", etf_core_score: 0.86, baseline_inst_pct: 0.56 }
+  - { symbol: "CRM",  sector: "Technology", cik: "0001108524", etf_core_score: 0.87, baseline_inst_pct: 0.81 }
+  - { symbol: "ADBE", sector: "Technology", cik: "0000796343", etf_core_score: 0.86, baseline_inst_pct: 0.82 }
+  - { symbol: "NOW",  sector: "Technology", cik: "0001373715", etf_core_score: 0.85, baseline_inst_pct: 0.87 }
+  - { symbol: "INTU", sector: "Technology", cik: "0000896878", etf_core_score: 0.84, baseline_inst_pct: 0.83 }
+  - { symbol: "IBM",  sector: "Technology", cik: "0000051143", etf_core_score: 0.82, baseline_inst_pct: 0.60 }
+  - { symbol: "PANW", sector: "Technology", cik: "0001327567", etf_core_score: 0.83, baseline_inst_pct: 0.80 }
+  - { symbol: "CRWD", sector: "Technology", cik: "0001535527", etf_core_score: 0.81, baseline_inst_pct: 0.72 }
+  - { symbol: "SNPS", sector: "Technology", cik: "0000883241", etf_core_score: 0.80, baseline_inst_pct: 0.86 }
+  - { symbol: "CDNS", sector: "Technology", cik: "0000813672", etf_core_score: 0.80, baseline_inst_pct: 0.85 }
+  - { symbol: "ACN",  sector: "Technology", cik: "0001467373", etf_core_score: 0.82, baseline_inst_pct: 0.75 }
+  - { symbol: "ANET", sector: "Technology", cik: "0001596532", etf_core_score: 0.81, baseline_inst_pct: 0.68 }
+  - { symbol: "ADP",  sector: "Technology", cik: "0000008670", etf_core_score: 0.80, baseline_inst_pct: 0.80 }
+
+  # --- Communication & Internet Platforms (6) ---
+  - { symbol: "META",  sector: "Communication", cik: "0001326801", etf_core_score: 0.93, baseline_inst_pct: 0.79 }
+  - { symbol: "GOOGL", sector: "Communication", cik: "0001652044", etf_core_score: 0.94, baseline_inst_pct: 0.81 }
+  - { symbol: "NFLX",  sector: "Communication", cik: "0001065280", etf_core_score: 0.88, baseline_inst_pct: 0.83 }
+  - { symbol: "TMUS",  sector: "Communication", cik: "0001283699", etf_core_score: 0.82, baseline_inst_pct: 0.56 }
+  - { symbol: "DIS",   sector: "Communication", cik: "0001744489", etf_core_score: 0.81, baseline_inst_pct: 0.67 }
+  - { symbol: "SPOT",  sector: "Communication", cik: "0001639920", etf_core_score: 0.77, baseline_inst_pct: 0.61 }
+
+  # --- Financials, Banks & Capital Markets (14) ---
+  - { symbol: "JPM",  sector: "Financials", cik: "0000019617", etf_core_score: 0.90, baseline_inst_pct: 0.72 }
+  - { symbol: "V",    sector: "Financials", cik: "0001403161", etf_core_score: 0.89, baseline_inst_pct: 0.79 }
+  - { symbol: "MA",   sector: "Financials", cik: "0001141391", etf_core_score: 0.88, baseline_inst_pct: 0.78 }
+  - { symbol: "GS",   sector: "Financials", cik: "0000886982", etf_core_score: 0.85, baseline_inst_pct: 0.74 }
+  - { symbol: "MS",   sector: "Financials", cik: "0000895421", etf_core_score: 0.84, baseline_inst_pct: 0.82 }
+  - { symbol: "BLK",  sector: "Financials", cik: "0001364742", etf_core_score: 0.85, baseline_inst_pct: 0.81 }
+  - { symbol: "SPGI", sector: "Financials", cik: "0000064040", etf_core_score: 0.84, baseline_inst_pct: 0.87 }
+  - { symbol: "AXP",  sector: "Financials", cik: "0000004962", etf_core_score: 0.83, baseline_inst_pct: 0.84 }
+  - { symbol: "PGR",  sector: "Financials", cik: "0000080661", etf_core_score: 0.82, baseline_inst_pct: 0.86 }
+  - { symbol: "CB",   sector: "Financials", cik: "0000896159", etf_core_score: 0.80, baseline_inst_pct: 0.88 }
+  - { symbol: "CME",  sector: "Financials", cik: "0001156375", etf_core_score: 0.79, baseline_inst_pct: 0.88 }
+  - { symbol: "ICE",  sector: "Financials", cik: "0001571949", etf_core_score: 0.79, baseline_inst_pct: 0.89 }
+  - { symbol: "MCO",  sector: "Financials", cik: "0001059556", etf_core_score: 0.78, baseline_inst_pct: 0.90 }
+  - { symbol: "KKR",  sector: "Financials", cik: "0001404912", etf_core_score: 0.78, baseline_inst_pct: 0.76 }
+
+  # --- Healthcare, Pharma & MedTech (13) ---
+  - { symbol: "LLY",  sector: "Healthcare", cik: "0000059478", etf_core_score: 0.91, baseline_inst_pct: 0.82 }
+  - { symbol: "UNH",  sector: "Healthcare", cik: "0000731766", etf_core_score: 0.89, baseline_inst_pct: 0.88 }
+  - { symbol: "ABBV", sector: "Healthcare", cik: "0001551152", etf_core_score: 0.86, baseline_inst_pct: 0.71 }
+  - { symbol: "JNJ",  sector: "Healthcare", cik: "0000200406", etf_core_score: 0.86, baseline_inst_pct: 0.70 }
+  - { symbol: "MRK",  sector: "Healthcare", cik: "0000310158", etf_core_score: 0.85, baseline_inst_pct: 0.77 }
+  - { symbol: "TMO",  sector: "Healthcare", cik: "0000097745", etf_core_score: 0.85, baseline_inst_pct: 0.89 }
+  - { symbol: "ABT",  sector: "Healthcare", cik: "0000001800", etf_core_score: 0.83, baseline_inst_pct: 0.76 }
+  - { symbol: "ISRG", sector: "Healthcare", cik: "0001035267", etf_core_score: 0.84, baseline_inst_pct: 0.85 }
+  - { symbol: "SYK",  sector: "Healthcare", cik: "0000310764", etf_core_score: 0.82, baseline_inst_pct: 0.78 }
+  - { symbol: "AMGN", sector: "Healthcare", cik: "0000318154", etf_core_score: 0.83, baseline_inst_pct: 0.77 }
+  - { symbol: "VRTX", sector: "Healthcare", cik: "0000875320", etf_core_score: 0.82, baseline_inst_pct: 0.91 }
+  - { symbol: "REGN", sector: "Healthcare", cik: "0000872589", etf_core_score: 0.81, baseline_inst_pct: 0.84 }
+  - { symbol: "BSX",  sector: "Healthcare", cik: "0000885725", etf_core_score: 0.80, baseline_inst_pct: 0.89 }
+
+  # --- Industrials, Aerospace & Defense (12) ---
+  - { symbol: "CAT",  sector: "Industrials", cik: "0000018230", etf_core_score: 0.86, baseline_inst_pct: 0.71 }
+  - { symbol: "GE",   sector: "Industrials", cik: "0000040545", etf_core_score: 0.86, baseline_inst_pct: 0.76 }
+  - { symbol: "RTX",  sector: "Industrials", cik: "0000101829", etf_core_score: 0.84, baseline_inst_pct: 0.80 }
+  - { symbol: "HON",  sector: "Industrials", cik: "0000773840", etf_core_score: 0.83, baseline_inst_pct: 0.76 }
+  - { symbol: "UNP",  sector: "Industrials", cik: "0000100885", etf_core_score: 0.83, baseline_inst_pct: 0.80 }
+  - { symbol: "ETN",  sector: "Industrials", cik: "0001551182", etf_core_score: 0.83, baseline_inst_pct: 0.82 }
+  - { symbol: "LMT",  sector: "Industrials", cik: "0000936468", etf_core_score: 0.83, baseline_inst_pct: 0.75 }
+  - { symbol: "DE",   sector: "Industrials", cik: "0000315189", etf_core_score: 0.81, baseline_inst_pct: 0.69 }
+  - { symbol: "GD",   sector: "Industrials", cik: "0000040533", etf_core_score: 0.81, baseline_inst_pct: 0.85 }
+  - { symbol: "PH",   sector: "Industrials", cik: "0000076334", etf_core_score: 0.80, baseline_inst_pct: 0.83 }
+  - { symbol: "TT",   sector: "Industrials", cik: "0001466258", etf_core_score: 0.79, baseline_inst_pct: 0.83 }
+  - { symbol: "WM",   sector: "Industrials", cik: "0000823768", etf_core_score: 0.79, baseline_inst_pct: 0.81 }
+
+  # --- Consumer Discretionary & Retail Leaders (10) ---
+  - { symbol: "AMZN", sector: "Consumer", cik: "0001018724", etf_core_score: 0.95, baseline_inst_pct: 0.64 }
+  - { symbol: "TSLA", sector: "Consumer", cik: "0001318605", etf_core_score: 0.88, baseline_inst_pct: 0.56 }
+  - { symbol: "HD",   sector: "Consumer", cik: "0000354950", etf_core_score: 0.88, baseline_inst_pct: 0.71 }
+  - { symbol: "MCD",  sector: "Consumer", cik: "0000063908", etf_core_score: 0.84, baseline_inst_pct: 0.70 }
+  - { symbol: "LOW",  sector: "Consumer", cik: "0000060667", etf_core_score: 0.83, baseline_inst_pct: 0.75 }
+  - { symbol: "TJX",  sector: "Consumer", cik: "0000109198", etf_core_score: 0.82, baseline_inst_pct: 0.90 }
+  - { symbol: "BKNG", sector: "Consumer", cik: "0001075531", etf_core_score: 0.83, baseline_inst_pct: 0.92 }
+  - { symbol: "CMG",  sector: "Consumer", cik: "0001058090", etf_core_score: 0.79, baseline_inst_pct: 0.91 }
+  - { symbol: "ORLY", sector: "Consumer", cik: "0000898173", etf_core_score: 0.79, baseline_inst_pct: 0.85 }
+  - { symbol: "MAR",  sector: "Consumer", cik: "0001048286", etf_core_score: 0.78, baseline_inst_pct: 0.65 }
+
+  # --- Consumer Staples (6) ---
+  - { symbol: "COST", sector: "Staples", cik: "0000909832", etf_core_score: 0.89, baseline_inst_pct: 0.69 }
+  - { symbol: "WMT",  sector: "Staples", cik: "0000104169", etf_core_score: 0.88, baseline_inst_pct: 0.56 }
+  - { symbol: "PG",   sector: "Staples", cik: "0000080424", etf_core_score: 0.87, baseline_inst_pct: 0.66 }
+  - { symbol: "PEP",  sector: "Staples", cik: "0000077476", etf_core_score: 0.84, baseline_inst_pct: 0.73 }
+  - { symbol: "PM",   sector: "Staples", cik: "0001413329", etf_core_score: 0.82, baseline_inst_pct: 0.78 }
+  - { symbol: "CL",   sector: "Staples", cik: "0000021665", etf_core_score: 0.79, baseline_inst_pct: 0.80 }
+
+  # --- Energy (6) ---
+  - { symbol: "XOM",  sector: "Energy", cik: "0000034088", etf_core_score: 0.89, baseline_inst_pct: 0.62 }
+  - { symbol: "CVX",  sector: "Energy", cik: "0000093410", etf_core_score: 0.87, baseline_inst_pct: 0.68 }
+  - { symbol: "COP",  sector: "Energy", cik: "0001163165", etf_core_score: 0.84, baseline_inst_pct: 0.82 }
+  - { symbol: "EOG",  sector: "Energy", cik: "0000821189", etf_core_score: 0.82, baseline_inst_pct: 0.90 }
+  - { symbol: "MPC",  sector: "Energy", cik: "0001510295", etf_core_score: 0.80, baseline_inst_pct: 0.77 }
+  - { symbol: "VLO",  sector: "Energy", cik: "0001035002", etf_core_score: 0.79, baseline_inst_pct: 0.79 }
+
+  # --- Materials, Utilities & Infrastructure (6) ---
+  - { symbol: "LIN",  sector: "Materials", cik: "0001707925", etf_core_score: 0.86, baseline_inst_pct: 0.83 }
+  - { symbol: "SHW",  sector: "Materials", cik: "0000089800", etf_core_score: 0.81, baseline_inst_pct: 0.78 }
+  - { symbol: "APD",  sector: "Materials", cik: "0000002969", etf_core_score: 0.79, baseline_inst_pct: 0.84 }
+  - { symbol: "NEE",  sector: "Utilities", cik: "0000753308", etf_core_score: 0.83, baseline_inst_pct: 0.79 }
+  - { symbol: "CEG",  sector: "Utilities", cik: "0001868275", etf_core_score: 0.82, baseline_inst_pct: 0.84 }
+  - { symbol: "PLD",  sector: "RealEstate", cik: "0001045609", etf_core_score: 0.81, baseline_inst_pct: 0.93 }
+
+  # --- Sector Flagship ETFs (Tradeable Rotation Leaders, 10) ---
+  - { symbol: "XLK",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.95, baseline_inst_pct: 0.82 }
+  - { symbol: "SMH",  sector: "Sector_ETF", cik: "0001137360", etf_core_score: 0.94, baseline_inst_pct: 0.76 }
+  - { symbol: "XLF",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.92, baseline_inst_pct: 0.84 }
+  - { symbol: "XLV",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.92, baseline_inst_pct: 0.86 }
+  - { symbol: "XLE",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.91, baseline_inst_pct: 0.80 }
+  - { symbol: "XLI",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.91, baseline_inst_pct: 0.83 }
+  - { symbol: "XLY",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.90, baseline_inst_pct: 0.82 }
+  - { symbol: "XLP",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.89, baseline_inst_pct: 0.81 }
+  - { symbol: "XLU",  sector: "Sector_ETF", cik: "0001064641", etf_core_score: 0.88, baseline_inst_pct: 0.84 }
+  - { symbol: "GLD",  sector: "Commodities_ETF", cik: "0001222333", etf_core_score: 0.90, baseline_inst_pct: 0.68 }
+
+  # --- Primary Market Regime Benchmarks (2) ---
+  - { symbol: "QQQ",  sector: "Broad_ETF", cik: "0001067839", etf_core_score: 1.00, baseline_inst_pct: 0.75 }
+  - { symbol: "SPY",  sector: "Broad_ETF", cik: "0000884394", etf_core_score: 1.00, baseline_inst_pct: 0.78 }
