@@ -120,7 +120,15 @@ class ControlCenterApplication:
         new_futu = fresh.runtime_cfg.futu
         self.settings = fresh
         self.daemon.settings = fresh
+        self.daemon.watchlist_scorer.cfg = fresh.watchlist_cfg
         self.portfolio_svc.settings = fresh
+
+        if hasattr(self.daemon.market_data, "api_key"):
+            apca = fresh.runtime_cfg.alpaca
+            self.daemon.market_data.enabled = apca.enabled  # type: ignore[attr-defined]
+            self.daemon.market_data.api_key = (apca.api_key or "").strip()  # type: ignore[attr-defined]
+            self.daemon.market_data.secret_key = (apca.secret_key or "").strip()  # type: ignore[attr-defined]
+            self.daemon.market_data.feed = (apca.feed or "iex").strip().lower()  # type: ignore[attr-defined]
 
         new_db_path = fresh.resolve_db_path()
         if new_db_path != self.store.db_path:
@@ -169,13 +177,28 @@ class ControlCenterApplication:
                 fallback_alert = "LOCAL FALLBACK ACTIVE — Futu OpenAPI is disconnected; reading delayed Yahoo Finance data."
             else:
                 fallback_alert = "Futu OpenAPI is disconnected — real-time market data unavailable."
+        alpaca_ready = hasattr(self.daemon.market_data, "has_credentials") and bool(
+            getattr(self.daemon.market_data, "has_credentials")()
+        )
+        if alpaca_ready and connected:
+            feed_label = "Alpaca 100-Stock Scan + Futu Live Execution"
+        elif alpaca_ready:
+            feed_label = "Alpaca Market Data v2 (Futu Execution Offline)"
+        elif connected:
+            feed_label = "Futu Real-Time Feed"
+        elif fb.used_synthetic:
+            feed_label = "Synthetic Fake Data"
+        else:
+            feed_label = "Fallback / Offline"
+
         return {
             "connected": connected,
+            "alpaca_configured": alpaca_ready,
             "is_simulated": is_simulated,
             "execution_mode": "Paper Simulation" if is_simulated else "Live Execution",
-            "data_feed": "Futu Real-Time Feed" if connected else ("Synthetic Fake Data" if fb.used_synthetic else "Fallback / Offline"),
-            "is_fallback_or_fake": not connected or fb.used_synthetic,
-            "fallback_alert": fallback_alert,
+            "data_feed": feed_label,
+            "is_fallback_or_fake": (not connected and not alpaca_ready) or fb.used_synthetic,
+            "fallback_alert": fallback_alert if not alpaca_ready else ("" if connected else "Futu OpenAPI disconnected — market scan active via Alpaca, live order execution paused."),
             "linked_broker_equity_usd": 0.0 if is_simulated else round(float(acct.get("equity_usd", 0.0)), 2),
         }
 
@@ -324,11 +347,15 @@ def get_trade_history(
 @app.post("/api/backtest")
 def run_strategy_backtest(req: BacktestRequest) -> Dict[str, Any]:
     ctx.refresh_config_if_needed()
-    engine = BacktestEngine(ctx.settings, ctx.daemon.gateway)
+    alpaca_ready = hasattr(ctx.daemon.market_data, "has_credentials") and bool(
+        getattr(ctx.daemon.market_data, "has_credentials")()
+    )
+    max_days = 2500 if alpaca_ready else 58
+    engine = BacktestEngine(ctx.settings, ctx.daemon.market_data)
     result = engine.run(
         tier_key=ctx.settings.active_tier_key,
         symbols=req.symbols,
-        days=max(7, min(58, req.days)),
+        days=max(7, min(max_days, req.days)),
         start_date=req.start_date,
         end_date=req.end_date,
     )

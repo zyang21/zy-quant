@@ -6,6 +6,11 @@
     "port": 11111,
     "trd_env": "SIMULATE"
   },
+  "alpaca": {
+    "enabled": true,
+    "feed": "iex",
+    "base_url": "https://data.alpaca.markets"
+  },
   "web": {
     "host": "127.0.0.1",
     "port": 8088,

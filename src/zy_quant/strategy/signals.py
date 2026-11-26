@@ -35,27 +35,41 @@ class IntradaySignalEngine:
     def _passes_daily_trend_and_regime(
         self,
         curr_price: float,
+        session_day: object,
         regime_light: RegimeLight,
         stock_daily_bars: Optional[Sequence[Bar]],
         qqq_daily_bars: Optional[Sequence[Bar]],
+        qqq_curr_price: Optional[float] = None,
     ) -> bool:
         if regime_light == RegimeLight.RED:
             return False
 
-        if stock_daily_bars and len(stock_daily_bars) >= 15:
-            d_closes = [b.close for b in stock_daily_bars]
+        prior_stock_d = (
+            [b for b in stock_daily_bars if b.timestamp.date() < session_day]  # type: ignore[operator]
+            if stock_daily_bars
+            else []
+        )
+        prior_qqq_d = (
+            [b for b in qqq_daily_bars if b.timestamp.date() < session_day]  # type: ignore[operator]
+            if qqq_daily_bars
+            else []
+        )
+
+        if len(prior_stock_d) >= 15:
+            d_closes = [b.close for b in prior_stock_d]
             sma20 = compute_sma(d_closes, 20)
             if self.cfg.require_stock_above_sma20 and curr_price < sma20:
                 return False
 
             if regime_light == RegimeLight.YELLOW:
-                # Require independent Relative Strength vs QQQ over ~20 trading days
-                if not qqq_daily_bars or len(qqq_daily_bars) < 15 or len(stock_daily_bars) < 20:
+                # Require independent Relative Strength vs QQQ over ~20 completed trading days
+                if len(prior_qqq_d) < 15 or len(prior_stock_d) < 20:
                     return False
-                s_lb = min(20, len(stock_daily_bars) - 1)
-                q_lb = min(20, len(qqq_daily_bars) - 1)
-                s_ret = (curr_price - stock_daily_bars[-1 - s_lb].close) / max(0.01, stock_daily_bars[-1 - s_lb].close)
-                q_ret = (qqq_daily_bars[-1].close - qqq_daily_bars[-1 - q_lb].close) / max(0.01, qqq_daily_bars[-1 - q_lb].close)
+                s_lb = min(20, len(prior_stock_d))
+                q_lb = min(20, len(prior_qqq_d))
+                q_now = qqq_curr_price if (qqq_curr_price and qqq_curr_price > 0) else prior_qqq_d[-1].close
+                s_ret = (curr_price - prior_stock_d[-s_lb].close) / max(0.01, prior_stock_d[-s_lb].close)
+                q_ret = (q_now - prior_qqq_d[-q_lb].close) / max(0.01, prior_qqq_d[-q_lb].close)
                 if (s_ret - q_ret) < self.cfg.yellow_min_rs_outperformance:
                     return False
         elif regime_light == RegimeLight.YELLOW:
@@ -74,13 +88,19 @@ class IntradaySignalEngine:
         capital_flow: Optional[CapitalFlowSnapshot] = None,
         stock_daily_bars: Optional[Sequence[Bar]] = None,
         qqq_daily_bars: Optional[Sequence[Bar]] = None,
+        qqq_curr_price: Optional[float] = None,
     ) -> Optional[EntrySignal]:
         if len(bars_15m) < max(self.cfg.atr_period + 2, self.cfg.ema_trend_period):
             return None
 
         curr = bars_15m[-1]
         if not self._passes_daily_trend_and_regime(
-            curr.close, regime_light, stock_daily_bars, qqq_daily_bars
+            curr.close,
+            curr.timestamp.date(),
+            regime_light,
+            stock_daily_bars,
+            qqq_daily_bars,
+            qqq_curr_price=qqq_curr_price,
         ):
             return None
 

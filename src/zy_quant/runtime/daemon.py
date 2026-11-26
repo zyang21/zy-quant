@@ -10,8 +10,10 @@ from typing import Any, Dict, List, Optional
 
 from zy_quant.config import AppSettings
 from zy_quant.fees import FutuUSFeeModel
+from zy_quant.gateway.alpaca_adapter import AlpacaMarketDataAdapter
 from zy_quant.gateway.base import BrokerExecutionAdapter, MarketDataAdapter
 from zy_quant.gateway.futu_adapter import FutuGatewayAdapter
+from zy_quant.intel.earnings_calendar import EarningsCalendarFeed
 from zy_quant.intel.edgar_form4 import SecEdgarForm4Scanner
 from zy_quant.intel.market_hours import get_us_market_session, session_close_time
 from zy_quant.intel.regime import MarketRegimeDetector
@@ -30,6 +32,7 @@ from zy_quant.models import (
 )
 from zy_quant.risk.mandate_gate import MandateRiskGate
 from zy_quant.runtime.alerts import AlertNotifier
+from zy_quant.storage.bar_cache import HistoricalBarCache
 from zy_quant.storage.state_store import StateStore
 from zy_quant.strategy.exit_models import ScientificExitAndSizingEngine
 from zy_quant.strategy.indicators import compute_wilder_atr_series
@@ -56,6 +59,7 @@ class TradingDaemon:
         store: Optional[StateStore] = None,
         gateway: Optional[Any] = None,
         notifier: Optional[AlertNotifier] = None,
+        market_data: Optional[MarketDataAdapter] = None,
     ) -> None:
         self.settings = settings
         self.store = store or StateStore(settings.resolve_db_path())
@@ -63,12 +67,30 @@ class TradingDaemon:
             futu_cfg=settings.runtime_cfg.futu,
             allow_synthetic_fallback=settings.runtime_cfg.allow_synthetic_fallback,
         )
+        if market_data is not None:
+            self.market_data: MarketDataAdapter = market_data
+            self.bar_cache: Optional[HistoricalBarCache] = getattr(market_data, "bar_cache", None)
+        elif gateway is not None:
+            # Isolated test gateway injection: route market data directly to injected test double
+            self.market_data = self.gateway
+            self.bar_cache = None
+        else:
+            self.bar_cache = HistoricalBarCache(settings.resolve_bar_cache_path())
+            self.market_data = AlpacaMarketDataAdapter(
+                alpaca_cfg=settings.runtime_cfg.alpaca,
+                bar_cache=self.bar_cache,
+                fallback=self.gateway,
+            )
+
         self.notifier = notifier or AlertNotifier()
         self.fee_model = FutuUSFeeModel()
 
         self.regime_detector = MarketRegimeDetector(settings.strategy_cfg.regime)
         self.watchlist_scorer = ConservativeWatchlistScorer(settings.watchlist_cfg)
         self.edgar_scanner = SecEdgarForm4Scanner()
+        self.earnings_feed = EarningsCalendarFeed(
+            cache_path=settings.root_dir / "data" / "cache" / "earnings_calendar.json"
+        )
         self.signal_engine = IntradaySignalEngine(settings.strategy_cfg.entry)
         self.exit_engine = ScientificExitAndSizingEngine(
             settings.strategy_cfg.exit_models, self.fee_model
@@ -494,10 +516,10 @@ class TradingDaemon:
 
     def evaluate_regime(self) -> RegimeSnapshot:
         reg_cfg = self.settings.strategy_cfg.regime
-        qqq_15m = self.gateway.get_bars(reg_cfg.primary_benchmark, timeframe="15m", days=5)
-        qqq_1d = self.gateway.get_bars(reg_cfg.primary_benchmark, timeframe="1d", days=40)
-        spy_1d = self.gateway.get_bars(reg_cfg.secondary_benchmark, timeframe="1d", days=40)
-        vix = self.gateway.get_vix_level()
+        qqq_15m = self.market_data.get_bars(reg_cfg.primary_benchmark, timeframe="15m", days=5)
+        qqq_1d = self.market_data.get_bars(reg_cfg.primary_benchmark, timeframe="1d", days=40)
+        spy_1d = self.market_data.get_bars(reg_cfg.secondary_benchmark, timeframe="1d", days=40)
+        vix = self.market_data.get_vix_level()
         snap = self.regime_detector.evaluate(qqq_15m, qqq_1d, spy_1d, vix_level=vix)
         self.store.set_flag(
             "latest_regime",
@@ -516,28 +538,90 @@ class TradingDaemon:
         )
         return snap
 
+    def _select_quota_safe_universe(self) -> List[Any]:
+        """
+        When Alpaca Market Data API is configured, unlocks the full 100-stock + sector ETF pool
+        in a single batch request (<1.5s, 0 Futu quota).
+        When running without Alpaca credentials, caps scan to top 16 cross-sector leaders so
+        Futu's 60 req/30s & 30-day K-line subscription quotas are never exhausted.
+        """
+        non_broad = [
+            s for s in self.settings.watchlist_cfg.universe if s.sector != "Broad_ETF"
+        ]
+        alpaca_ready = hasattr(self.market_data, "has_credentials") and bool(
+            getattr(self.market_data, "has_credentials")()
+        )
+        if alpaca_ready or len(non_broad) <= 18:
+            return non_broad
+
+        ordered = sorted(non_broad, key=lambda u: u.etf_core_score, reverse=True)
+        picked: List[Any] = []
+        sec_counts: Dict[str, int] = {}
+        for u in ordered:
+            if sec_counts.get(u.sector, 0) >= 3:
+                continue
+            picked.append(u)
+            sec_counts[u.sector] = sec_counts.get(u.sector, 0) + 1
+            if len(picked) >= 16:
+                break
+        return picked
+
     def refresh_watchlist(
-        self, regime: RegimeSnapshot, check_edgar: bool = False
+        self,
+        regime: RegimeSnapshot,
+        check_edgar: bool = False,
+        check_earnings: bool = True,
     ) -> List[Dict[str, Any]]:
         quotes: Dict[str, QuoteSnapshot] = {}
         intraday_rets: Dict[str, float] = {}
         flows: Dict[str, CapitalFlowSnapshot] = {}
         insiders: Dict[str, InsiderActivity] = {}
 
-        for sec in self.settings.watchlist_cfg.universe:
-            if sec.sector == "Broad_ETF":
-                continue
-            q = self.gateway.get_quote(sec.symbol)
-            if q is not None:
-                quotes[sec.symbol] = q
-            d_bars = self.gateway.get_bars(sec.symbol, timeframe="1d", days=5)
-            if len(d_bars) >= 2 and d_bars[-2].close > 0:
-                intraday_rets[sec.symbol] = (d_bars[-1].close - d_bars[-2].close) / d_bars[-2].close
-            flow = self.gateway.get_capital_flow(sec.symbol)
-            if flow is not None:
-                flows[sec.symbol] = flow
+        scan_pool = self._select_quota_safe_universe()
+        pool_syms = [sec.symbol for sec in scan_pool]
+        alpaca_ready = hasattr(self.market_data, "has_credentials") and bool(
+            getattr(self.market_data, "has_credentials")()
+        )
+
+        if alpaca_ready and hasattr(self.market_data, "get_snapshots_batch"):
+            quotes = self.market_data.get_snapshots_batch(pool_syms)  # type: ignore[attr-defined]
+            bars_1d_map = self.market_data.get_bars_batch(  # type: ignore[attr-defined]
+                pool_syms, timeframe="1d", days=5
+            )
+            for sym, d_bars in bars_1d_map.items():
+                if len(d_bars) >= 2 and d_bars[-2].close > 0:
+                    q_last = quotes[sym].last_price if sym in quotes else d_bars[-1].close
+                    intraday_rets[sym] = (q_last - d_bars[-2].close) / d_bars[-2].close
             if check_edgar:
-                insiders[sec.symbol] = self.edgar_scanner.fetch_insider_activity(sec.symbol, sec.cik)
+                for sec in scan_pool:
+                    insiders[sec.symbol] = self.edgar_scanner.fetch_insider_activity(
+                        sec.symbol, sec.cik
+                    )
+        else:
+            for sec in scan_pool:
+                q = self.market_data.get_quote(sec.symbol)
+                if q is not None:
+                    quotes[sec.symbol] = q
+                d_bars = self.market_data.get_bars(sec.symbol, timeframe="1d", days=5)
+                if len(d_bars) >= 2 and d_bars[-2].close > 0:
+                    intraday_rets[sec.symbol] = (
+                        d_bars[-1].close - d_bars[-2].close
+                    ) / d_bars[-2].close
+                flow = self.gateway.get_capital_flow(sec.symbol)
+                if flow is not None:
+                    flows[sec.symbol] = flow
+                if check_edgar:
+                    insiders[sec.symbol] = self.edgar_scanner.fetch_insider_activity(
+                        sec.symbol, sec.cik
+                    )
+
+        earn_map = (
+            self.earnings_feed.get_upcoming_earnings(
+                symbols=pool_syms, allow_network=(self.bar_cache is not None)
+            )
+            if check_earnings
+            else {}
+        )
 
         candidates = self.watchlist_scorer.rank_universe(
             quotes=quotes,
@@ -546,6 +630,7 @@ class TradingDaemon:
             regime_light=regime.light,
             capital_flows=flows,
             insiders=insiders,
+            earnings_dates=earn_map,
         )
         self.store.save_watchlist_scores(candidates)
         self._last_watchlist_scan_at = datetime.now(timezone.utc)
@@ -624,7 +709,7 @@ class TradingDaemon:
             if self.store.get_active_orders(side=OrderSide.SELL, symbol=sym):
                 continue
 
-            bars_15m = self.gateway.get_bars(sym, timeframe="15m", days=5)
+            bars_15m = self.market_data.get_bars(sym, timeframe="15m", days=5)
             if not bars_15m:
                 continue
             atrs = compute_wilder_atr_series(
@@ -807,25 +892,22 @@ class TradingDaemon:
                 for t in self.store.query_closed_trades(start_iso=cooldown_cutoff, limit=100)
             }
             pending_buy_syms = {str(o["symbol"]) for o in active_buys}
-            qqq_1d = self.gateway.get_bars(
+            qqq_1d = self.market_data.get_bars(
                 self.settings.strategy_cfg.regime.primary_benchmark, timeframe="1d", days=40
             )
 
-            top_n = self.settings.watchlist_cfg.scoring_thresholds.top_n_active
-            min_score = self.settings.watchlist_cfg.scoring_thresholds.min_watch_score
-            watchlist = [
-                w
-                for w in self.store.get_watchlist_scores()
-                if w["passed_hard_filters"] and w["total_score"] >= min_score
-            ][:top_n]
+            # Select active Top-N candidates with GICS Sector Cap (max 3 per sector)
+            watchlist = self.watchlist_scorer.select_active_top_n(
+                self.store.get_watchlist_scores()
+            )
 
             for item in watchlist:
                 sym = item["symbol"]
                 if sym in open_positions or sym in pending_buy_syms or sym in recent_exits:
                     continue
-                bars_15m = self.gateway.get_bars(sym, timeframe="15m", days=5)
-                bars_1d = self.gateway.get_bars(sym, timeframe="1d", days=40)
-                flow = self.gateway.get_capital_flow(sym)
+                bars_15m = self.market_data.get_bars(sym, timeframe="15m", days=5)
+                bars_1d = self.market_data.get_bars(sym, timeframe="1d", days=40)
+                flow = self.gateway.get_capital_flow(sym) if self.gateway.is_connected() else self.market_data.get_capital_flow(sym)
                 sig = self.signal_engine.evaluate_15m(
                     symbol=sym,
                     sector=item["sector"],

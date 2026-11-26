@@ -14,10 +14,18 @@ import uvicorn
 from zy_quant.backtest.engine import BacktestEngine
 from zy_quant.config import AppSettings
 from zy_quant.fees import FutuUSFeeModel
+from zy_quant.gateway.alpaca_adapter import AlpacaMarketDataAdapter
 from zy_quant.gateway.futu_adapter import FutuGatewayAdapter
+from zy_quant.intel.earnings_calendar import EarningsCalendarFeed
 from zy_quant.intel.market_hours import get_us_market_session
+from zy_quant.intel.universe_manager import (
+    PointInTimeUniverseFilter,
+    rebalance_universe_with_buffer,
+    save_universe_yaml,
+)
 from zy_quant.runtime.daemon import TradingDaemon
 from zy_quant.services.analytics import HistoryQueryService, PortfolioAnalyticsService
+from zy_quant.storage.bar_cache import HistoricalBarCache
 from zy_quant.storage.state_store import StateStore
 
 
@@ -190,25 +198,45 @@ class QuantCLI:
         end_date: Optional[str],
         symbols_csv: Optional[str],
         as_json: bool,
+        pit_csv: Optional[str] = None,
     ) -> None:
-        gw = FutuGatewayAdapter(futu_cfg=self.settings.runtime_cfg.futu)
-        gw.connect()
+        bar_cache = HistoricalBarCache(self.settings.resolve_bar_cache_path())
+        alpaca_cfg = self.settings.runtime_cfg.alpaca
+        gw: Optional[FutuGatewayAdapter] = None
+
+        # Only spin up FutuOpenD TCP handshake during backtests if Alpaca API keys aren't configured yet
+        if not (alpaca_cfg.enabled and alpaca_cfg.api_key and alpaca_cfg.secret_key):
+            gw = FutuGatewayAdapter(
+                futu_cfg=self.settings.runtime_cfg.futu,
+                allow_synthetic_fallback=self.settings.runtime_cfg.allow_synthetic_fallback,
+            )
+            gw.connect()
+
+        data_adapter = AlpacaMarketDataAdapter(
+            alpaca_cfg=alpaca_cfg,
+            bar_cache=bar_cache,
+            fallback=gw,
+        )
+        pit_filter = PointInTimeUniverseFilter.from_csv(Path(pit_csv)) if pit_csv else None
+
         try:
             symbols = (
                 [s.strip().upper() for s in symbols_csv.split(",") if s.strip()]
                 if symbols_csv
                 else None
             )
-            engine = BacktestEngine(self.settings, gw)
+            engine = BacktestEngine(self.settings, data_adapter)
             res = engine.run(
                 tier_key=tier or self.settings.active_tier_key,
                 symbols=symbols,
                 days=days,
                 start_date=start_date,
                 end_date=end_date,
+                pit_filter=pit_filter,
             )
         finally:
-            gw.close()
+            if gw is not None:
+                gw.close()
 
         if as_json:
             print(json.dumps(asdict(res), indent=2, ensure_ascii=False))
@@ -263,17 +291,107 @@ class QuantCLI:
             cfg["futu"]["api_token"] = f"{tok[:3]}***{tok[-2:]}" if len(tok) > 5 else "***"
         if cfg["futu"].get("trade_pwd_md5"):
             cfg["futu"]["trade_pwd_md5"] = "***"
+        if cfg.get("alpaca", {}).get("api_key"):
+            ak = cfg["alpaca"]["api_key"]
+            cfg["alpaca"]["api_key"] = f"{ak[:4]}***{ak[-2:]}" if len(ak) > 6 else "***"
+        if cfg.get("alpaca", {}).get("secret_key"):
+            cfg["alpaca"]["secret_key"] = "***"
         print(
             json.dumps(
                 {
                     "settings_file": str(self.settings.root_dir / "config" / "settings.json"),
                     "local_override_file": str(self.settings.root_dir / "config" / "settings.local.json"),
                     "active_db_file": str(self.settings.resolve_db_path()),
+                    "bar_cache_file": str(self.settings.resolve_bar_cache_path()),
+                    "universe_size": len(self.settings.watchlist_cfg.universe),
                     "sim_db_file": str(self.settings.resolve_db_path("SIMULATE")),
                     "real_db_file": str(self.settings.resolve_db_path("REAL")),
                     "active_runtime_config": cfg,
                 },
                 indent=2,
+            )
+        )
+
+    def run_test_alpaca(self, full_universe: bool = False) -> None:
+        bar_cache = HistoricalBarCache(self.settings.resolve_bar_cache_path())
+        adapter = AlpacaMarketDataAdapter(
+            alpaca_cfg=self.settings.runtime_cfg.alpaca,
+            bar_cache=bar_cache,
+        )
+        sample = (
+            [u.symbol for u in self.settings.watchlist_cfg.universe if u.sector != "Broad_ETF"]
+            if full_universe
+            else ["SPY", "QQQ", "NVDA", "MSFT", "JPM", "XOM", "LLY", "CAT"]
+        )
+        res = adapter.test_connection(sample_symbols=sample)
+        earn = EarningsCalendarFeed(
+            cache_path=self.settings.root_dir / "data" / "cache" / "earnings_calendar.json"
+        ).get_upcoming_earnings(symbols=sample)
+        res["upcoming_earnings_in_sample"] = {k: v.isoformat() for k, v in earn.items()}
+        res["universe_configured_count"] = len(self.settings.watchlist_cfg.universe)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+
+    def run_refresh_universe(self, apply_write: bool = False) -> None:
+        bar_cache = HistoricalBarCache(self.settings.resolve_bar_cache_path())
+        adapter = AlpacaMarketDataAdapter(
+            alpaca_cfg=self.settings.runtime_cfg.alpaca,
+            bar_cache=bar_cache,
+        )
+        if not adapter.has_credentials():
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "error": "Configure `alpaca.api_key` and `alpaca.secret_key` in `config/settings.local.json` before running `refresh-universe`.",
+                    },
+                    indent=2,
+                )
+            )
+            return
+
+        current = self.settings.watchlist_cfg.universe
+        eq_syms = [u.symbol for u in current if not u.sector.endswith("_ETF")]
+        bars_60d = adapter.get_bars_batch(eq_syms, timeframe="1d", days=65)
+        metrics = []
+        for u in current:
+            if u.sector.endswith("_ETF"):
+                continue
+            blist = bars_60d.get(u.symbol, [])
+            if not blist:
+                continue
+            recent = blist[-60:]
+            adv_60 = sum(b.close * b.volume for b in recent) / len(recent)
+            metrics.append(
+                {
+                    "symbol": u.symbol,
+                    "sector": u.sector,
+                    "cik": u.cik,
+                    "etf_core_score": u.etf_core_score,
+                    "baseline_inst_pct": u.baseline_inst_pct,
+                    "price": recent[-1].close,
+                    "adv_60d_usd": adv_60,
+                }
+            )
+
+        updated_uni, summary = rebalance_universe_with_buffer(current, metrics)
+        target_file = self.settings.root_dir / "config" / (
+            self.settings.watchlist_cfg.universe_file or "universe_100.yaml"
+        )
+        if apply_write and summary.total_count > 0:
+            save_universe_yaml(target_file, updated_uni)
+
+        print(
+            json.dumps(
+                {
+                    "applied": apply_write,
+                    "target_file": str(target_file),
+                    "equities_selected": summary.total_count,
+                    "added": summary.added,
+                    "removed": summary.removed,
+                    "sector_distribution": summary.sector_distribution,
+                },
+                indent=2,
+                ensure_ascii=False,
             )
         )
 
@@ -317,7 +435,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--from", dest="start_date", default=None, help="Start date YYYY-MM-DD")
     p_bt.add_argument("--to", dest="end_date", default=None, help="End date YYYY-MM-DD")
     p_bt.add_argument("--symbols", default=None, help="Comma-separated symbols (e.g. NVDA,MSFT)")
+    p_bt.add_argument("--pit-csv", dest="pit_csv", default=None, help="Point-in-Time constituent CSV (symbol,start_date,end_date)")
     p_bt.add_argument("--json", action="store_true")
+
+    p_alpaca = sub.add_parser("test-alpaca", help="Verify Alpaca Market Data API v2 connection, batch latency & earnings feed")
+    p_alpaca.add_argument("--full", action="store_true", help="Benchmark full 110-symbol batch snapshot scan")
+
+    p_uni = sub.add_parser("refresh-universe", help="Run quarterly objective ADV/price universe rebalance with 85/120 buffer")
+    p_uni.add_argument("--apply", action="store_true", help="Write rebalanced universe to config/universe_100.yaml")
 
     p_cfg = sub.add_parser("config", help="Display active merged runtime configuration (secrets masked)")
     p_cfg.add_argument(
@@ -384,21 +509,38 @@ def main() -> None:
             end_date=args.end_date,
             symbols_csv=args.symbols,
             as_json=args.json,
+            pit_csv=args.pit_csv,
         )
+    elif args.cmd == "test-alpaca":
+        cli.run_test_alpaca(full_universe=args.full)
+    elif args.cmd == "refresh-universe":
+        cli.run_refresh_universe(apply_write=args.apply)
     elif args.cmd == "config":
         cli.run_config_show(consolidate_local=args.consolidate_local)
     elif args.cmd == "service":
+        start_sh = cli.settings.root_dir / "deploy" / "start.sh"
+        stop_sh = cli.settings.root_dir / "deploy" / "stop.sh"
+        manual_flag = cli.settings.root_dir / "data" / ".manual_start"
         uid = os.getuid()
         plist = Path.home() / "Library" / "LaunchAgents" / "com.zyquant.daemon.plist"
+
         if args.action == "stop":
-            subprocess.run(["launchctl", "bootout", f"gui/{uid}/com.zyquant.daemon"], check=False)
-            print("Background service stopped.")
-        elif args.action == "start":
-            subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], check=False)
-            print("Background service started.")
-        elif args.action == "restart":
-            subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/com.zyquant.daemon"], check=False)
-            print("Background service restarted.")
+            if stop_sh.exists():
+                subprocess.run(["/bin/bash", str(stop_sh)], check=False)
+            else:
+                manual_flag.unlink(missing_ok=True)
+                subprocess.run(["launchctl", "bootout", f"gui/{uid}/com.zyquant.daemon"], check=False)
+                print("Background service stopped.")
+        elif args.action in ("start", "restart"):
+            manual_flag.parent.mkdir(parents=True, exist_ok=True)
+            manual_flag.touch()
+            if start_sh.exists():
+                subprocess.run(["/bin/bash", str(start_sh)], check=False)
+            else:
+                if args.action == "start":
+                    subprocess.run(["launchctl", "bootstrap", f"gui/{uid}", str(plist)], check=False)
+                subprocess.run(["launchctl", "kickstart", "-k", f"gui/{uid}/com.zyquant.daemon"], check=False)
+                print(f"Background service {args.action}ed (manual dashboard flag armed).")
     elif args.cmd == "fee-calc":
         fm = FutuUSFeeModel()
         print(

@@ -54,8 +54,14 @@ class MarketRegimeDetector:
         spy_px = spy_closes_d[-1]
         spy_sma20 = compute_sma(spy_closes_d, self.cfg.daily_sma_period)
 
-        # Compute today's intraday return from today's first bar open (or prior daily close)
-        prev_close = qqq_daily[-2].close if len(qqq_daily) >= 2 else qqq_intraday_15m[0].open
+        # Compute today's intraday return against prior completed daily close
+        session_d = qqq_intraday_15m[-1].timestamp.date()
+        if qqq_daily[-1].timestamp.date() < session_d:
+            prev_close = qqq_daily[-1].close
+        elif len(qqq_daily) >= 2:
+            prev_close = qqq_daily[-2].close
+        else:
+            prev_close = qqq_intraday_15m[0].open
         intraday_ret = (qqq_px - prev_close) / prev_close if prev_close > 0 else 0.0
 
         # Hard RED triggers

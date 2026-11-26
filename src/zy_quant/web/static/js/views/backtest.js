@@ -48,6 +48,8 @@ export class BacktestLabView {
             <button class="preset-btn" data-days="14">14D</button>
             <button class="preset-btn active" data-days="30">30D</button>
             <button class="preset-btn" data-days="55">55D</button>
+            <button class="preset-btn" data-days="180">180D</button>
+            <button class="preset-btn" data-days="365">1Y</button>
           </div>
 
           <span class="txt-muted" style="font-size:12px;margin-left:6px;">Custom Period:</span>
@@ -152,14 +154,20 @@ export class BacktestLabView {
       });
 
       if (bt.strategy_summary) this.renderBlueprint(bt.strategy_summary);
-      const srcLabel = bt.data_source === 'FUTU_REALTIME' ? 'Verified Futu Real Historical Bars' : bt.data_source;
+      const sourceNames = {
+        ALPACA_MARKET_DATA: 'Verified Alpaca Historical Bars (Split-Adjusted)',
+        LOCAL_BAR_CACHE: 'Verified Local SQLite Bar Cache',
+        FUTU_REALTIME: 'Verified Futu Real Historical Bars',
+      };
+      const isVerifiedSource = Boolean(sourceNames[bt.data_source]);
+      const srcLabel = sourceNames[bt.data_source] || bt.data_source;
       document.getElementById('btWindowLabel').textContent =
         bt.period_start && bt.period_end
           ? `${srcLabel} · ${bt.period_start} → ${bt.period_end}`
           : srcLabel;
 
       const warnEl = document.getElementById('btDataIntegrityBanner');
-      if (bt.is_synthetic_data || bt.data_source !== 'FUTU_REALTIME' || (bt.data_warnings && bt.data_warnings.length)) {
+      if (bt.is_synthetic_data || !isVerifiedSource || (bt.data_warnings && bt.data_warnings.length)) {
         warnEl.style.display = 'block';
         const details = (bt.data_warnings || []).join(' | ') || `Data source degraded: ${bt.data_source}`;
         warnEl.textContent = `DATA FALLBACK / INTEGRITY WARNING (${bt.data_source}): ${details}`;

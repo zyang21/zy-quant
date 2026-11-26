@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from zy_quant.config import UniverseSecurity, WatchlistScoringConfig
+from zy_quant.intel.market_hours import ET_TZ
 from zy_quant.models import (
     CapitalFlowSnapshot,
     InsiderActivity,
@@ -51,7 +52,7 @@ class ConservativeWatchlistScorer:
         hf = self.cfg.hard_filters
         w = self.cfg.weights
         now = datetime.now(timezone.utc)
-        ref_day = today or now.date()
+        ref_day = today or now.astimezone(ET_TZ).date()
 
         inst_pct = institutional_pct if institutional_pct is not None else sec.baseline_inst_pct
         reasons: List[str] = []
@@ -170,3 +171,33 @@ class ConservativeWatchlistScorer:
 
         scored.sort(key=lambda c: (c.passed_hard_filters, c.total_score), reverse=True)
         return scored
+
+    def select_active_top_n(
+        self,
+        scored_rows: Sequence[Dict[str, Any]],
+        top_n: Optional[int] = None,
+        min_score: Optional[float] = None,
+        max_per_sector: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Selects up to `top_n_active` eligible candidates while enforcing the GICS Sector Cap
+        (`max_per_sector_in_top_n`) so a single hot sector never crowds out cross-sector leaders.
+        """
+        th = self.cfg.scoring_thresholds
+        limit_n = top_n if top_n is not None else th.top_n_active
+        floor_score = min_score if min_score is not None else th.min_watch_score
+        sec_cap = max_per_sector if max_per_sector is not None else th.max_per_sector_in_top_n
+
+        selected: List[Dict[str, Any]] = []
+        sector_counts: Dict[str, int] = {}
+        for row in scored_rows:
+            if not row.get("passed_hard_filters") or float(row.get("total_score", 0.0)) < floor_score:
+                continue
+            sec = str(row.get("sector") or "Unknown")
+            if sector_counts.get(sec, 0) >= sec_cap:
+                continue
+            selected.append(row)
+            sector_counts[sec] = sector_counts.get(sec, 0) + 1
+            if len(selected) >= limit_n:
+                break
+        return selected

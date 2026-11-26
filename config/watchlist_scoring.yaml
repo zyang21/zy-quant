@@ -18,7 +18,11 @@ weights:
 scoring_thresholds:
   min_watch_score: 62.0                # Minimum composite score (0-100) to enter active candidate pool
   top_n_active: 8                      # Only subscribe 15m real-time bars/flow on top N candidates (saves Futu quota)
+  max_per_sector_in_top_n: 3           # GICS Sector Cap: max 3 active tickers per sector to prevent tech crowding
   red_day_rs_bonus_cap: 15.0           # Extra bonus within stability bucket for stocks green while QQQ is red
+
+# Loads the 100-stock sector-balanced institutional universe + 12 sector/benchmark ETFs
+universe_file: "universe_100.yaml"
 
 # Pre-vetted liquid US Institutional / ETF Core Universe (all typically >$50 & >$500M ADV)
 # etf_weight_score reflects normalized presence across SPY / QQQ / Sector flagship ETFs (0.0 - 1.0)
