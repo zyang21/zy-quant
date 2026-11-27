@@ -351,20 +351,19 @@ class ScientificExitAndSizingEngine:
         max_notional_usd = min(available_cash_usd, account_equity_usd * single_cap_pct * scale)
 
         raw_shares = min(max_risk_budget_usd / risk_per_share, max_notional_usd / px)
+        risk_implied_floor = (max_risk_budget_usd / max(0.04, self.cfg.swing_max_hard_stop_pct)) * 0.55
+        eff_min_notional = min(
+            tier.min_order_notional_usd * scale,
+            max(100.0 * scale, risk_implied_floor),
+        )
         if raw_shares >= 1.0:
             shares = float(math.floor(raw_shares))
-        elif tier.allow_fractional_shares and raw_shares * px >= min(tier.min_order_notional_usd, 450.0):
+        elif tier.allow_fractional_shares and raw_shares * px >= eff_min_notional:
             shares = round(min(0.99, raw_shares), 4)
         else:
             return None, "Insufficient buying power for >=1 share or fractional swing lot"
 
         notional_usd = shares * px
-        risk_implied_floor = (max_risk_budget_usd / max(0.04, self.cfg.swing_max_hard_stop_pct)) * 0.60
-        eff_min_notional = (
-            min(tier.min_order_notional_usd * scale, max(450.0 * scale, risk_implied_floor))
-            if account_equity_usd >= 5000.0
-            else tier.min_order_notional_usd * scale
-        )
         if notional_usd < eff_min_notional:
             return None, f"Swing notional ${notional_usd:.2f} < floor ${eff_min_notional:.2f}"
 

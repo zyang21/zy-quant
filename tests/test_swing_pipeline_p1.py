@@ -983,3 +983,169 @@ def test_earnings_cache_resilience_amc_pead_yellow_sizing_and_web_swing_mode(tmp
     bp = web_ctx.get_strategy_summary(mode_override="swing_1d")
     assert bp["mode"] == "swing_1d"
     assert "GTC STOP" in bp["initial_stop_rule"]
+
+
+def test_round2_rpc_failure_safety_phase_sleep_tier1k_and_hkd_isolation(tmp_path: Path) -> None:
+    """
+    Regression tests for all Round-2 Review Findings (#1..#6):
+      1. Futu RPC failure (`last_order_sync_ok=False` / `last_position_sync_ok=False`) never places
+         duplicate `GTC STOP` orders, never wipes `broker_stop_order_id`, and never deletes SQLite positions
+      2. Phase-boundary-aware `next_sleep_minutes` wakes right at `15:35 ET` / `12:35 ET` (never overshoots EOD)
+      3. `tier_1k` (`$1,000`) executes swing trades without `25%` single-asset cap deadlock
+      4. `get_account_summary()` isolates `HKD` fallback rows and caps Cash Plus at `equity - market_val`
+      5. `EarningsCalendarFeed` preserves forward disk cache when mid-loop HTTP returns `429`
+      6. Multi-fill `_handle_protective_stop_update` maintains `$0.00` stateful `virtual_cash` drift
+    """
+    from zy_quant.runtime.pipeline import _compute_phase_aware_sleep_minutes
+
+    settings = AppSettings.load()
+
+    # 1. Futu RPC failure safety (`order_list_query` & `position_list_query` transient errors)
+    store_rpc = StateStore(tmp_path / "rpc_guard.db")
+    daemon_rpc = TradingDaemon(settings, store=store_rpc, notifier=AlertNotifier())
+    pipe_rpc = DailySwingPipeline(daemon_rpc)
+
+    now_pre = datetime(2026, 11, 25, 9, 25, tzinfo=ET_TZ).astimezone(timezone.utc)
+    live_pos = OpenPosition(
+        "NVDA", "Semiconductors", 10.0, 10.0, 150.0, now_pre, 140.0, 140.0, 152.0, 10.0,
+        stop_order_type="GTC_STOP", broker_stop_order_id="GTC-LIVE-99",
+    )
+    store_rpc.upsert_position(live_pos)
+
+    placed_stops: List[str] = []
+    daemon_rpc.gateway.trd_env_name = "REAL"
+    daemon_rpc.gateway.has_target_account = lambda: True  # type: ignore[method-assign]
+    daemon_rpc.gateway.is_connected = lambda: True  # type: ignore[method-assign]
+    daemon_rpc.gateway.last_order_sync_ok = False
+    daemon_rpc.gateway.last_position_sync_ok = False
+    daemon_rpc.gateway.sync_open_orders = lambda refresh_cache=False: []  # type: ignore[method-assign]
+    daemon_rpc.gateway.get_open_positions = lambda: {}  # type: ignore[method-assign]
+    daemon_rpc._place_stop_order = lambda sym, sh, px, oid=None: (placed_stops.append(sym) or "DUP-STOP")  # type: ignore[method-assign]
+
+    # Neither startup_reconcile nor heal_overnight_gtc_stops may delete NVDA or place a duplicate stop!
+    daemon_rpc.startup_reconcile()
+    assert "NVDA" in store_rpc.get_positions()
+    healed_on_err = pipe_rpc.heal_overnight_gtc_stops(now_pre, already_reconciled=True)
+    assert healed_on_err == []
+    assert placed_stops == []
+    assert store_rpc.get_positions()["NVDA"].broker_stop_order_id == "GTC-LIVE-99"
+
+    # 2. Phase-boundary-aware `next_sleep_minutes` (never overshoots 25-min EOD window!)
+    assert _compute_phase_aware_sleep_minutes(datetime(2026, 11, 25, 15, 25, tzinfo=ET_TZ), PipelinePhase.IDLE_GTC_ARMED, 0, False) == 10
+    assert _compute_phase_aware_sleep_minutes(datetime(2026, 11, 27, 12, 34, tzinfo=ET_TZ), PipelinePhase.IDLE_GTC_ARMED, 0, False) == 1
+    assert _compute_phase_aware_sleep_minutes(datetime(2026, 11, 25, 9, 27, tzinfo=ET_TZ), PipelinePhase.PRE_OPEN_SYNC, 0, False) == 3
+
+    # 3. `tier_1k` (`$1,000`) sizing + MandateRiskGate + BacktestEngine non-deadlock verification!
+    exit_eng = ScientificExitAndSizingEngine(settings.strategy_cfg.exit_models, FutuUSFeeModel())
+    tier_1k = settings.tiers_cfg.get_active("tier_1k")
+    sig_1k = EntrySignal("COST", "Consumer", SetupType.VCP_PIVOT_BREAKOUT, now_pre, 520.0, 8.5, 512.0, 1.7, 84.0, "test")
+    plan_1k, st_1k = exit_eng.build_swing_position_plan(sig_1k, 1000.0, 1000.0, tier_1k, position_scale=1.0)
+    assert st_1k == "APPROVED" and plan_1k is not None and plan_1k.notional_usd > 250.0
+
+    gate_1k = MandateRiskGate(StateStore(tmp_path / "gate_1k.db"), settings.strategy_cfg.daemon)
+    dec_1k = gate_1k.check_entry(plan_1k, tier_1k, 1000.0, {}, now=now_pre, enforce_swing_heat=True)
+    assert dec_1k.allowed is True, dec_1k.reason
+
+    cache_1k = HistoricalBarCache(tmp_path / "bt_1k.db")
+    for idx, sym in enumerate(["QQQ", "SPY", "NVDA", "XOM"]):
+        b1d, _ = _make_consistent_1d_and_15m_series(
+            sym, n_days=270, intraday_days=5, end_d=date(2026, 11, 25),
+            start_px=95.0 + idx * 10.0, daily_drift=0.0028 if sym not in ("QQQ", "SPY") else 0.0016, seed_offset=idx * 5,
+        )
+        cache_1k.upsert_bars("1d", b1d)
+    ad_1k = AlpacaMarketDataAdapter(AlpacaDataConfig(api_key="", secret_key=""), bar_cache=cache_1k)
+    bt_1k = BacktestEngine(settings, ad_1k).run(
+        tier_key="tier_1k", symbols=["NVDA", "XOM"], days=90, mode="swing_1d", clock_mode="1d",
+        earnings_events={"NVDA": EarningsEvent("NVDA", date(2026, 11, 20), "AMC"), "XOM": EarningsEvent("XOM", date(2026, 11, 20), "AMC")},
+    )
+    assert bt_1k.total_fees_usd > 0.0  # Real swing orders executed on tier_1k!
+
+    # 4. Futu HK `HKD` fallback isolation & non-leveraged Cash Plus `equity - market_val` cap!
+    futu_ad = FutuGatewayAdapter(trd_env="REAL")
+
+    class DummyFutuCcy:
+        RET_OK = 0
+
+        class TrdEnv:
+            REAL = "REAL"
+
+        class Currency:
+            USD = "USD"
+
+    class CcyCtx:
+        def __init__(self) -> None:
+            self.fail_usd_query = True
+
+        def get_acc_list(self) -> tuple[int, pd.DataFrame]:
+            return 0, pd.DataFrame([{"acc_id": 999, "trd_env": "REAL", "acc_type": "MARGIN"}])
+
+        def accinfo_query(self, **kwargs: Any) -> tuple[int, Any]:
+            if kwargs.get("currency") == "USD" and self.fail_usd_query:
+                return -1, "USD query unsupported"
+            if kwargs.get("currency") == "USD":
+                # MARGIN account where intraday stock purchase raised market_val=$7,100 while $8,400 MMF redeems T+1
+                return 0, pd.DataFrame([{
+                    "total_assets": 12500.0, "us_cash": 0.0, "fund_assets": 8400.0, "market_val": 7100.0, "power": 16000.0,
+                }])
+            # HKD fallback row (`HK$78,000` == `$10,000 USD`!)
+            return 0, pd.DataFrame([{
+                "currency": "HKD", "total_assets": 78000.0, "cash": 32700.0, "fund_assets": 45000.0,
+                "usd_assets": 10000.0, "us_cash": 4200.0, "us_market_val": 5800.0, "power": 120000.0,
+            }])
+
+    ccy_ctx = CcyCtx()
+    futu_ad._futu_mod = DummyFutuCcy
+    futu_ad._trade_ctx = ccy_ctx
+    futu_ad.is_connected = lambda: True  # type: ignore[method-assign]
+
+    hkd_fb_acct = futu_ad.get_account_summary()
+    assert hkd_fb_acct["equity_usd"] == 10000.0  # Strictly USD, NEVER HK$78,000!
+    assert hkd_fb_acct["cash_usd"] == 4200.0
+
+    ccy_ctx.fail_usd_query = False
+    margin_mmf_acct = futu_ad.get_account_summary()
+    assert margin_mmf_acct["cash_usd"] == 5400.0  # Capped at `12500 - 7100`, NEVER $8,400 or $16,000 leverage!
+
+    # 5. `EarningsCalendarFeed` partial HTTP 429 mid-loop resilience
+    partial_cache = tmp_path / "partial_earn.json"
+    partial_cache.write_text(
+        json.dumps({"updated_at": "2020-01-01T00:00:00+00:00", "events": {"NVDA": {"date": "2026-12-03", "timing": "AMC"}}}),
+        encoding="utf-8",
+    )
+
+    def mid_loop_429(req: httpx.Request) -> httpx.Response:
+        q_d = req.url.params.get("date", "")
+        if q_d < "2026-11-25":
+            return httpx.Response(200, json={"data": {"rows": [{"symbol": "CRM", "time": "time-after-hours"}]}})
+        return httpx.Response(429, text="Rate limited")
+
+    p_feed = EarningsCalendarFeed(cache_path=partial_cache, http_client=httpx.Client(transport=httpx.MockTransport(mid_loop_429)))
+    ev_partial = p_feed.get_upcoming_events(symbols=["NVDA", "CRM"], ref_day=date(2026, 11, 25), allow_network=True)
+    assert "NVDA" in ev_partial  # Forward cached earnings NOT wiped when forward HTTP hit 429!
+    assert "NVDA" in json.loads(partial_cache.read_text(encoding="utf-8"))["events"]
+
+    # 6. Multi-fill `_handle_protective_stop_update` exact delta accounting
+    store_st = StateStore(tmp_path / "stop_multifill.db")
+    daemon_st = TradingDaemon(settings, store=store_st, notifier=AlertNotifier())
+    t_10k = settings.tiers_cfg.get_active("tier_10k")
+    buy_fee_st = daemon_st.fee_model.estimate_leg(10.0, 150.0, OrderSide.BUY).total_friction_usd
+    plan_st = PositionPlan("AVGO", "Semiconductors", 10.0, 150.0, 150.1, 140.0, 10.0, 100.0, 1500.0, 4.1, 2.5, 0.5, SetupType.VCP_PIVOT_BREAKOUT)
+    sig_st = EntrySignal("AVGO", "Semiconductors", SetupType.VCP_PIVOT_BREAKOUT, now_pre, 150.0, 4.5, 148.0, 1.5, 84.0, "test")
+    store_st.record_order_intent("BUY-AVGO-ST", "AVGO", OrderSide.BUY, 10.0, 150.1, "test", created_at=now_pre)
+    daemon_st._settle_paper_local_buy("BUY-AVGO-ST", "AVGO", plan_st, sig_st, buy_fee_st, now_pre, "tier_10k", t_10k)
+
+    pos_avgo = store_st.get_positions()["AVGO"]
+    pos_avgo.broker_stop_order_id = "GTC-STOP-AVGO"
+    store_st.upsert_position(pos_avgo)
+    daemon_st.gateway.query_order_fee = lambda oid: 2.50  # type: ignore[method-assign]
+
+    # Stop fills in 2 prints: 4 sh @ $140.00 -> 6 sh @ $138.00 (cumulative avg = $138.80, total fee = $2.50)
+    daemon_st.on_broker_order_update(
+        BrokerOrderUpdate("GTC-STOP-AVGO", "AVGO", OrderSide.SELL, "STOP", OrderStatus.PARTIAL_FILLED, "FILLED_PART", 10.0, 140.0, 4.0, 140.0)
+    )
+    daemon_st.on_broker_order_update(
+        BrokerOrderUpdate("GTC-STOP-AVGO", "AVGO", OrderSide.SELL, "STOP", OrderStatus.FILLED, "FILLED_ALL", 10.0, 140.0, 10.0, 138.8)
+    )
+    rec_st = store_st.reconcile_stateful_ledger("tier_10k", t_10k.reference_equity_usd)
+    assert rec_st["ok"] is True
+    assert abs(rec_st["drift_usd"]) <= 0.01

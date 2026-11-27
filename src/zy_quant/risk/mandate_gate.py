@@ -253,10 +253,11 @@ class MandateRiskGate:
         # 7. Portfolio Heat & Single-Name / Sector Concentration Caps
         eq = max(1.0, account_equity_usd)
         if enforce_swing_heat or tier.enforce_swing_caps:
+            is_etf = plan.sector.endswith("_ETF")
             single_cap = (
-                tier.max_sector_etf_pct
-                if plan.sector.endswith("_ETF")
-                else tier.max_single_equity_pct
+                min(tier.max_position_pct, tier.max_sector_etf_pct if is_etf else tier.max_single_equity_pct)
+                if (tier.enforce_swing_caps or tier.max_concurrent_positions >= 3)
+                else tier.max_position_pct
             )
             if (plan.notional_usd / eq) > single_cap + 1e-6:
                 return RiskDecision(

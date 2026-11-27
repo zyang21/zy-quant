@@ -136,6 +136,9 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._order_handler: Any = None
         self._kline_cache: Dict[tuple[str, str], tuple[float, int, List[Bar]]] = {}
         self._last_kline_rpc_mono: float = 0.0
+        self._last_order_refresh_mono: float = 0.0
+        self.last_order_sync_ok: bool = False
+        self.last_position_sync_ok: bool = False
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def register_order_callback(self, callback: Callable[[BrokerOrderUpdate], Any]) -> None:
@@ -474,21 +477,32 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     def sync_open_orders(self, refresh_cache: bool = False) -> List[BrokerOrderUpdate]:
         """
         Pull-based order reconciliation fallback via Futu order_list_query().
-        Catches any order status transitions missed during brief socket drops.
+        Tracks `last_order_sync_ok` so callers never mistake an RPC/rate-limit error for an empty order book.
         """
         if not self.is_connected() or self._trade_ctx is None:
+            self.last_order_sync_ok = False
             return []
         acc_id = self._select_acc_id(self.trd_env_name)
         if acc_id == 0:
+            self.last_order_sync_ok = False
             return []
         ft = self._futu_mod
+        now_mono = time.monotonic()
+        eff_refresh = bool(refresh_cache and (now_mono - self._last_order_refresh_mono) >= 2.0)
         with self._rpc_lock:
             ret, df = self._trade_ctx.order_list_query(
                 trd_env=self._trd_env(),
                 acc_id=acc_id,
-                refresh_cache=refresh_cache,
+                refresh_cache=eff_refresh,
             )
-        if ret != ft.RET_OK or df is None or df.empty:
+        if ret != ft.RET_OK or df is None or isinstance(df, str):
+            self.last_order_sync_ok = False
+            logger.warning("Futu order_list_query failed (ret=%s): %s", ret, df)
+            return []
+        self.last_order_sync_ok = True
+        if eff_refresh:
+            self._last_order_refresh_mono = now_mono
+        if df.empty:
             return []
         updates: List[BrokerOrderUpdate] = []
         for _, row in df.iterrows():
@@ -564,9 +578,10 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             ret, df = self._trade_ctx.accinfo_query(
                 trd_env=query_env, acc_id=acc_id, currency=ft.Currency.USD
             )
-            if ret != ft.RET_OK or df is None or df.empty:
+            queried_usd_ok = ret == ft.RET_OK and df is not None and not isinstance(df, str) and not df.empty
+            if not queried_usd_ok:
                 ret, df = self._trade_ctx.accinfo_query(trd_env=query_env, acc_id=acc_id)
-        if ret != ft.RET_OK or df is None or df.empty:
+        if ret != ft.RET_OK or df is None or isinstance(df, str) or df.empty:
             return {
                 "equity_usd": 0.0,
                 "cash_usd": 0.0,
@@ -583,14 +598,28 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             except (TypeError, ValueError):
                 return 0.0
 
-        equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
-        has_us_cash_field = "us_cash" in row and row.get("us_cash") not in (None, "N/A", "")
-        raw_cash = _f(row.get("us_cash")) if has_us_cash_field else _f(row.get("cash"))
-        fund_assets = _f(row.get("fund_assets"))
-        buying_power = _f(row.get("power"))
+        row_ccy = str(row.get("currency") or "").strip().upper()
+        is_usd_denominated = queried_usd_ok or row_ccy == "USD"
+        if is_usd_denominated:
+            equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
+            has_us_cash_field = "us_cash" in row and row.get("us_cash") not in (None, "N/A", "")
+            raw_cash = _f(row.get("us_cash")) if has_us_cash_field else _f(row.get("cash"))
+            fund_assets = _f(row.get("fund_assets"))
+            market_val = _f(row.get("market_val"))
+            buying_power = _f(row.get("power"))
+        else:
+            # Fallback non-USD row (e.g. HKD unified summary): strictly read explicit US-dollar columns only!
+            equity = _f(row.get("usd_assets"))
+            raw_cash = _f(row.get("us_cash"))
+            fund_assets = 0.0
+            market_val = _f(row.get("us_market_val"))
+            buying_power = 0.0
+
         # Futu HK Cash Plus (USD MMF auto-sweep) parks idle USD in `fund_assets` with `us_cash == 0`;
-        # include `fund_assets` and cap at non-leveraged equity/buying_power so real cash isn't masked as $0!
-        liquid_cash = raw_cash + fund_assets
+        # floor at $0 and cap at non-leveraged `equity - market_val` so MARGIN `power` never buys on leverage!
+        liquid_cash = max(0.0, raw_cash + fund_assets)
+        if equity > 0:
+            liquid_cash = min(liquid_cash, max(0.0, equity - market_val))
         if buying_power > 0:
             liquid_cash = min(liquid_cash, buying_power)
         return {
@@ -598,7 +627,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             "cash_usd": liquid_cash,
             "raw_cash_usd": raw_cash,
             "fund_assets_usd": fund_assets,
-            "market_val_usd": _f(row.get("market_val")),
+            "market_val_usd": market_val,
             "buying_power_usd": buying_power,
             "connected": 1.0,
             "note": note,
@@ -640,11 +669,21 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
 
     def get_open_positions(self) -> Dict[str, Dict[str, float]]:
         if not self.is_connected() or self._trade_ctx is None:
+            self.last_position_sync_ok = False
             return {}
         ft = self._futu_mod
         acc_id = self._select_acc_id()
-        ret, df = self._trade_ctx.position_list_query(trd_env=self._trd_env(), acc_id=acc_id)
-        if ret != ft.RET_OK or df is None or df.empty:
+        if acc_id == 0:
+            self.last_position_sync_ok = False
+            return {}
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.position_list_query(trd_env=self._trd_env(), acc_id=acc_id)
+        if ret != ft.RET_OK or df is None or isinstance(df, str):
+            self.last_position_sync_ok = False
+            logger.warning("Futu position_list_query failed (ret=%s): %s", ret, df)
+            return {}
+        self.last_position_sync_ok = True
+        if df.empty:
             return {}
         holdings: Dict[str, Dict[str, float]] = {}
         for _, row in df.iterrows():

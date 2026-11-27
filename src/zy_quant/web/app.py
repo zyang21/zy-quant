@@ -124,6 +124,8 @@ class ControlCenterApplication:
         self.settings = fresh
         self.daemon.settings = fresh
         self.daemon.watchlist_scorer.cfg = fresh.watchlist_cfg
+        self.daemon.exit_engine.cfg = fresh.strategy_cfg.exit_models
+        self.daemon.risk_gate.daemon_cfg = fresh.strategy_cfg.daemon
         self.daemon.swing_pipeline.swing_engine = DailySwingSignalEngine(
             entry_cfg=fresh.strategy_cfg.entry,
             regime_cfg=fresh.strategy_cfg.regime,

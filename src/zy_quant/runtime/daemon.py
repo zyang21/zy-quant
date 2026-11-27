@@ -281,13 +281,14 @@ class TradingDaemon:
         if connected and self.gateway.has_target_account():
             summary["order_events"] = self.reconcile_open_orders()
             broker_pos = self.gateway.get_open_positions()
-            rec = self.store.reconcile_broker_positions(broker_pos)
-            summary["reconciliation"] = rec
-            if any(rec.values()):
-                self.notifier.send(
-                    "Startup Position Reconciliation",
-                    f"Adopted={rec['adopted']}, Updated={rec['updated']}, ClosedRemotely={rec['closed_remotely']}",
-                )
+            if getattr(self.gateway, "last_position_sync_ok", True):
+                rec = self.store.reconcile_broker_positions(broker_pos)
+                summary["reconciliation"] = rec
+                if any(rec.values()):
+                    self.notifier.send(
+                        "Startup Position Reconciliation",
+                        f"Adopted={rec['adopted']}, Updated={rec['updated']}, ClosedRemotely={rec['closed_remotely']}",
+                    )
         self.store.set_flag(
             "daemon_heartbeat",
             {
@@ -562,7 +563,12 @@ class TradingDaemon:
         if delta <= 1e-6:
             return None
 
-        fill_px = float(update.avg_fill_price or update.price or pos.current_stop)
+        cum_avg_px = float(update.avg_fill_price or update.price or pos.current_stop)
+        prev_notional = float(pos.metadata.get("stop_reconciled_notional") or 0.0)
+        new_notional = new_filled * cum_avg_px
+        delta_notional = max(0.0, new_notional - prev_notional)
+        slice_px = round(delta_notional / delta, 4) if delta_notional > 0 else cum_avg_px
+
         if pos.current_stop > pos.entry_price:
             reason = (
                 ExitReason.CHANDELIER_TRAIL
@@ -572,13 +578,19 @@ class TradingDaemon:
         else:
             reason = ExitReason.INITIAL_ATR_STOP
 
-        sell_fee = self._resolve_order_fee(
-            update.broker_order_id,
-            delta,
-            fill_px,
-            OrderSide.SELL,
-            is_terminal=update.status.is_terminal,
+        prev_fee = float(pos.metadata.get("stop_reconciled_fee") or 0.0)
+        exact_total_fee = (
+            self.gateway.query_order_fee(update.broker_order_id)
+            if (update.status.is_terminal and update.broker_order_id)
+            else None
         )
+        if exact_total_fee is not None and exact_total_fee > 0.0:
+            total_stop_fee = round(exact_total_fee, 4)
+            delta_fee = max(0.0, round(total_stop_fee - prev_fee, 4))
+        else:
+            delta_fee = self.fee_model.estimate_leg(delta, slice_px, OrderSide.SELL).total_friction_usd
+            total_stop_fee = round(prev_fee + delta_fee, 4)
+
         alloc_buy_fee = (
             float(pos.metadata.get("buy_fee_usd") or 0.0)
             * (delta / max(1e-6, pos.initial_shares))
@@ -596,9 +608,9 @@ class TradingDaemon:
             stop_cid,
             status=update.status,
             broker_order_id=update.broker_order_id,
-            fill_price=fill_px,
-            avg_fill_price=fill_px,
-            fee_usd=sell_fee,
+            fill_price=round(cum_avg_px, 4),
+            avg_fill_price=round(cum_avg_px, 4),
+            fee_usd=total_stop_fee,
             filled_shares=new_filled,
             reconciled_shares=new_filled,
         )
@@ -609,8 +621,8 @@ class TradingDaemon:
             setup=pos.setup,
             shares=delta,
             entry_price=pos.entry_price,
-            exit_price=fill_px,
-            fee_usd=round(alloc_buy_fee + sell_fee, 4),
+            exit_price=slice_px,
+            fee_usd=round(alloc_buy_fee + delta_fee, 4),
             risk_per_share=pos.risk_per_share,
             exit_reason=reason.value,
             entry_time=pos.entry_time.isoformat(),
@@ -618,13 +630,15 @@ class TradingDaemon:
 
         pos.shares = round(pos.shares - delta, 6)
         pos.metadata["stop_reconciled_shares"] = new_filled
+        pos.metadata["stop_reconciled_notional"] = round(new_notional, 6)
+        pos.metadata["stop_reconciled_fee"] = total_stop_fee
         if pos.shares <= 1e-5:
             self.store.remove_position(pos.symbol)
         else:
             self.store.upsert_position(pos)
-        self._sync_sim_virtual_cash(delta * fill_px - sell_fee, tier_hint)
+        self._sync_sim_virtual_cash(delta_notional - delta_fee, tier_hint)
 
-        msg = f"{pos.symbol}: server-side stop filled {delta} sh @ ${fill_px:.2f} ({reason.value})"
+        msg = f"{pos.symbol}: server-side stop filled {delta} sh @ ${slice_px:.2f} ({reason.value})"
         self.notifier.send("Server-Side Stop Triggered", msg, level="WARN")
         return msg
 
@@ -691,7 +705,7 @@ class TradingDaemon:
                     if side_str == "SELL" and self.settings.strategy_cfg.daemon.place_server_side_stop:
                         rem_pos = self.store.get_positions().get(str(fresh["symbol"]))
                         if rem_pos is not None and rem_pos.shares > 1e-5:
-                            rem_pos.broker_stop_order_id = self.gateway.place_or_update_protective_stop(
+                            rem_pos.broker_stop_order_id = self._place_stop_order(
                                 rem_pos.symbol,
                                 rem_pos.shares,
                                 rem_pos.current_stop,
@@ -1012,7 +1026,7 @@ class TradingDaemon:
                     pos.current_stop > prev_stop
                     and self.settings.strategy_cfg.daemon.place_server_side_stop
                 ):
-                    pos.broker_stop_order_id = self.gateway.place_or_update_protective_stop(
+                    pos.broker_stop_order_id = self._place_stop_order(
                         sym, pos.shares, pos.current_stop, pos.broker_stop_order_id
                     )
                 self.store.upsert_position(pos)

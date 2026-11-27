@@ -66,6 +66,38 @@ def resolve_swing_phase(now_utc: datetime) -> PipelinePhase:
     return PipelinePhase.MARKET_CLOSED
 
 
+def _compute_phase_aware_sleep_minutes(
+    now_et: datetime,
+    phase: PipelinePhase,
+    in_flight: int,
+    has_frac: bool,
+) -> int:
+    """
+    Clamps scheduler sleep duration to the next upcoming phase boundary so `IDLE_GTC_ARMED`
+    or `OPEN_GAP_GUARD` NEVER overshoots the 25-minute `EOD_DECISION_WINDOW` (`close - 25m`)!
+    """
+    if in_flight > 0:
+        return 1
+    d = now_et.date()
+    if not is_trading_day(d):
+        return 15
+    hm = now_et.hour * 60 + now_et.minute
+    close_t = session_close_time(d)
+    close_m = close_t.hour * 60 + close_t.minute
+    open_m = 9 * 60 + 30
+    eod_start_m = close_m - 25
+    post_close_m = close_m + 2
+
+    if hm < open_m:
+        return max(1, min(5, open_m - hm))
+    if hm < eod_start_m:
+        base = 15 if has_frac else 20
+        return max(1, min(base, eod_start_m - hm))
+    if hm < close_m:
+        return max(1, min(5, post_close_m - hm))
+    return 15
+
+
 class DailySwingPipeline:
     """
     Deterministic, SQLite-checkpointed 4-Phase Daily Swing Execution Pipeline (`swing_1d`).
@@ -84,21 +116,27 @@ class DailySwingPipeline:
             swing_cfg=daemon.settings.strategy_cfg.swing,
         )
 
-    def heal_overnight_gtc_stops(self, now_utc: datetime) -> List[str]:
+    def heal_overnight_gtc_stops(
+        self, now_utc: datetime, already_reconciled: bool = False
+    ) -> List[str]:
         """
         GTC Stop-Audit Healer (`PRE_OPEN_SYNC` & `POST_CLOSE_SETTLEMENT`):
           - Distinguishes `FILLED` stops (`dealt_qty > 0`, already settled by `reconcile_open_orders`)
             from exchange ex-dividend / 90-day `CANCELLED / EXPIRED / FAILED` `0`-fill GTC stops!
-          - Ensures every open whole-share (`>= 1.0 sh`) position has an active, matching-quantity
-            `GTC` stop on Futu's servers, and marks `< 1.0 sh` fractional lots as `CLIENT_FRAC_RTH`.
+          - Guards against transient Futu `order_list_query` rate-limit/RPC failures (`last_order_sync_ok`)
+            so an existing live `GTC STOP` is NEVER duplicated or wiped to `None`!
         """
         healed: List[str] = []
         d = self.daemon
         has_acc = d.gateway.has_target_account()
         broker_map = {}
+        order_sync_ok = True
         if has_acc:
-            d.reconcile_open_orders(now=now_utc)
-            for upd in d.gateway.sync_open_orders(refresh_cache=True):
+            if not already_reconciled:
+                d.reconcile_open_orders(now=now_utc)
+            synced_orders = d.gateway.sync_open_orders(refresh_cache=False)
+            order_sync_ok = bool(getattr(d.gateway, "last_order_sync_ok", True))
+            for upd in synced_orders:
                 broker_map[upd.broker_order_id] = upd
 
         daemon_cfg = d.settings.strategy_cfg.daemon
@@ -116,21 +154,26 @@ class DailySwingPipeline:
                 continue
 
             needs_rearm = False
+            prior_confirmed_terminal = False
             expected_whole_qty = float(math.floor(pos.shares))
             oid = pos.broker_stop_order_id
 
             if not oid:
                 needs_rearm = True
+                prior_confirmed_terminal = True
             elif has_acc and getattr(d.gateway, "trd_env_name", "SIMULATE") == "REAL":
+                if not order_sync_ok:
+                    # Transient RPC/rate-limit failure on `order_list_query`: NEVER assume `oid` vanished!
+                    logger.warning("Skipping GTC stop re-arm audit for %s (oid=%s): order_list_query RPC unhealthy", sym, oid)
+                    continue
                 b_upd = broker_map.get(oid)
                 if b_upd is None:
-                    # Missing from broker open/today order list -> re-arm fresh GTC stop!
+                    # Missing from today/open order list -> pass `oid` so gateway cancels/verifies before placing!
                     needs_rearm = True
                 elif b_upd.status in (OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.FAILED):
-                    # Includes both 0-fill ex-dividend cancellations AND CANCELLED_PART where remaining shares need protection!
                     needs_rearm = True
+                    prior_confirmed_terminal = True
                 elif abs(b_upd.qty - expected_whole_qty) > 1e-5:
-                    # Quantity mismatch after partial scale-out -> modify GTC stop qty immediately!
                     new_oid = d._place_stop_order(sym, pos.shares, pos.current_stop, oid)
                     if new_oid:
                         pos.broker_stop_order_id = new_oid
@@ -140,13 +183,18 @@ class DailySwingPipeline:
                     continue
 
             if needs_rearm:
-                new_oid = d._place_stop_order(sym, pos.shares, pos.current_stop, None)
-                pos.broker_stop_order_id = new_oid
-                pos.stop_order_type = f"GTC_{daemon_cfg.server_stop_order_type}"
-                d.store.upsert_position(pos)
-                healed.append(
-                    f"{sym}: re-armed server-side GTC stop ({expected_whole_qty:.0f} sh @ ${pos.current_stop:.2f}, oid={new_oid})"
-                )
+                existing_ref = None if prior_confirmed_terminal else oid
+                new_oid = d._place_stop_order(sym, pos.shares, pos.current_stop, existing_ref)
+                if new_oid:
+                    pos.broker_stop_order_id = new_oid
+                    pos.stop_order_type = f"GTC_{daemon_cfg.server_stop_order_type}"
+                    d.store.upsert_position(pos)
+                    healed.append(
+                        f"{sym}: re-armed server-side GTC stop ({expected_whole_qty:.0f} sh @ ${pos.current_stop:.2f}, oid={new_oid})"
+                    )
+                elif prior_confirmed_terminal and pos.broker_stop_order_id is not None:
+                    pos.broker_stop_order_id = None
+                    d.store.upsert_position(pos)
 
         return healed
 
@@ -287,6 +335,7 @@ class DailySwingPipeline:
                 else []
             )
             in_flight = len(d.store.get_active_orders())
+            has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
             return {
                 "trading_date": trading_date_iso,
                 "phase": phase.value,
@@ -295,7 +344,7 @@ class DailySwingPipeline:
                 "entries": [],
                 "exits": frac_exits,
                 "in_flight_orders": in_flight,
-                "next_sleep_minutes": 1 if in_flight > 0 else 15,
+                "next_sleep_minutes": _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac),
             }
 
         summary: Dict[str, Any] = {
@@ -313,7 +362,8 @@ class DailySwingPipeline:
         if phase == PipelinePhase.PRE_OPEN_SYNC:
             if has_acc:
                 broker_pos = d.gateway.get_open_positions()
-                summary["reconciliation"] = d.store.reconcile_broker_positions(broker_pos)
+                if getattr(d.gateway, "last_position_sync_ok", True):
+                    summary["reconciliation"] = d.store.reconcile_broker_positions(broker_pos)
             self._fetch_260d_universe(pool_syms)
             if hasattr(d.market_data, "calibrate_sip_iex_volume_ratios"):
                 d.market_data.calibrate_sip_iex_volume_ratios(pool_syms)  # type: ignore[attr-defined]
@@ -323,20 +373,22 @@ class DailySwingPipeline:
             if check_edgar or d.bar_cache is not None:
                 for u in scan_pool[:16]:
                     d.edgar_scanner.fetch_insider_activity(u.symbol, u.cik)
-            healed = self.heal_overnight_gtc_stops(now)
+            healed = self.heal_overnight_gtc_stops(now, already_reconciled=True)
+            in_flight = len(d.store.get_active_orders())
+            has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
             summary["gtc_healed"] = healed
             summary["upcoming_earnings_count"] = len(earn_events)
-            summary["next_sleep_minutes"] = 5
+            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac)
             d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
 
         elif phase == PipelinePhase.OPEN_GAP_GUARD:
             frac_exits = self.execute_fractional_client_stops(now)
-            healed = self.heal_overnight_gtc_stops(now)
+            healed = self.heal_overnight_gtc_stops(now, already_reconciled=True)
             summary["exits"] = frac_exits
             summary["gtc_healed"] = healed
             in_flight = len(d.store.get_active_orders())
             has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
-            summary["next_sleep_minutes"] = 1 if in_flight > 0 else (15 if has_frac else 30)
+            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac)
             d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
 
         elif phase == PipelinePhase.IDLE_GTC_ARMED:
@@ -344,7 +396,7 @@ class DailySwingPipeline:
             summary["exits"] = frac_exits
             in_flight = len(d.store.get_active_orders())
             has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
-            summary["next_sleep_minutes"] = 1 if in_flight > 0 else (15 if has_frac else 30)
+            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac)
 
         elif phase == PipelinePhase.EOD_DECISION_WINDOW:
             summary.update(self._execute_eod_decision_dag(now, now_et.date(), tier_key, tier, pool_syms, check_edgar))
@@ -366,10 +418,10 @@ class DailySwingPipeline:
 
             self._fetch_260d_universe(pool_syms)
             if has_acc:
-                summary["post_close_reconciliation"] = d.store.reconcile_broker_positions(
-                    d.gateway.get_open_positions()
-                )
-            healed = self.heal_overnight_gtc_stops(now)
+                broker_pos = d.gateway.get_open_positions()
+                if getattr(d.gateway, "last_position_sync_ok", True):
+                    summary["post_close_reconciliation"] = d.store.reconcile_broker_positions(broker_pos)
+            healed = self.heal_overnight_gtc_stops(now, already_reconciled=False)
 
             trd_env_name = getattr(d.gateway, "trd_env_name", "SIMULATE")
             open_pos = d.store.get_positions()
@@ -488,7 +540,7 @@ class DailySwingPipeline:
         if alpaca_ready and hasattr(d.market_data, "get_snapshots_batch"):
             quotes = d.market_data.get_snapshots_batch(["QQQ", "SPY", *all_target_syms])  # type: ignore[attr-defined]
         else:
-            for s in ["QQQ", *all_target_syms]:
+            for s in ["QQQ", "SPY", *all_target_syms]:
                 q_snap = d.market_data.get_quote(s)
                 if q_snap is not None:
                     quotes[s] = q_snap
@@ -789,6 +841,7 @@ class DailySwingPipeline:
                     entries_placed.append(f"{sym} x{plan.shares} @ ${plan.entry_price:.2f}")
 
         in_flight = len(d.store.get_active_orders())
+        has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
         return {
             "regime": regime.light.value,
             "reason": regime.reason,
@@ -797,7 +850,9 @@ class DailySwingPipeline:
             "entries": entries_placed,
             "exits": exits_triggered,
             "in_flight_orders": in_flight,
-            "next_sleep_minutes": 1 if in_flight > 0 else 5,
+            "next_sleep_minutes": _compute_phase_aware_sleep_minutes(
+                now_utc.astimezone(ET_TZ), PipelinePhase.EOD_DECISION_WINDOW, in_flight, has_frac
+            ),
         }
 
     def run_due_phase(

@@ -816,6 +816,7 @@ class BacktestEngine:
         positions: Dict[str, OpenPosition] = {}
         queued_next_open: List[tuple[Any, Any]] = []  # (PositionPlan, EntrySignal) queued for T+1 open in 1d mode
         closed_trades: List[Dict[str, Any]] = []
+        daily_realized_pnl: Dict[date, float] = {}
         buy_dates: List[date] = []
         stop_episode_dates: List[date] = []
         cooldown_until_d: Optional[date] = None
@@ -848,6 +849,7 @@ class BacktestEngine:
             leg_fee = alloc_buy + sell_fee
             leg_net = leg_gross - leg_fee
             gross_pnl_total += leg_gross
+            daily_realized_pnl[exit_d] = daily_realized_pnl.get(exit_d, 0.0) + leg_net
             r_mult = leg_net / max(0.01, pos.risk_per_share * sell_qty)
             closed_trades.append(
                 {
@@ -1022,8 +1024,10 @@ class BacktestEngine:
                 }
             )
 
-            # 3. Entry Evaluation (SwingWatchlistScorer + StoplossGuard + Portfolio Heat + 60d Correlation)
+            # 3. Entry Evaluation (SwingWatchlistScorer + Daily Loss Breaker + StoplossGuard + Heat + Correlation)
             if regime.light == RegimeLight.RED:
+                continue
+            if daily_realized_pnl.get(cur_d, 0.0) <= -abs(curr_eq * tier.max_daily_loss_pct):
                 continue
             if cooldown_until_d is not None and cur_d <= cooldown_until_d:
                 continue
@@ -1137,10 +1141,11 @@ class BacktestEngine:
                     continue
 
                 # Single-Asset Cap + Portfolio Heat (Principal & Open-Equity Drawdown) + Sector Cap + 60d Correlation
+                is_etf = sector.endswith("_ETF")
                 single_cap = (
-                    tier.max_sector_etf_pct
-                    if sector.endswith("_ETF")
-                    else tier.max_single_equity_pct
+                    min(tier.max_position_pct, tier.max_sector_etf_pct if is_etf else tier.max_single_equity_pct)
+                    if (tier.enforce_swing_caps or tier.max_concurrent_positions >= 3)
+                    else tier.max_position_pct
                 )
                 if (plan.notional_usd / max(1.0, curr_eq)) > single_cap + 1e-6:
                     continue

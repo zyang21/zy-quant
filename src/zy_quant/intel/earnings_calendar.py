@@ -81,8 +81,13 @@ class EarningsCalendarFeed:
             return {}
 
         today = ref_day or now.astimezone(ET_TZ).date()
-        fetched: Dict[str, EarningsEvent] = {}
+        stale_disk = self._read_disk_cache(now, ignore_ttl=True)
+        merged: Dict[str, EarningsEvent] = dict(stale_disk) if stale_disk else {}
+        forward_expected = 0
+        forward_ok = 0
         any_http_ok = False
+        transport_failed = False
+
         try:
             owned = self._http_client is None
             client = self._http_client or httpx.Client(timeout=6.0, headers=self.HEADERS)
@@ -92,10 +97,16 @@ class EarningsCalendarFeed:
                     q_day = today + timedelta(days=offset)
                     if q_day.weekday() >= 5:
                         continue
+                    if q_day >= today:
+                        forward_expected += 1
                     resp = client.get(self.NASDAQ_URL, params={"date": q_day.isoformat()})
                     if resp.status_code != 200:
                         continue
                     any_http_ok = True
+                    if q_day >= today:
+                        forward_ok += 1
+                    # Only replace cached entries belonging to this confirmed HTTP-200 date!
+                    merged = {k: v for k, v in merged.items() if v.report_date != q_day}
                     rows = ((resp.json().get("data") or {}).get("rows")) or []
                     for r in rows:
                         sym = str(r.get("symbol") or "").strip().upper()
@@ -103,29 +114,30 @@ class EarningsCalendarFeed:
                             continue
                         timing = normalize_nasdaq_earnings_timing(str(r.get("time") or ""))
                         ev = EarningsEvent(symbol=sym, report_date=q_day, timing=timing)
-                        if sym not in fetched:
-                            fetched[sym] = ev
+                        if sym not in merged:
+                            merged[sym] = ev
                         else:
-                            prev_d = fetched[sym].report_date
+                            prev_d = merged[sym].report_date
                             if (q_day >= today and prev_d < today) or (
                                 abs((q_day - today).days) < abs((prev_d - today).days)
                             ):
-                                fetched[sym] = ev
+                                merged[sym] = ev
             finally:
                 if owned:
                     client.close()
         except Exception as exc:
-            logger.debug("Earnings calendar network refresh skipped: %s", exc)
+            transport_failed = True
+            logger.debug("Earnings calendar network refresh interrupted: %s", exc)
 
-        if any_http_ok:
-            self._mem_cache = (now, fetched)
-            self._write_disk_cache(now, fetched)
-            return self._filter(fetched, target_set)
+        # Only persist refreshed TTL when forward window succeeded without mid-loop transport truncation!
+        forward_complete = (forward_expected == 0) or (forward_ok == forward_expected)
+        if any_http_ok and not transport_failed and forward_complete:
+            self._mem_cache = (now, merged)
+            self._write_disk_cache(now, merged)
+            return self._filter(merged, target_set)
 
-        # Never poison disk/memory cache with `{}` on network failure; fall back to stale disk cache if present!
-        stale_disk = self._read_disk_cache(now, ignore_ttl=True)
-        if stale_disk is not None:
-            return self._filter(stale_disk, target_set)
+        if merged:
+            return self._filter(merged, target_set)
         return {}
 
     def get_upcoming_earnings(
