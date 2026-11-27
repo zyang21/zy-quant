@@ -673,8 +673,9 @@ class TradingDaemon:
                 continue
 
             broker_oid = str(order_row.get("broker_order_id") or "")
+            cancel_ok = True
             if broker_oid:
-                self.gateway.cancel_order(broker_oid)
+                cancel_ok = self.gateway.cancel_order(broker_oid)
                 # Re-poll once after cancel in case additional shares filled right before cancel
                 for upd in self.gateway.sync_open_orders(refresh_cache=True):
                     if upd.broker_order_id == broker_oid:
@@ -684,7 +685,11 @@ class TradingDaemon:
 
             with self._order_lock:
                 fresh = self.store.get_order(cid)
-                if fresh and fresh["status"] != OrderStatus.FILLED.value:
+                if (
+                    fresh
+                    and fresh["status"] != OrderStatus.FILLED.value
+                    and (cancel_ok or fresh["status"] in (OrderStatus.CANCELLED.value, OrderStatus.EXPIRED.value, OrderStatus.FAILED.value))
+                ):
                     filled_sh = float(fresh.get("filled_shares") or 0.0)
                     term_status = (
                         OrderStatus.CANCELLED if filled_sh > 0.0 else OrderStatus.EXPIRED
@@ -907,6 +912,7 @@ class TradingDaemon:
 
         # 1. Always step & protect existing open positions (even during YELLOW/RED regimes)
         exits_triggered: List[str] = []
+        open_positions = self.store.get_positions()
         for sym, pos in list(open_positions.items()):
             # Skip duplicate exit evaluation while an exit order for this symbol is already in-flight
             if self.store.get_active_orders(side=OrderSide.SELL, symbol=sym):
@@ -970,41 +976,46 @@ class TradingDaemon:
                     if has_target_acc:
                         # Async broker lifecycle (SIMULATE sub-account or REAL):
                         # Keep position intact in SQLite until ZyTradeOrderHandler / sync_open_orders confirms fill!
+                        prior_stop_oid = pos.broker_stop_order_id
                         if is_scale_out:
                             pos.scaled_out = prev_scaled_out
                             pos.current_stop = prev_stop
                             pos.breakeven_armed = prev_be_armed
-                        if pos.broker_stop_order_id and action.shares_to_sell >= pos.shares:
-                            self.gateway.cancel_order(pos.broker_stop_order_id)
+                        if prior_stop_oid and action.shares_to_sell >= pos.shares - 1e-5:
+                            if not self.gateway.cancel_order(prior_stop_oid):
+                                self.store.update_order_status(
+                                    cid,
+                                    status=OrderStatus.FAILED,
+                                    reason=f"{action.note} | Aborted SELL: existing stop {prior_stop_oid} cancel failed",
+                                )
+                                continue
                             pos.broker_stop_order_id = None
-                        self.store.upsert_position(pos)
+                        with self._order_lock:
+                            live_p = self.store.get_positions().get(sym)
+                            if live_p is None or abs(live_p.shares - pos.shares) > 1e-5:
+                                self.store.update_order_status(
+                                    cid,
+                                    status=OrderStatus.CANCELLED,
+                                    reason=f"{action.note} | Position changed concurrently before SELL submit",
+                                )
+                                continue
+                            self.store.upsert_position(pos)
 
                         broker_oid = self.gateway.place_limit_order(
                             sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, remark=cid
                         )
-                        if broker_oid:
-                            # Guard against fast synchronous/thread push that may have already updated status!
-                            with self._order_lock:
-                                curr_ord = self.store.get_order(cid)
-                                if curr_ord and curr_ord["status"] == OrderStatus.PENDING.value:
-                                    self.store.update_order_status(
-                                        cid,
-                                        status=OrderStatus.SUBMITTED,
-                                        broker_order_id=broker_oid,
-                                    )
-                                elif curr_ord and not curr_ord.get("broker_order_id"):
-                                    self.store.update_order_status(
-                                        cid,
-                                        status=OrderStatus(curr_ord["status"]),
-                                        broker_order_id=broker_oid,
-                                    )
+                        if self._mark_order_submitted_safely(
+                            cid, broker_oid, f"{action.note} | Broker rejected SELL submission"
+                        ):
                             exits_triggered.append(f"{sym} SUBMITTED ({action.note})")
-                        else:
-                            self.store.update_order_status(
-                                cid,
-                                status=OrderStatus.FAILED,
-                                reason=f"{action.note} | Broker rejected SELL submission",
-                            )
+                        elif not is_scale_out and self.settings.strategy_cfg.daemon.place_server_side_stop:
+                            with self._order_lock:
+                                rem_p = self.store.get_positions().get(sym)
+                                if rem_p is not None and rem_p.shares > 1e-5 and not rem_p.broker_stop_order_id:
+                                    rem_p.broker_stop_order_id = self._place_stop_order(
+                                        sym, rem_p.shares, rem_p.current_stop, None
+                                    )
+                                    self.store.upsert_position(rem_p)
                     else:
                         # PAPER-LOCAL mode (no Futu sub-account): preserve immediate virtual fill
                         self._settle_paper_local_sell(
@@ -1021,15 +1032,18 @@ class TradingDaemon:
                             open_positions.pop(sym, None)
                         exits_triggered.append(f"{sym} ({action.note})")
             else:
-                # If Chandelier / Breakeven ratcheted stop upward, sync protective stop to Futu server!
-                if (
-                    pos.current_stop > prev_stop
-                    and self.settings.strategy_cfg.daemon.place_server_side_stop
-                ):
-                    pos.broker_stop_order_id = self._place_stop_order(
-                        sym, pos.shares, pos.current_stop, pos.broker_stop_order_id
-                    )
-                self.store.upsert_position(pos)
+                # If Chandelier / Breakeven ratcheted stop upward, sync protective stop under _order_lock!
+                with self._order_lock:
+                    live_p = self.store.get_positions().get(sym)
+                    if live_p is not None and abs(live_p.shares - pos.shares) <= 1e-5:
+                        if (
+                            pos.current_stop > prev_stop
+                            and self.settings.strategy_cfg.daemon.place_server_side_stop
+                        ):
+                            pos.broker_stop_order_id = self._place_stop_order(
+                                sym, pos.shares, pos.current_stop, live_p.broker_stop_order_id
+                            )
+                        self.store.upsert_position(pos)
 
         # Refresh open_positions snapshot in case push callback settled an exit immediately
         open_positions = self.store.get_positions()

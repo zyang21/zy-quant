@@ -403,18 +403,27 @@ class DailySwingPipeline:
             d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
 
         elif phase == PipelinePhase.POST_CLOSE_SETTLEMENT:
-            # Cancel any dangling DAY limit orders left unfilled past market close
+            # Cancel any dangling DAY limit orders left unfilled past market close (with fill-race re-poll)
             cancelled_day: List[str] = []
             for ord_row in d.store.get_active_orders():
+                cid = str(ord_row["client_order_id"])
                 b_oid = str(ord_row.get("broker_order_id") or "")
-                if b_oid:
-                    d.gateway.cancel_order(b_oid)
-                d.store.update_order_status(
-                    str(ord_row["client_order_id"]),
-                    status=OrderStatus.CANCELLED if float(ord_row.get("filled_shares") or 0.0) > 0 else OrderStatus.EXPIRED,
-                    reason=f"{ord_row.get('reason') or ''} | Post-close settlement sweep".strip(" |"),
-                )
-                cancelled_day.append(str(ord_row["client_order_id"]))
+                cancel_ok = True
+                if b_oid and has_acc:
+                    cancel_ok = d.gateway.cancel_order(b_oid)
+                    for upd in d.gateway.sync_open_orders(refresh_cache=True):
+                        if upd.broker_order_id == b_oid:
+                            d.on_broker_order_update(upd)
+                with d._order_lock:
+                    fresh = d.store.get_order(cid)
+                    if fresh and fresh["status"] != OrderStatus.FILLED.value and (cancel_ok or not has_acc):
+                        f_sh = float(fresh.get("filled_shares") or 0.0)
+                        d.store.update_order_status(
+                            cid,
+                            status=OrderStatus.CANCELLED if f_sh > 0.0 else OrderStatus.EXPIRED,
+                            reason=f"{fresh.get('reason') or ''} | Post-close settlement sweep".strip(" |"),
+                        )
+                        cancelled_day.append(cid)
 
             self._fetch_260d_universe(pool_syms)
             if has_acc:
@@ -614,6 +623,7 @@ class DailySwingPipeline:
 
         # --- Step (b): Step Open Positions (Pre-Earnings Cushion, Time Stop, Chandelier GTC Ratchet) ---
         exits_triggered: List[str] = []
+        open_positions = d.store.get_positions()
         for sym, pos in list(open_positions.items()):
             if d.store.get_active_orders(side=OrderSide.SELL, symbol=sym):
                 continue
@@ -646,7 +656,7 @@ class DailySwingPipeline:
             if action.should_exit and action.shares_to_sell > 0:
                 is_partial_exit = action.shares_to_sell < pos.shares - 1e-5
                 post_scale_stop = pos.current_stop
-                cid = f"EXIT-{sym}-{session_date.strftime('%Y%m%d')}-{action.reason.value if action.reason else 'X'}"
+                cid = f"EXIT-{sym}-{now_utc.strftime('%Y%m%d%H%M%S')}-{action.reason.value if action.reason else 'X'}"
                 exit_plan_meta = {
                     "symbol": sym,
                     "entry_price": pos.entry_price,
@@ -663,15 +673,32 @@ class DailySwingPipeline:
                     cid, sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, action.note, plan_meta=exit_plan_meta, created_at=now_utc
                 ):
                     if has_acc:
+                        prior_stop_oid = pos.broker_stop_order_id
                         if is_partial_exit:
                             pos.scaled_out = prev_scaled
                             pos.current_stop = prev_stop
                             pos.breakeven_armed = prev_be
                             pos.earnings_cushion_applied_date = prev_earn_date
-                        elif pos.broker_stop_order_id:
-                            d.gateway.cancel_order(pos.broker_stop_order_id)
+                        elif prior_stop_oid:
+                            if not d.gateway.cancel_order(prior_stop_oid):
+                                # Short-flip guard: abort duplicate full SELL while live GTC STOP could not be cancelled!
+                                d.store.update_order_status(
+                                    cid,
+                                    status=OrderStatus.FAILED,
+                                    reason=f"{action.note} | Aborted SELL: existing GTC stop {prior_stop_oid} cancel failed",
+                                )
+                                continue
                             pos.broker_stop_order_id = None
-                        d.store.upsert_position(pos)
+                        with d._order_lock:
+                            live_p = d.store.get_positions().get(sym)
+                            if live_p is None or abs(live_p.shares - pos.shares) > 1e-5:
+                                d.store.update_order_status(
+                                    cid,
+                                    status=OrderStatus.CANCELLED,
+                                    reason=f"{action.note} | Position changed concurrently before SELL submit",
+                                )
+                                continue
+                            d.store.upsert_position(pos)
                         # Marketable sell limit anchored to live price so stop exits never hang above market!
                         q_live = quotes.get(sym)
                         live_ref = q_live.bid if (q_live and q_live.bid > 0) else today_bar.close
@@ -684,17 +711,29 @@ class DailySwingPipeline:
                         )
                         if d._mark_order_submitted_safely(cid, b_oid, f"{action.note} | Broker rejected SELL"):
                             exits_triggered.append(f"{sym} SUBMITTED ({action.note})")
+                        elif not is_partial_exit and d.settings.strategy_cfg.daemon.place_server_side_stop:
+                            # Naked-position guard: full-exit SELL failed after cancelling GTC stop -> re-arm immediately!
+                            with d._order_lock:
+                                rem_p = d.store.get_positions().get(sym)
+                                if rem_p is not None and rem_p.shares > 1e-5 and not rem_p.broker_stop_order_id:
+                                    rem_p.broker_stop_order_id = d._place_stop_order(
+                                        sym, rem_p.shares, rem_p.current_stop, None
+                                    )
+                                    d.store.upsert_position(rem_p)
                     else:
                         d._settle_paper_local_sell(
                             cid, sym, pos, action.shares_to_sell, action.exit_price, action.reason.value if action.reason else "EXIT", tier_key, tier
                         )
                         exits_triggered.append(f"{sym} ({action.note})")
             else:
-                if pos.current_stop > prev_stop and d.settings.strategy_cfg.daemon.place_server_side_stop:
-                    pos.broker_stop_order_id = d._place_stop_order(
-                        sym, pos.shares, pos.current_stop, pos.broker_stop_order_id
-                    )
-                d.store.upsert_position(pos)
+                with d._order_lock:
+                    live_p = d.store.get_positions().get(sym)
+                    if live_p is not None and abs(live_p.shares - pos.shares) <= 1e-5:
+                        if pos.current_stop > prev_stop and d.settings.strategy_cfg.daemon.place_server_side_stop:
+                            pos.broker_stop_order_id = d._place_stop_order(
+                                sym, pos.shares, pos.current_stop, live_p.broker_stop_order_id
+                            )
+                        d.store.upsert_position(pos)
 
         # --- Step (c): 100-Stock Daily RS Ranking & Swing Entry Signals ---
         insiders: Dict[str, InsiderActivity] = {}

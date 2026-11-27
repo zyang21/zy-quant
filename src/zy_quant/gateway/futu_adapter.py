@@ -599,7 +599,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 return 0.0
 
         row_ccy = str(row.get("currency") or "").strip().upper()
-        is_usd_denominated = queried_usd_ok or row_ccy == "USD"
+        is_usd_denominated = (queried_usd_ok and row_ccy in ("", "USD")) or row_ccy == "USD"
         if is_usd_denominated:
             equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
             has_us_cash_field = "us_cash" in row and row.get("us_cash") not in (None, "N/A", "")
@@ -786,10 +786,23 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             if ret == ft.RET_OK:
                 return existing_order_id
 
-            # Short-flip prevention: NEVER submit a second GTC STOP while `existing_order_id` may still be live!
+            # Short-flip prevention: NEVER submit a second GTC STOP if `existing_order_id` already filled
+            # or partially filled, or if it may still be live and could not be cancelled!
             open_map = {u.broker_order_id: u for u in self.sync_open_orders(refresh_cache=True)}
             prev_ord = open_map.get(existing_order_id)
-            if prev_ord is None or prev_ord.status.is_active:
+            if prev_ord is not None and (
+                prev_ord.status == OrderStatus.FILLED or prev_ord.filled_shares > 1e-6
+            ):
+                logger.warning(
+                    "Existing GTC stop %s for %s already filled (%s sh, status=%s); dispatching fill and aborting replacement STOP",
+                    existing_order_id,
+                    symbol,
+                    prev_ord.filled_shares,
+                    prev_ord.status.value,
+                )
+                self._dispatch_order_update(prev_ord)
+                return existing_order_id
+            if not self.last_order_sync_ok or prev_ord is None or prev_ord.status.is_active:
                 if not self.cancel_order(existing_order_id):
                     logger.error(
                         "Refusing to place duplicate GTC STOP for %s while existing stop %s could not be cancelled",
@@ -818,14 +831,13 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         return str(df.iloc[0]["order_id"])
 
     def cancel_order(self, order_id: str) -> bool:
-        if (
-            not self.is_connected()
-            or self._trade_ctx is None
-            or not order_id
-            or order_id.startswith(("SIM-", "PAPER-"))
-        ):
+        if not order_id or order_id.startswith(("SIM-", "PAPER-")):
             return True
+        if not self.is_connected() or self._trade_ctx is None:
+            return False
         acc_id = self._select_acc_id(self.trd_env_name)
+        if acc_id == 0:
+            return False
         ft = self._futu_mod
         with self._rpc_lock:
             ret, _ = self._trade_ctx.modify_order(

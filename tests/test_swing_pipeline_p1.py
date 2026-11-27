@@ -1149,3 +1149,142 @@ def test_round2_rpc_failure_safety_phase_sleep_tier1k_and_hkd_isolation(tmp_path
     rec_st = store_st.reconcile_stateful_ledger("tier_10k", t_10k.reference_equity_usd)
     assert rec_st["ok"] is True
     assert abs(rec_st["drift_usd"]) <= 0.01
+
+
+def test_round3_filled_gtc_stop_guard_cancel_safety_and_phantom_position_guard(tmp_path: Path) -> None:
+    """
+    Regression tests for all Round-3 Review Findings (#1..#3):
+      1. `place_or_update_protective_stop` NEVER submits a replacement `SELL STOP` when `existing_order_id`
+         already `FILLED` (or partially filled), dispatching the fill instead (zero short-flip!)
+      2. `cancel_order()` returns `False` for real broker order IDs when disconnected / `acc_id == 0`,
+         full `SELL` exit aborts if `cancel_order` fails, and re-arms `GTC STOP` if `place_limit_order` fails!
+      3. Concurrent `ZyTradeOrderHandler` stop-fill deletion during `_execute_eod_decision_dag` I/O
+         cannot be resurrected as a phantom SQLite position by Step (b)!
+    """
+    adapter = FutuGatewayAdapter(trd_env="REAL")
+    # 2a. Disconnected `cancel_order` MUST return `False` for real broker IDs, `True` for SIM-* IDs!
+    assert adapter.cancel_order("SIM-LOCAL-STOP-NVDA") is True
+    assert adapter.cancel_order("GTC-REAL-9001") is False
+
+    class DummyFutuR3:
+        RET_OK = 0
+
+        class TrdEnv:
+            REAL = "REAL"
+
+        class TrdSide:
+            SELL = "SELL"
+
+        class OrderType:
+            STOP = "STOP"
+
+        class TimeInForce:
+            GTC = "GTC"
+
+        class ModifyOrderOp:
+            NORMAL = "NORMAL"
+            CANCEL = "CANCEL"
+
+    class FilledStopCtx:
+        def __init__(self) -> None:
+            self.placed: List[Dict[str, Any]] = []
+
+        def get_acc_list(self) -> tuple[int, pd.DataFrame]:
+            return 0, pd.DataFrame([{"acc_id": 555, "trd_env": "REAL", "acc_type": "MARGIN"}])
+
+        def modify_order(self, **kwargs: Any) -> tuple[int, Any]:
+            return -1, "Order already filled"
+
+        def place_order(self, **kwargs: Any) -> tuple[int, pd.DataFrame]:
+            self.placed.append(kwargs)
+            return 0, pd.DataFrame([{"order_id": "BAD-DUP-STOP"}])
+
+    f_ctx = FilledStopCtx()
+    adapter._futu_mod = DummyFutuR3
+    adapter._trade_ctx = f_ctx
+    adapter.is_connected = lambda: True  # type: ignore[method-assign]
+    dispatched: List[BrokerOrderUpdate] = []
+    adapter.register_order_callback(dispatched.append)
+
+    def _sync_filled(refresh_cache: bool = False) -> List[BrokerOrderUpdate]:
+        adapter.last_order_sync_ok = True
+        return [
+            BrokerOrderUpdate(
+                "GTC-10", "NVDA", OrderSide.SELL, "STOP", OrderStatus.FILLED, "FILLED_ALL", 10.0, 140.0, 10.0, 140.0
+            )
+        ]
+
+    adapter.sync_open_orders = _sync_filled  # type: ignore[method-assign]
+    out_oid = adapter.place_or_update_protective_stop("NVDA", 10.0, 145.0, existing_order_id="GTC-10")
+    assert out_oid == "GTC-10"
+    assert len(f_ctx.placed) == 0  # ZERO duplicate GTC STOP placed on already-filled stop!
+    assert len(dispatched) == 1 and dispatched[0].status == OrderStatus.FILLED
+
+    # 2b & 3. Full SELL exit cancel-failure guard, naked-stop re-arm on rejected SELL, & phantom resurrection guard
+    settings = AppSettings.load()
+    store = StateStore(tmp_path / "r3_eod.db")
+    daemon = TradingDaemon(settings, store=store, notifier=AlertNotifier())
+    pipe = DailySwingPipeline(daemon)
+
+    target_d = date(2026, 11, 25)
+    now_eod = datetime(2026, 11, 25, 15, 45, tzinfo=ET_TZ).astimezone(timezone.utc)
+    d_map = {
+        sym: _make_daily_series(sym, n_days=120, end_d=date(2026, 11, 24), start_px=150.0, seed_offset=i * 3)
+        for i, sym in enumerate(["QQQ", "SPY", "XOM", "JPM"])
+    }
+    pipe._fetch_260d_universe = lambda syms: d_map  # type: ignore[method-assign]
+    daemon.earnings_feed.get_upcoming_events = lambda **kw: {  # type: ignore[method-assign]
+        "XOM": EarningsEvent("XOM", target_d, "AMC"),  # Triggers 100% full exit (< +1.0R)!
+    }
+    daemon.market_data.has_credentials = lambda: False  # type: ignore[method-assign]
+    daemon.market_data.get_bars = lambda sym, timeframe="15m", days=2: []  # type: ignore[method-assign]
+    daemon.market_data.get_quote = lambda sym: QuoteSnapshot(sym, 152.0, 151.9, 152.1, 900_000_000.0, now_eod)  # type: ignore[method-assign]
+    daemon.gateway.trd_env_name = "REAL"
+    daemon.gateway.has_target_account = lambda: True  # type: ignore[method-assign]
+    daemon.gateway.is_connected = lambda: True  # type: ignore[method-assign]
+    daemon.gateway.get_account_summary = lambda: {"equity_usd": 10000.0, "cash_usd": 0.0}  # type: ignore[method-assign]
+
+    # XOM will trigger full pre-earnings exit; JPM will evaluate non-exit ratchet!
+    store.upsert_position(
+        OpenPosition("XOM", "Energy", 10.0, 10.0, 150.0, now_eod - timedelta(days=3), 140.0, 140.0, 153.0, 10.0, broker_stop_order_id="STOP-XOM-1")
+    )
+    store.upsert_position(
+        OpenPosition("JPM", "Financials", 10.0, 10.0, 150.0, now_eod - timedelta(days=3), 140.0, 140.0, 153.0, 10.0, broker_stop_order_id="STOP-JPM-1")
+    )
+
+    sell_attempts: List[str] = []
+    rearmed_stops: List[str] = []
+    cancel_should_succeed = False
+    daemon.gateway.cancel_order = lambda oid: cancel_should_succeed  # type: ignore[method-assign]
+    daemon.gateway.place_limit_order = lambda sym, side, qty, px, remark="": (sell_attempts.append(sym) or None)  # type: ignore[method-assign]
+    daemon._place_stop_order = lambda sym, sh, px, oid=None: (rearmed_stops.append(sym) or f"REARMED-{sym}")  # type: ignore[method-assign]
+
+    # Case A: `cancel_order` returns False -> full SELL must abort (0 `place_limit_order` calls, STOP-XOM-1 kept!)
+    tier_10k = settings.tiers_cfg.get_active("tier_10k")
+    pipe._execute_eod_decision_dag(now_eod, target_d, "tier_10k", tier_10k, ["XOM"], check_edgar=False)
+    assert sell_attempts == []
+    assert store.get_positions()["XOM"].broker_stop_order_id == "STOP-XOM-1"
+
+    # Case B: Reset XOM earnings flag, `cancel_order` succeeds, `place_limit_order` fails (`None`) ->
+    # MUST immediately re-arm XOM's GTC stop so position is NEVER left naked!
+    # ALSO simulate concurrent push-thread stop fill deleting JPM during `get_upcoming_events` I/O ->
+    # JPM MUST NOT be resurrected as a phantom open position!
+    p_xom = store.get_positions()["XOM"]
+    p_xom.earnings_cushion_applied_date = None
+    store.upsert_position(p_xom)
+    cancel_should_succeed = True
+
+    orig_step = daemon.exit_engine.step_daily_position
+
+    def _step_with_concurrent_jpm_close(pos: OpenPosition, *a: Any, **kw: Any) -> Any:
+        res = orig_step(pos, *a, **kw)
+        if pos.symbol == "JPM":
+            store.remove_position("JPM")  # Concurrent ZyTradeOrderHandler closed JPM mid-Step (b)!
+        return res
+
+    daemon.exit_engine.step_daily_position = _step_with_concurrent_jpm_close  # type: ignore[method-assign]
+    pipe._execute_eod_decision_dag(now_eod + timedelta(minutes=1), target_d, "tier_10k", tier_10k, ["XOM"], check_edgar=False)
+
+    final_positions = store.get_positions()
+    assert "JPM" not in final_positions  # Closed JPM was NOT resurrected!
+    assert final_positions["XOM"].broker_stop_order_id == "REARMED-XOM"  # XOM re-armed after rejected SELL!
