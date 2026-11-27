@@ -96,6 +96,9 @@ Non-secret runtime settings live in tracked `config/settings.json`. Credentials 
 # while keeping the launchd pre-market StartCalendarInterval armed
 ./deploy/stop.sh
 
+# Completely uninstall launchd plist, kill all processes, restore sleep, and cancel pmset wake timers
+./deploy/stop.sh --superkill
+
 # Optional: wake Mac hardware from deep sleep on AC power 1m before pre-market check
 sudo pmset repeat wakeorpoweron MTWRF 21:19:00   # Summer (EDT)
 sudo pmset repeat wakeorpoweron MTWRF 22:19:00   # Winter (EST)

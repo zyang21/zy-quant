@@ -453,6 +453,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_svc = sub.add_parser("service", help="Manage macOS launchd background service (start|stop|restart)")
     p_svc.add_argument("action", choices=["start", "stop", "restart"], help="Service lifecycle action")
+    p_svc.add_argument("--superkill", action="store_true", help="Completely uninstall launchd schedule, processes & wake timers")
 
     p_fee = sub.add_parser("fee-calc", help="Calculate exact 2026 Futu HK US round-trip friction")
     p_fee.add_argument("--shares", type=float, required=True)
@@ -526,10 +527,15 @@ def main() -> None:
 
         if args.action == "stop":
             if stop_sh.exists():
-                subprocess.run(["/bin/bash", str(stop_sh)], check=False)
+                cmd = ["/bin/bash", str(stop_sh)]
+                if args.superkill:
+                    cmd.append("--superkill")
+                subprocess.run(cmd, check=False)
             else:
                 manual_flag.unlink(missing_ok=True)
                 subprocess.run(["launchctl", "bootout", f"gui/{uid}/com.zyquant.daemon"], check=False)
+                if args.superkill and plist.exists():
+                    plist.unlink()
                 print("Background service stopped.")
         elif args.action in ("start", "restart"):
             manual_flag.parent.mkdir(parents=True, exist_ok=True)

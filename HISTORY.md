@@ -27,3 +27,16 @@ Archive of completed roadmap milestones, architecture upgrades, and backtest ver
   - `tier_1k`: Net `-4.45%` (`-$44.48`) -> **`-0.79%` (`-$7.88`)**, Gross `-$1.78` -> **`+$35.00`**, PF `0.60 -> 0.93`, Max DD `6.73% -> 5.58%`.
   - `tier_10k`: Net `-0.71%` (`-$71.21`) -> **`+1.78%` (`+$178.20`)**, Gross `+$63.22` -> **`+$342.74`**, Win Rate `34.6% -> 52.8%`, PF `0.91 -> 1.19`, Max DD `6.30% -> 4.65%`.
   - `tier_100k`: Net `-1.43%` (`-$1,429.96`) -> **`+0.66%` (`+$661.00`)**, Gross `-$875.06` -> **`+$1,294.77`**, Win Rate `47.0% -> 51.9%`, PF `0.83 -> 1.08`, Max DD `4.33% -> 3.76%`.
+
+---
+
+## 2026-11-26 — `[P1]` Alpaca Market Data v2, 100-Stock Sector Universe, SQLite BarCache & Zero-Lookahead Fixes
+- **Branch / Commits:** `feat/alpaca-universe` (`84d3a39`, merged in `bfd8a2e`)
+- **Delivered Scope:**
+  - Implemented `AlpacaMarketDataAdapter` (`src/zy_quant/gateway/alpaca_adapter.py`) with 100-symbol batch `/v2/stocks/snapshots` (`2.78s` full-pool scan, zero Futu quota), paginated split-adjusted `15m` (strictly US RTH + early-close filtered) / `1d` bars, historical `sip -> iex` fallback, and surgical head/tail delta fetching.
+  - Added `HistoricalBarCache` (`src/zy_quant/storage/bar_cache.py`, `data/cache/market_bars.db`), caching `1,170,630` real bars across `112` symbols (`55D` 100-stock backtest in `0.7s`, `1.5Y` backtest in `5.3s`) and removing the 58-day ceiling in `BacktestEngine` & Web UI.
+  - Expanded universe to **100 cross-sector institutional equities + 12 sector/broad ETFs** (`config/universe_100.yaml`), enforced GICS Sector Cap (`max_per_sector_in_top_n: 3`), added `PointInTimeUniverseFilter` + 85/120 buffer rebalancer (`universe_manager.py`), and wired Nasdaq `EarningsCalendarFeed` (`America/New_York` date-anchored).
+  - Hardened `deploy/run_daemon.sh`, `deploy/start.sh`, `deploy/stop.sh`, and `zy-quant service` CLI (`.manual_start` flag sync, scheduled post-market auto-exit releasing `caffeinate -is`, non-blocking `sudo -n`).
+  - Eliminated `[CRITICAL]` same-day `1d` close look-ahead leak via `bisect_left` across `BacktestEngine`, `IntradaySignalEngine`, and `MarketRegimeDetector` (locked by poison-bar regression test; 33/33 tests passing).
+- **Key Quantitative Finding (1.17M Real Bars, Zero Look-Ahead, `2025-05 -> 2026-11`):**
+  - High-frequency 15m trading (`~300 trades/yr`) suffered heavy noise & friction drag on `$5k / $10k` even under simulated IBKR `$0.35` fees (`-7.4%` / `-13.8%`), whereas **Low-Frequency Multi-Week Swing on Futu HK** (`~38 trades / 1.5Y`) delivered **`+9.87%` net on `$5k` (`PF 1.23`, DD `12.9%`), `+10.29%` net on `$10k` (`PF 1.20`, DD `11.5%`), and `+24.21%` net on unlocked 4-slot `$100k` (`PF 1.17`)**.

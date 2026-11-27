@@ -12,7 +12,7 @@ PLIST_DST="${HOME}/Library/LaunchAgents/${LABEL}.plist"
 MANUAL_FLAG="${ROOT_DIR}/data/.manual_start"
 
 ENABLE_CLAMSHELL=0
-if [[ "${1:-}" == "--clamshell" ]]; then
+if [[ "${1:-}" == "--clamshell" || "${1:-}" == "—clamshell" ]]; then
     ENABLE_CLAMSHELL=1
 fi
 
