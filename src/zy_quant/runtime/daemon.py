@@ -554,6 +554,38 @@ class TradingDaemon:
             )
             return event_summary
 
+    def _cancel_or_verify_dead_stop(
+        self, symbol: str, stop_oid: Optional[str], expected_shares: float
+    ) -> bool:
+        """
+        Safely cancels an active server-side protective stop before submitting a full `SELL` exit:
+          - Returns `True` if `cancel_order()` succeeded OR if `stop_oid` is confirmed `0`-fill
+            terminal (`CANCELLED`/`EXPIRED`/`FAILED`) / historical while broker still holds `expected_shares`.
+          - Dispatches fill and returns `False` if `stop_oid` already filled/partially filled,
+            or if cancellation/RPC failed!
+        """
+        if not stop_oid:
+            return True
+        if self.gateway.cancel_order(stop_oid):
+            return True
+        synced = self.gateway.sync_open_orders(refresh_cache=True)
+        if not getattr(self.gateway, "last_order_sync_ok", False):
+            return False
+        st_upd = {u.broker_order_id: u for u in synced}.get(stop_oid)
+        if st_upd is not None:
+            if st_upd.status == OrderStatus.FILLED or st_upd.filled_shares > 1e-6:
+                self.on_broker_order_update(st_upd)
+                return False
+            if st_upd.status.is_terminal:
+                return True
+            return False
+        broker_pos = self.gateway.get_open_positions()
+        held_qty = float((broker_pos.get(symbol.upper()) or {}).get("shares", 0.0))
+        return bool(
+            getattr(self.gateway, "last_position_sync_ok", False)
+            and held_qty >= expected_shares - 1e-5
+        )
+
     def _handle_protective_stop_update(
         self, pos: OpenPosition, update: BrokerOrderUpdate
     ) -> Optional[str]:
@@ -561,6 +593,18 @@ class TradingDaemon:
         new_filled = max(prev_stop_filled, float(update.filled_shares or 0.0))
         delta = round(new_filled - prev_stop_filled, 6)
         if delta <= 1e-6:
+            if (
+                update.status.is_terminal
+                and update.status != OrderStatus.FILLED
+                and pos.shares > 1e-5
+                and pos.broker_stop_order_id == update.broker_order_id
+            ):
+                pos.broker_stop_order_id = None
+                self.store.upsert_position(pos)
+                return (
+                    f"{pos.symbol}: server-side stop {update.broker_order_id} ended "
+                    f"{update.status.value} (0 delta); cleared stop ID for re-arm"
+                )
             return None
 
         cum_avg_px = float(update.avg_fill_price or update.price or pos.current_stop)
@@ -981,8 +1025,21 @@ class TradingDaemon:
                             pos.scaled_out = prev_scaled_out
                             pos.current_stop = prev_stop
                             pos.breakeven_armed = prev_be_armed
-                        if prior_stop_oid and action.shares_to_sell >= pos.shares - 1e-5:
-                            if not self.gateway.cancel_order(prior_stop_oid):
+                            if prior_stop_oid and self.settings.strategy_cfg.daemon.place_server_side_stop:
+                                rem_sh = round(pos.shares - action.shares_to_sell, 6)
+                                reduced_oid = self._place_stop_order(
+                                    sym, rem_sh, prev_stop, prior_stop_oid
+                                )
+                                if not reduced_oid or not getattr(self.gateway, "last_stop_sync_ok", True):
+                                    self.store.update_order_status(
+                                        cid,
+                                        status=OrderStatus.FAILED,
+                                        reason=f"{action.note} | Aborted scale-out SELL: could not reduce GTC stop qty",
+                                    )
+                                    continue
+                                pos.broker_stop_order_id = reduced_oid
+                        elif prior_stop_oid:
+                            if not self._cancel_or_verify_dead_stop(sym, prior_stop_oid, pos.shares):
                                 self.store.update_order_status(
                                     cid,
                                     status=OrderStatus.FAILED,
@@ -1008,14 +1065,16 @@ class TradingDaemon:
                             cid, broker_oid, f"{action.note} | Broker rejected SELL submission"
                         ):
                             exits_triggered.append(f"{sym} SUBMITTED ({action.note})")
-                        elif not is_scale_out and self.settings.strategy_cfg.daemon.place_server_side_stop:
+                        elif self.settings.strategy_cfg.daemon.place_server_side_stop:
                             with self._order_lock:
                                 rem_p = self.store.get_positions().get(sym)
-                                if rem_p is not None and rem_p.shares > 1e-5 and not rem_p.broker_stop_order_id:
-                                    rem_p.broker_stop_order_id = self._place_stop_order(
-                                        sym, rem_p.shares, rem_p.current_stop, None
+                                if rem_p is not None and rem_p.shares > 1e-5:
+                                    restored_oid = self._place_stop_order(
+                                        sym, rem_p.shares, rem_p.current_stop, rem_p.broker_stop_order_id
                                     )
-                                    self.store.upsert_position(rem_p)
+                                    if restored_oid and getattr(self.gateway, "last_stop_sync_ok", True):
+                                        rem_p.broker_stop_order_id = restored_oid
+                                        self.store.upsert_position(rem_p)
                     else:
                         # PAPER-LOCAL mode (no Futu sub-account): preserve immediate virtual fill
                         self._settle_paper_local_sell(

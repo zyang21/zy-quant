@@ -1288,3 +1288,163 @@ def test_round3_filled_gtc_stop_guard_cancel_safety_and_phantom_position_guard(t
     final_positions = store.get_positions()
     assert "JPM" not in final_positions  # Closed JPM was NOT resurrected!
     assert final_positions["XOM"].broker_stop_order_id == "REARMED-XOM"  # XOM re-armed after rejected SELL!
+
+
+def test_round4_historical_gtc_rearm_zero_fill_stop_clear_partial_scale_out_and_post_close_order(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression tests for all Round-4 Review Findings (#1..#5):
+      1. Prior-day expired / ex-dividend purged `GTC STOP` (`prev_ord is None` while `last_order_sync_ok=True`
+         and `cancel_order` returns `False`) verifies held shares via `get_open_positions()` and places fresh GTC STOP!
+      2. `0`-fill `CANCELLED` / `EXPIRED` protective stop update clears `pos.broker_stop_order_id = None`
+         immediately so full `SELL` exits never deadlock on cancelling a dead stop!
+      3. Partial `50%` scale-out (`PRE_EARNINGS_CUSHION` at `+1.8R`) pre-reduces the server-side `GTC STOP`
+         quantity from `20 -> 10` shares BEFORE submitting `LIMIT SELL 10 sh` (freeing `can_sell_qty` & zero 150% over-sell),
+         and restores `20 sh` if `place_limit_order` fails!
+      4. `POST_CLOSE_SETTLEMENT` runs `reconcile_open_orders()` BEFORE `reconcile_broker_positions()` so
+         late closing stop fills record `closed_trades` and `virtual_cash` before position deletion!
+      5. `resolve_swing_phase` waits until `close + 2m` (`16:02 ET`) for `POST_CLOSE_SETTLEMENT` and clamps pre-`09:15 ET` sleep!
+    """
+    from zy_quant.runtime.pipeline import _compute_phase_aware_sleep_minutes
+
+    # 5. Phase boundary & pre-09:15 sleep checks
+    assert resolve_swing_phase(datetime(2026, 11, 25, 16, 1, tzinfo=ET_TZ).astimezone(timezone.utc)) == PipelinePhase.IDLE_GTC_ARMED
+    assert resolve_swing_phase(datetime(2026, 11, 25, 16, 2, tzinfo=ET_TZ).astimezone(timezone.utc)) == PipelinePhase.POST_CLOSE_SETTLEMENT
+    assert _compute_phase_aware_sleep_minutes(datetime(2026, 11, 25, 9, 12, tzinfo=ET_TZ), PipelinePhase.MARKET_CLOSED, 0, False) == 3
+
+    # 1. Historical expired GTC STOP (`prev_ord is None`, `cancel_order -> False`, broker still holds 10 sh) -> re-arms!
+    adapter = FutuGatewayAdapter(trd_env="REAL")
+
+    class DummyFutuR4:
+        RET_OK = 0
+
+        class TrdEnv:
+            REAL = "REAL"
+
+        class TrdSide:
+            SELL = "SELL"
+
+        class OrderType:
+            STOP = "STOP"
+
+        class TimeInForce:
+            GTC = "GTC"
+
+        class ModifyOrderOp:
+            NORMAL = "NORMAL"
+            CANCEL = "CANCEL"
+
+    class HistExpiredCtx:
+        def __init__(self) -> None:
+            self.placed: List[Dict[str, Any]] = []
+
+        def get_acc_list(self) -> tuple[int, pd.DataFrame]:
+            return 0, pd.DataFrame([{"acc_id": 666, "trd_env": "REAL", "acc_type": "MARGIN"}])
+
+        def modify_order(self, **kwargs: Any) -> tuple[int, Any]:
+            # Both NORMAL modify and CANCEL fail because GTC-OLD expired 90 days ago into historical orders!
+            return -1, "Historical order cannot be modified or cancelled"
+
+        def order_list_query(self, **kwargs: Any) -> tuple[int, pd.DataFrame]:
+            return 0, pd.DataFrame()  # Empty active order book (`last_order_sync_ok = True`)
+
+        def position_list_query(self, **kwargs: Any) -> tuple[int, pd.DataFrame]:
+            return 0, pd.DataFrame([{"code": "US.NVDA", "qty": 10.0, "cost_price": 145.0, "market_val": 1520.0}])
+
+        def place_order(self, **kwargs: Any) -> tuple[int, pd.DataFrame]:
+            self.placed.append(kwargs)
+            return 0, pd.DataFrame([{"order_id": "GTC-FRESH-10"}])
+
+    h_ctx = HistExpiredCtx()
+    adapter._futu_mod = DummyFutuR4
+    adapter._trade_ctx = h_ctx
+    adapter.is_connected = lambda: True  # type: ignore[method-assign]
+
+    fresh_oid = adapter.place_or_update_protective_stop("NVDA", 10.0, 142.0, existing_order_id="GTC-OLD")
+    assert fresh_oid == "GTC-FRESH-10"
+    assert adapter.last_stop_sync_ok is True
+    assert len(h_ctx.placed) == 1 and h_ctx.placed[0]["qty"] == 10.0
+
+    # 2. `0`-fill `CANCELLED` protective stop update clears `pos.broker_stop_order_id` immediately!
+    settings = AppSettings.load()
+    store = StateStore(tmp_path / "r4_pipeline.db")
+    daemon = TradingDaemon(settings, store=store, notifier=AlertNotifier())
+    pipe = DailySwingPipeline(daemon)
+
+    now_t = datetime(2026, 11, 25, 15, 45, tzinfo=ET_TZ).astimezone(timezone.utc)
+    store.upsert_position(
+        OpenPosition("AVGO", "Semiconductors", 20.0, 20.0, 200.0, now_t - timedelta(days=5), 190.0, 190.0, 219.0, 10.0, broker_stop_order_id="GTC-EXDIV-0")
+    )
+    daemon.on_broker_order_update(
+        BrokerOrderUpdate("GTC-EXDIV-0", "AVGO", OrderSide.SELL, "STOP", OrderStatus.CANCELLED, "CANCELLED_ALL", 20.0, 190.0, 0.0, None)
+    )
+    assert store.get_positions()["AVGO"].broker_stop_order_id is None  # Cleared immediately on 0-fill CANCELLED!
+
+    # 3. Partial 50% scale-out (`AVGO` at $218 = +1.8R ahead of AMC earnings) pre-reduces 20-sh GTC stop -> 10 sh
+    #    BEFORE calling `place_limit_order`, and restores back to 20 sh if `place_limit_order` rejects!
+    p_avgo = store.get_positions()["AVGO"]
+    p_avgo.broker_stop_order_id = "GTC-AVGO-20"
+    store.upsert_position(p_avgo)
+
+    target_d = date(2026, 11, 25)
+    d_map = {
+        sym: _make_daily_series(sym, n_days=120, end_d=date(2026, 11, 24), start_px=200.0, seed_offset=i * 4)
+        for i, sym in enumerate(["QQQ", "SPY", "AVGO"])
+    }
+    pipe._fetch_260d_universe = lambda syms: d_map  # type: ignore[method-assign]
+    daemon.earnings_feed.get_upcoming_events = lambda **kw: {"AVGO": EarningsEvent("AVGO", target_d, "AMC")}  # type: ignore[method-assign]
+    daemon.market_data.has_credentials = lambda: False  # type: ignore[method-assign]
+    daemon.market_data.get_bars = lambda sym, timeframe="15m", days=2: []  # type: ignore[method-assign]
+    daemon.market_data.get_quote = lambda sym: QuoteSnapshot(sym, 218.0, 217.9, 218.1, 950_000_000.0, now_t)  # type: ignore[method-assign]
+    daemon.gateway.trd_env_name = "REAL"
+    daemon.gateway.has_target_account = lambda: True  # type: ignore[method-assign]
+    daemon.gateway.is_connected = lambda: True  # type: ignore[method-assign]
+    daemon.gateway.last_stop_sync_ok = True
+    daemon.gateway.get_account_summary = lambda: {"equity_usd": 10000.0, "cash_usd": 0.0}  # type: ignore[method-assign]
+
+    call_log: List[tuple[str, float]] = []
+    daemon._place_stop_order = lambda sym, sh, px, oid=None: (call_log.append(("STOP_QTY", sh)) or f"GTC-AVGO-{int(sh)}")  # type: ignore[method-assign]
+    daemon.gateway.place_limit_order = lambda sym, side, qty, px, remark="": (call_log.append(("SELL_LIM", qty)) or None)  # type: ignore[method-assign]
+
+    tier_10k = settings.tiers_cfg.get_active("tier_10k")
+    pipe._execute_eod_decision_dag(now_t, target_d, "tier_10k", tier_10k, ["AVGO"], check_edgar=False)
+    # Sequence MUST be: (1) reduce GTC stop to 10 sh -> (2) submit 10 sh LIMIT SELL (rejected) -> (3) restore GTC stop to 20 sh!
+    assert call_log == [("STOP_QTY", 10.0), ("SELL_LIM", 10.0), ("STOP_QTY", 20.0)]
+    assert store.get_positions()["AVGO"].broker_stop_order_id == "GTC-AVGO-20"
+
+    # 4. `POST_CLOSE_SETTLEMENT` reconciles late stop fills BEFORE `reconcile_broker_positions` deletes the position!
+    store_pc = StateStore(tmp_path / "r4_postclose.db")
+    daemon_pc = TradingDaemon(settings, store=store_pc, notifier=AlertNotifier())
+    pipe_pc = DailySwingPipeline(daemon_pc)
+    pipe_pc._fetch_260d_universe = lambda syms: d_map  # type: ignore[method-assign]
+    daemon_pc.gateway.trd_env_name = "SIMULATE"
+    daemon_pc.gateway.has_target_account = lambda: True  # type: ignore[method-assign]
+    daemon_pc.gateway.is_connected = lambda: True  # type: ignore[method-assign]
+
+    buy_fee_pc = daemon_pc.fee_model.estimate_leg(10.0, 150.0, OrderSide.BUY).total_friction_usd
+    plan_pc = PositionPlan("XOM", "Energy", 10.0, 150.0, 150.1, 142.0, 8.0, 80.0, 1500.0, 4.1, 2.5, 0.5, SetupType.VCP_PIVOT_BREAKOUT)
+    sig_pc = EntrySignal("XOM", "Energy", SetupType.VCP_PIVOT_BREAKOUT, now_t, 150.0, 3.8, 148.0, 1.5, 82.0, "test")
+    store_pc.record_order_intent("BUY-XOM-PC", "XOM", OrderSide.BUY, 10.0, 150.1, "test", created_at=now_t)
+    daemon_pc._settle_paper_local_buy("BUY-XOM-PC", "XOM", plan_pc, sig_pc, buy_fee_pc, now_t, "tier_10k", tier_10k)
+    p_xom_pc = store_pc.get_positions()["XOM"]
+    p_xom_pc.broker_stop_order_id = "STOP-CLOSE-1"
+    store_pc.upsert_position(p_xom_pc)
+
+    def _sync_late_stop(refresh_cache: bool = False) -> List[BrokerOrderUpdate]:
+        daemon_pc.gateway.last_order_sync_ok = True
+        return [
+            BrokerOrderUpdate("STOP-CLOSE-1", "XOM", OrderSide.SELL, "STOP", OrderStatus.FILLED, "FILLED_ALL", 10.0, 142.0, 10.0, 142.0)
+        ]
+
+    def _empty_broker_pos() -> Dict[str, Dict[str, float]]:
+        daemon_pc.gateway.last_position_sync_ok = True
+        return {}
+
+    daemon_pc.gateway.sync_open_orders = _sync_late_stop  # type: ignore[method-assign]
+    daemon_pc.gateway.get_open_positions = _empty_broker_pos  # type: ignore[method-assign]
+
+    pc_time = datetime(2026, 11, 25, 16, 5, tzinfo=ET_TZ).astimezone(timezone.utc)
+    pc_res = pipe_pc.run_phase(PipelinePhase.POST_CLOSE_SETTLEMENT, now_utc=pc_time)
+    assert len(store_pc.query_closed_trades()) == 1  # Late closing stop fill WAS recorded in closed_trades!
+    assert pc_res["ledger_reconciliation"]["ok"] is True

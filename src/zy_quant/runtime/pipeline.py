@@ -61,7 +61,9 @@ def resolve_swing_phase(now_utc: datetime) -> PipelinePhase:
         return PipelinePhase.IDLE_GTC_ARMED
     if (close_m - 25) <= hm < close_m:
         return PipelinePhase.EOD_DECISION_WINDOW
-    if close_m <= hm <= (close_m + 120):
+    if close_m <= hm < (close_m + 2):
+        return PipelinePhase.IDLE_GTC_ARMED
+    if (close_m + 2) <= hm <= (close_m + 180):
         return PipelinePhase.POST_CLOSE_SETTLEMENT
     return PipelinePhase.MARKET_CLOSED
 
@@ -73,8 +75,9 @@ def _compute_phase_aware_sleep_minutes(
     has_frac: bool,
 ) -> int:
     """
-    Clamps scheduler sleep duration to the next upcoming phase boundary so `IDLE_GTC_ARMED`
-    or `OPEN_GAP_GUARD` NEVER overshoots the 25-minute `EOD_DECISION_WINDOW` (`close - 25m`)!
+    Clamps scheduler sleep duration to the next upcoming phase boundary so `IDLE_GTC_ARMED`,
+    `MARKET_CLOSED`, or `OPEN_GAP_GUARD` NEVER overshoots `PRE_OPEN_SYNC`, `EOD_DECISION_WINDOW`,
+    or `POST_CLOSE_SETTLEMENT` (`close + 2m`)!
     """
     if in_flight > 0:
         return 1
@@ -84,16 +87,19 @@ def _compute_phase_aware_sleep_minutes(
     hm = now_et.hour * 60 + now_et.minute
     close_t = session_close_time(d)
     close_m = close_t.hour * 60 + close_t.minute
+    pre_open_m = 9 * 60 + 15
     open_m = 9 * 60 + 30
     eod_start_m = close_m - 25
     post_close_m = close_m + 2
 
+    if hm < pre_open_m:
+        return max(1, min(15, pre_open_m - hm))
     if hm < open_m:
         return max(1, min(5, open_m - hm))
     if hm < eod_start_m:
         base = 15 if has_frac else 20
         return max(1, min(base, eod_start_m - hm))
-    if hm < close_m:
+    if hm < post_close_m:
         return max(1, min(5, post_close_m - hm))
     return 15
 
@@ -175,7 +181,8 @@ class DailySwingPipeline:
                     prior_confirmed_terminal = True
                 elif abs(b_upd.qty - expected_whole_qty) > 1e-5:
                     new_oid = d._place_stop_order(sym, pos.shares, pos.current_stop, oid)
-                    if new_oid:
+                    stop_ok = bool(getattr(d.gateway, "last_stop_sync_ok", True))
+                    if new_oid and stop_ok:
                         pos.broker_stop_order_id = new_oid
                         pos.stop_order_type = f"GTC_{daemon_cfg.server_stop_order_type}"
                         d.store.upsert_position(pos)
@@ -185,14 +192,15 @@ class DailySwingPipeline:
             if needs_rearm:
                 existing_ref = None if prior_confirmed_terminal else oid
                 new_oid = d._place_stop_order(sym, pos.shares, pos.current_stop, existing_ref)
-                if new_oid:
+                stop_ok = bool(getattr(d.gateway, "last_stop_sync_ok", True))
+                if new_oid and stop_ok and (prior_confirmed_terminal or new_oid != oid):
                     pos.broker_stop_order_id = new_oid
                     pos.stop_order_type = f"GTC_{daemon_cfg.server_stop_order_type}"
                     d.store.upsert_position(pos)
                     healed.append(
                         f"{sym}: re-armed server-side GTC stop ({expected_whole_qty:.0f} sh @ ${pos.current_stop:.2f}, oid={new_oid})"
                     )
-                elif prior_confirmed_terminal and pos.broker_stop_order_id is not None:
+                elif prior_confirmed_terminal and pos.broker_stop_order_id is not None and not stop_ok:
                     pos.broker_stop_order_id = None
                     d.store.upsert_position(pos)
 
@@ -427,10 +435,11 @@ class DailySwingPipeline:
 
             self._fetch_260d_universe(pool_syms)
             if has_acc:
+                order_events.extend(d.reconcile_open_orders(now=now))
                 broker_pos = d.gateway.get_open_positions()
                 if getattr(d.gateway, "last_position_sync_ok", True):
                     summary["post_close_reconciliation"] = d.store.reconcile_broker_positions(broker_pos)
-            healed = self.heal_overnight_gtc_stops(now, already_reconciled=False)
+            healed = self.heal_overnight_gtc_stops(now, already_reconciled=True)
 
             trd_env_name = getattr(d.gateway, "trd_env_name", "SIMULATE")
             open_pos = d.store.get_positions()
@@ -491,7 +500,9 @@ class DailySwingPipeline:
             d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
 
         else:
-            summary["next_sleep_minutes"] = 15
+            in_flight = len(d.store.get_active_orders())
+            has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
+            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac)
 
         open_pos_now = d.store.get_positions()
         in_flight_now = len(d.store.get_active_orders())
@@ -679,8 +690,21 @@ class DailySwingPipeline:
                             pos.current_stop = prev_stop
                             pos.breakeven_armed = prev_be
                             pos.earnings_cushion_applied_date = prev_earn_date
+                            if prior_stop_oid and d.settings.strategy_cfg.daemon.place_server_side_stop:
+                                rem_sh = round(pos.shares - action.shares_to_sell, 6)
+                                reduced_oid = d._place_stop_order(
+                                    sym, rem_sh, prev_stop, prior_stop_oid
+                                )
+                                if not reduced_oid or not getattr(d.gateway, "last_stop_sync_ok", True):
+                                    d.store.update_order_status(
+                                        cid,
+                                        status=OrderStatus.FAILED,
+                                        reason=f"{action.note} | Aborted partial SELL: could not reduce GTC stop qty",
+                                    )
+                                    continue
+                                pos.broker_stop_order_id = reduced_oid
                         elif prior_stop_oid:
-                            if not d.gateway.cancel_order(prior_stop_oid):
+                            if not d._cancel_or_verify_dead_stop(sym, prior_stop_oid, pos.shares):
                                 # Short-flip guard: abort duplicate full SELL while live GTC STOP could not be cancelled!
                                 d.store.update_order_status(
                                     cid,
@@ -711,15 +735,17 @@ class DailySwingPipeline:
                         )
                         if d._mark_order_submitted_safely(cid, b_oid, f"{action.note} | Broker rejected SELL"):
                             exits_triggered.append(f"{sym} SUBMITTED ({action.note})")
-                        elif not is_partial_exit and d.settings.strategy_cfg.daemon.place_server_side_stop:
-                            # Naked-position guard: full-exit SELL failed after cancelling GTC stop -> re-arm immediately!
+                        elif d.settings.strategy_cfg.daemon.place_server_side_stop:
+                            # Naked-position / scale-out restore guard: restore full GTC stop qty if SELL rejected!
                             with d._order_lock:
                                 rem_p = d.store.get_positions().get(sym)
-                                if rem_p is not None and rem_p.shares > 1e-5 and not rem_p.broker_stop_order_id:
-                                    rem_p.broker_stop_order_id = d._place_stop_order(
-                                        sym, rem_p.shares, rem_p.current_stop, None
+                                if rem_p is not None and rem_p.shares > 1e-5:
+                                    restored_oid = d._place_stop_order(
+                                        sym, rem_p.shares, rem_p.current_stop, rem_p.broker_stop_order_id
                                     )
-                                    d.store.upsert_position(rem_p)
+                                    if restored_oid and getattr(d.gateway, "last_stop_sync_ok", True):
+                                        rem_p.broker_stop_order_id = restored_oid
+                                        d.store.upsert_position(rem_p)
                     else:
                         d._settle_paper_local_sell(
                             cid, sym, pos, action.shares_to_sell, action.exit_price, action.reason.value if action.reason else "EXIT", tier_key, tier

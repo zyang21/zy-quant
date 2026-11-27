@@ -139,6 +139,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._last_order_refresh_mono: float = 0.0
         self.last_order_sync_ok: bool = False
         self.last_position_sync_ok: bool = False
+        self.last_stop_sync_ok: bool = True
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def register_order_callback(self, callback: Callable[[BrokerOrderUpdate], Any]) -> None:
@@ -741,6 +742,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
           leave `STOP_LIMIT` orders stranded unfilled; `OrderType.STOP_LIMIT` also supported).
         """
         if shares <= 0:
+            self.last_stop_sync_ok = False
             return None
         # Fractional share guard (< 1.0 sh): route strictly through client-side RTH stop monitor
         if shares < 1.0:
@@ -750,6 +752,7 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 and self.is_connected()
             ):
                 self.cancel_order(existing_order_id)
+            self.last_stop_sync_ok = True
             return f"SIM-CLIENT-FRAC-STOP-{symbol}"
 
         whole_shares = float(math.floor(shares)) if shares != math.floor(shares) else float(shares)
@@ -757,14 +760,17 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         # Note: Futu SIMULATE / offline PAPER-LOCAL environment only supports NORMAL/MARKET orders;
         # native GTC STOP orders are supported in REAL US trading.
         if self.trd_env_name != "REAL":
+            self.last_stop_sync_ok = True
             return existing_order_id or f"SIM-LOCAL-STOP-{symbol}"
 
         if not self.is_connected() or self._trade_ctx is None:
+            self.last_stop_sync_ok = False
             return existing_order_id
         ft = self._futu_mod
 
         acc_id = self._select_acc_id("REAL")
         if acc_id == 0:
+            self.last_stop_sync_ok = False
             return existing_order_id
 
         use_stop_market = order_mode.strip().upper() != "STOP_LIMIT"
@@ -784,32 +790,60 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                     acc_id=acc_id,
                 )
             if ret == ft.RET_OK:
+                self.last_stop_sync_ok = True
                 return existing_order_id
 
             # Short-flip prevention: NEVER submit a second GTC STOP if `existing_order_id` already filled
             # or partially filled, or if it may still be live and could not be cancelled!
             open_map = {u.broker_order_id: u for u in self.sync_open_orders(refresh_cache=True)}
             prev_ord = open_map.get(existing_order_id)
-            if prev_ord is not None and (
-                prev_ord.status == OrderStatus.FILLED or prev_ord.filled_shares > 1e-6
-            ):
-                logger.warning(
-                    "Existing GTC stop %s for %s already filled (%s sh, status=%s); dispatching fill and aborting replacement STOP",
-                    existing_order_id,
-                    symbol,
-                    prev_ord.filled_shares,
-                    prev_ord.status.value,
-                )
-                self._dispatch_order_update(prev_ord)
-                return existing_order_id
-            if not self.last_order_sync_ok or prev_ord is None or prev_ord.status.is_active:
+            if not self.last_order_sync_ok:
                 if not self.cancel_order(existing_order_id):
+                    self.last_stop_sync_ok = False
                     logger.error(
-                        "Refusing to place duplicate GTC STOP for %s while existing stop %s could not be cancelled",
+                        "Refusing to place duplicate GTC STOP for %s while order_list_query failed and %s could not be cancelled",
                         symbol,
                         existing_order_id,
                     )
                     return existing_order_id
+            elif prev_ord is not None:
+                if prev_ord.status == OrderStatus.FILLED or prev_ord.filled_shares > 1e-6:
+                    self.last_stop_sync_ok = False
+                    logger.warning(
+                        "Existing GTC stop %s for %s already filled (%s sh, status=%s); dispatching fill and aborting replacement STOP",
+                        existing_order_id,
+                        symbol,
+                        prev_ord.filled_shares,
+                        prev_ord.status.value,
+                    )
+                    self._dispatch_order_update(prev_ord)
+                    return existing_order_id
+                if prev_ord.status.is_active and not self.cancel_order(existing_order_id):
+                    self.last_stop_sync_ok = False
+                    logger.error(
+                        "Refusing to place duplicate GTC STOP for %s while active stop %s could not be cancelled",
+                        symbol,
+                        existing_order_id,
+                    )
+                    return existing_order_id
+            else:
+                # `last_order_sync_ok` is True and `prev_ord` is None: `existing_order_id` is absent from
+                # Futu's active order book (e.g. prior-day 90-day expiry or ex-dividend cancellation).
+                # Verify broker still holds `>= whole_shares` before placing fresh GTC STOP!
+                if not self.cancel_order(existing_order_id):
+                    broker_pos = self.get_open_positions()
+                    held_qty = float((broker_pos.get(symbol.upper()) or {}).get("shares", 0.0))
+                    if not self.last_position_sync_ok or held_qty < whole_shares - 1e-5:
+                        self.last_stop_sync_ok = False
+                        logger.error(
+                            "Aborting GTC STOP re-arm for %s (historical oid=%s): position sync ok=%s, held_qty=%s < %s",
+                            symbol,
+                            existing_order_id,
+                            self.last_position_sync_ok,
+                            held_qty,
+                            whole_shares,
+                        )
+                        return existing_order_id
 
         with self._rpc_lock:
             ret, df = self._trade_ctx.place_order(
@@ -826,8 +860,10 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 remark="zy-quant protective GTC stop",
             )
         if ret != ft.RET_OK or df is None or isinstance(df, str) or df.empty:
+            self.last_stop_sync_ok = False
             logger.error("Failed placing server-side GTC stop for %s: %s", symbol, df)
             return None
+        self.last_stop_sync_ok = True
         return str(df.iloc[0]["order_id"])
 
     def cancel_order(self, order_id: str) -> bool:
