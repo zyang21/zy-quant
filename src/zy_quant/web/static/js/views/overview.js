@@ -205,6 +205,13 @@ export class OverviewView {
         hint: 'Peak-to-trough drop',
         tooltip: 'Largest percentage drop from a portfolio peak. Measures worst-case historical pain.',
       }),
+      metricTile({
+        label: 'Portfolio Heat',
+        value: `${Number(p.principal_heat_pct || 0).toFixed(2)}% / ${Number(p.max_portfolio_heat_pct || 6).toFixed(1)}%`,
+        valueClass: Number(p.principal_heat_pct || 0) >= Number(p.max_portfolio_heat_pct || 6) * 0.85 ? 'txt-warn' : 'txt-up',
+        hint: `${fmtUsd(p.principal_heat_usd || 0)} Principal · ${p.pipeline_phase || 'IDLE'}`,
+        tooltip: 'Total open principal at risk to current stops (drops to 0% per position once breakeven stop is armed). Includes 60d pairwise correlation & StoplossGuard gates.',
+      }),
     ].join('');
 
     // Market Regime Traffic Light
@@ -236,8 +243,12 @@ export class OverviewView {
         <div class="rv ${reg.vix_level >= 30 ? 'txt-down' : (reg.vix_level >= 24 ? 'txt-warn' : 'txt-up')}">${reg.vix_level ?? '—'} ${reg.vix_level >= 30 ? '(Elevated Panic)' : '(Normal)'}</div>
       </div>
       <div class="rule-item">
-        <div class="rk">S&P 500 Benchmark (SPY)</div>
-        <div class="rv">$${reg.spy_price ?? '—'} · QQQ Day ${fmtPct(reg.qqq_intraday_return_pct || 0)}</div>
+        <div class="rk">S&P 500 & Breadth</div>
+        <div class="rv">$${reg.spy_price ?? '—'} · Breadth >SMA50: ${reg.breadth_above_sma50_pct != null ? `${reg.breadth_above_sma50_pct}%` : '—'}</div>
+      </div>
+      <div class="rule-item">
+        <div class="rk">Pipeline & Risk Guards</div>
+        <div class="rv">${esc(p.pipeline_phase || 'IDLE')} · Corr ≤ ${p.max_pair_corr_limit ?? 0.75} · ${(p.stoploss_guard && p.stoploss_guard.active) ? `Cooldown → ${esc(p.stoploss_guard.cooldown_until_date)}` : 'StoplossGuard OK'}</div>
       </div>
     `;
 
@@ -289,9 +300,16 @@ export class OverviewView {
         .map((pos) => {
           const upnl = Number(pos.unrealized_pnl_usd || 0);
           const cls = upnl >= 0 ? 'txt-up' : 'txt-down';
-          const stateLabel = pos.breakeven_armed
-            ? 'Chandelier Trail Active (Risk-Free)'
-            : 'Initial ATR Stop Armed';
+          const stopTag = pos.stop_order_type || 'GTC_STOP';
+          const gtcBadge = pos.gtc_stop_healthy === false
+            ? 'STOP UNARMED'
+            : (pos.breakeven_armed ? `${stopTag} · Breakeven+` : `${stopTag} Armed`);
+          const earnHint = pos.earnings_countdown_td != null
+            ? ` · Earn T-${pos.earnings_countdown_td}d (${pos.earnings_timing || 'UNK'})`
+            : '';
+          const holdDisplay = pos.days_held > 0
+            ? `${pos.days_held}d${earnHint}`
+            : `${pos.hold_hours}h (${pos.bars_held_15m}b)${earnHint}`;
           return `
             <tr>
               <td><strong>${esc(pos.symbol)}</strong> <span class="txt-muted" style="font-size:11px;">${esc(pos.sector)}</span></td>
@@ -302,8 +320,8 @@ export class OverviewView {
               <td class="num ${cls}">${fmtUsd(upnl, true)} (${fmtPct(pos.unrealized_pnl_pct)})</td>
               <td class="num ${pos.current_r >= 0 ? 'txt-up' : 'txt-down'}">${pos.current_r >= 0 ? '+' : ''}${Number(pos.current_r).toFixed(2)}R</td>
               <td class="num txt-warn">${fmtUsd(pos.current_stop)}</td>
-              <td class="num">${pos.hold_hours}h <span class="txt-muted">(${pos.bars_held_15m}b)</span></td>
-              <td>${statusBadge(stateLabel, pos.breakeven_armed ? 'up' : 'neutral', false)}</td>
+              <td class="num">${esc(holdDisplay)}</td>
+              <td>${statusBadge(gtcBadge, pos.gtc_stop_healthy === false ? 'down' : (pos.breakeven_armed ? 'up' : 'neutral'), false)}</td>
             </tr>
           `;
         })

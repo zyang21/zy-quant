@@ -32,6 +32,7 @@ from zy_quant.models import (
 )
 from zy_quant.risk.mandate_gate import MandateRiskGate
 from zy_quant.runtime.alerts import AlertNotifier
+from zy_quant.runtime.pipeline import DailySwingPipeline
 from zy_quant.storage.bar_cache import HistoricalBarCache
 from zy_quant.storage.state_store import StateStore
 from zy_quant.strategy.exit_models import ScientificExitAndSizingEngine
@@ -96,11 +97,154 @@ class TradingDaemon:
             settings.strategy_cfg.exit_models, self.fee_model
         )
         self.risk_gate = MandateRiskGate(self.store, settings.strategy_cfg.daemon)
+        self.swing_pipeline = DailySwingPipeline(self)
 
         self._stop_requested = False
         self._last_watchlist_scan_at: Optional[datetime] = None
         self._order_lock = threading.RLock()
         self.gateway.register_order_callback(self.on_broker_order_update)
+
+    def _place_stop_order(
+        self,
+        symbol: str,
+        shares: float,
+        stop_price: float,
+        existing_order_id: Optional[str] = None,
+    ) -> Optional[str]:
+        mode = self.settings.strategy_cfg.daemon.server_stop_order_type
+        try:
+            return self.gateway.place_or_update_protective_stop(
+                symbol, shares, stop_price, existing_order_id, order_mode=mode
+            )
+        except TypeError:
+            # Backward compatibility for lightweight test mocks with 4-arg signature
+            return self.gateway.place_or_update_protective_stop(
+                symbol, shares, stop_price, existing_order_id
+            )
+
+    def _sync_sim_virtual_cash(self, delta_usd: float, tier_key_hint: Optional[str] = None) -> None:
+        if getattr(self.gateway, "trd_env_name", "SIMULATE") == "REAL":
+            return
+        t_key = tier_key_hint or self.settings.active_tier_key
+        t_prof = self.settings.tiers_cfg.get_active(t_key)
+        self.store.adjust_virtual_cash(t_key, delta_usd, t_prof.reference_equity_usd)
+
+    def _ensure_sim_virtual_cash_bootstrapped(self, tier_key_hint: Optional[str] = None) -> None:
+        if getattr(self.gateway, "trd_env_name", "SIMULATE") == "REAL":
+            return
+        t_key = tier_key_hint or self.settings.active_tier_key
+        t_prof = self.settings.tiers_cfg.get_active(t_key)
+        self.store.get_virtual_cash(t_key, t_prof.reference_equity_usd)
+
+    def _settle_paper_local_buy(
+        self,
+        cid: str,
+        sym: str,
+        plan: Any,
+        sig: Any,
+        est_buy_fee: float,
+        now_utc: datetime,
+        tier_key: str,
+        tier: Any,
+    ) -> None:
+        self._ensure_sim_virtual_cash_bootstrapped(tier_key)
+        self.store.update_order_status(
+            cid,
+            OrderStatus.FILLED,
+            broker_order_id="PAPER-LOCAL",
+            fill_price=plan.entry_price,
+            avg_fill_price=plan.entry_price,
+            fee_usd=est_buy_fee,
+            filled_shares=plan.shares,
+            reconciled_shares=plan.shares,
+        )
+        stop_oid = (
+            self._place_stop_order(sym, plan.shares, plan.initial_stop)
+            if self.settings.strategy_cfg.daemon.place_server_side_stop
+            else None
+        )
+        stop_type = "CLIENT_FRAC_RTH" if plan.shares < 1.0 else f"GTC_{self.settings.strategy_cfg.daemon.server_stop_order_type}"
+        new_pos = OpenPosition(
+            symbol=sym,
+            sector=plan.sector,
+            shares=plan.shares,
+            initial_shares=plan.shares,
+            entry_price=plan.entry_price,
+            entry_time=now_utc,
+            initial_stop=plan.initial_stop,
+            current_stop=plan.initial_stop,
+            highest_price=plan.entry_price,
+            risk_per_share=plan.risk_per_share,
+            entry_atr_1d=sig.atr_14,
+            stop_order_type=stop_type,
+            broker_stop_order_id=stop_oid,
+            setup=plan.setup.value,
+            metadata={
+                "buy_fee_usd": est_buy_fee,
+                "expectancy_r": plan.expectancy_r,
+                "last_bar_ts": sig.timestamp.isoformat(),
+                "last_mark_price": plan.entry_price,
+                "tier_key": tier_key,
+            },
+        )
+        self.store.upsert_position(new_pos)
+        self._sync_sim_virtual_cash(-(plan.shares * plan.entry_price + est_buy_fee), tier_key)
+        self.notifier.send(
+            "New Entry Executed",
+            f"{sym} ({plan.setup.value}): {plan.shares} sh @ ${plan.entry_price:.2f}, "
+            f"Stop=${plan.initial_stop:.2f}, Expectancy=+{plan.expectancy_r:.2f}R",
+        )
+
+    def _settle_paper_local_sell(
+        self,
+        cid: str,
+        sym: str,
+        pos: OpenPosition,
+        shares_to_sell: float,
+        exit_price: float,
+        exit_reason: str,
+        tier_key: str,
+        tier: Any,
+    ) -> None:
+        self._ensure_sim_virtual_cash_bootstrapped(tier_key)
+        sell_fee = self.fee_model.estimate_leg(
+            shares_to_sell, exit_price, OrderSide.SELL
+        ).total_friction_usd
+        alloc_buy_fee = float(pos.metadata.get("buy_fee_usd") or 0.0) * (
+            shares_to_sell / max(1e-6, pos.initial_shares)
+        )
+        self.store.update_order_status(
+            cid,
+            OrderStatus.FILLED,
+            broker_order_id="PAPER-LOCAL",
+            fill_price=exit_price,
+            avg_fill_price=exit_price,
+            fee_usd=sell_fee,
+            filled_shares=shares_to_sell,
+            reconciled_shares=shares_to_sell,
+        )
+        self.store.record_closed_trade(
+            symbol=sym,
+            setup=pos.setup,
+            shares=shares_to_sell,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            fee_usd=round(alloc_buy_fee + sell_fee, 4),
+            risk_per_share=pos.risk_per_share,
+            exit_reason=exit_reason,
+            entry_time=pos.entry_time.isoformat(),
+        )
+        pos.shares = round(pos.shares - shares_to_sell, 6)
+        if pos.shares <= 1e-5:
+            self.store.remove_position(sym)
+        else:
+            if self.settings.strategy_cfg.daemon.place_server_side_stop:
+                pos.broker_stop_order_id = self._place_stop_order(
+                    sym, pos.shares, pos.current_stop, pos.broker_stop_order_id
+                )
+            self.store.upsert_position(pos)
+        self._sync_sim_virtual_cash(shares_to_sell * exit_price - sell_fee, tier_key)
+        self.notifier.send("Position Exit", f"{sym}: {exit_reason} @ ${exit_price:.2f}", level="WARN")
 
     def startup_reconcile(self) -> Dict[str, Any]:
         connected = self.gateway.is_connected() or self.gateway.connect()
@@ -210,7 +354,9 @@ class TradingDaemon:
                 plan_meta = {}
 
             event_summary: Optional[str] = None
+            tier_hint = str(plan_meta.get("tier_key") or self.settings.active_tier_key)
             if delta_shares > 1e-6:
+                self._ensure_sim_virtual_cash_bootstrapped(tier_hint)
                 if side == OrderSide.BUY:
                     pos = open_positions.get(sym)
                     planned_stop = float(
@@ -218,6 +364,7 @@ class TradingDaemon:
                     )
                     safe_stop = min(planned_stop, round(eff_fill_px * 0.995, 2))
                     risk_ps = max(0.01, round(eff_fill_px - safe_stop, 4))
+                    stop_type = "CLIENT_FRAC_RTH" if delta_shares < 1.0 and pos is None else f"GTC_{self.settings.strategy_cfg.daemon.server_stop_order_type}"
 
                     if pos is None:
                         pos = OpenPosition(
@@ -231,12 +378,15 @@ class TradingDaemon:
                             current_stop=safe_stop,
                             highest_price=round(eff_fill_px, 4),
                             risk_per_share=risk_ps,
+                            entry_atr_1d=float(plan_meta.get("entry_atr_1d") or 0.0),
+                            stop_order_type=stop_type,
                             setup=str(plan_meta.get("setup") or "VWAP_PULLBACK"),
                             metadata={
                                 "buy_fee_usd": round(total_fee, 4),
                                 "expectancy_r": float(plan_meta.get("expectancy_r") or 0.0),
                                 "last_bar_ts": str(plan_meta.get("last_bar_ts") or ""),
                                 "last_mark_price": round(eff_fill_px, 4),
+                                "tier_key": tier_hint,
                             },
                         )
                     else:
@@ -246,15 +396,17 @@ class TradingDaemon:
                         pos.entry_price = round(eff_fill_px, 4)
                         pos.highest_price = max(pos.highest_price, round(eff_fill_px, 4))
                         pos.risk_per_share = max(0.01, round(pos.entry_price - pos.initial_stop, 4))
+                        pos.stop_order_type = "CLIENT_FRAC_RTH" if pos.shares < 1.0 else f"GTC_{self.settings.strategy_cfg.daemon.server_stop_order_type}"
                         pos.metadata["buy_fee_usd"] = round(
                             float(pos.metadata.get("buy_fee_usd") or 0.0) + delta_fee, 4
                         )
 
                     if self.settings.strategy_cfg.daemon.place_server_side_stop:
-                        pos.broker_stop_order_id = self.gateway.place_or_update_protective_stop(
+                        pos.broker_stop_order_id = self._place_stop_order(
                             sym, pos.shares, pos.current_stop, pos.broker_stop_order_id
                         )
                     self.store.upsert_position(pos)
+                    self._sync_sim_virtual_cash(-(delta_shares * eff_fill_px + delta_fee), tier_hint)
                     event_summary = (
                         f"BUY {sym} filled +{delta_shares} sh (total {pos.shares} sh) "
                         f"@ ${eff_fill_px:.2f} [{update.status.value}]"
@@ -320,6 +472,8 @@ class TradingDaemon:
                             pos.breakeven_armed = True
                             post_stop = float(plan_meta.get("post_scale_stop") or pos.current_stop)
                             pos.current_stop = max(pos.current_stop, post_stop)
+                            if plan_meta.get("earnings_cushion_date"):
+                                pos.earnings_cushion_applied_date = str(plan_meta["earnings_cushion_date"])
 
                         if pos.shares <= 1e-5:
                             if pos.broker_stop_order_id:
@@ -327,15 +481,15 @@ class TradingDaemon:
                             self.store.remove_position(sym)
                         else:
                             if self.settings.strategy_cfg.daemon.place_server_side_stop:
-                                pos.broker_stop_order_id = (
-                                    self.gateway.place_or_update_protective_stop(
-                                        sym,
-                                        pos.shares,
-                                        pos.current_stop,
-                                        pos.broker_stop_order_id,
-                                    )
+                                pos.broker_stop_order_id = self._place_stop_order(
+                                    sym,
+                                    pos.shares,
+                                    pos.current_stop,
+                                    pos.broker_stop_order_id,
                                 )
                             self.store.upsert_position(pos)
+
+                    self._sync_sim_virtual_cash(delta_shares * eff_fill_px - delta_fee, tier_hint)
 
                     event_summary = (
                         f"SELL {sym} filled {delta_shares} sh @ ${eff_fill_px:.2f} "
@@ -414,6 +568,8 @@ class TradingDaemon:
             filled_shares=new_filled,
             reconciled_shares=new_filled,
         )
+        tier_hint = str(pos.metadata.get("tier_key") or self.settings.active_tier_key)
+        self._ensure_sim_virtual_cash_bootstrapped(tier_hint)
         self.store.record_closed_trade(
             symbol=pos.symbol,
             setup=pos.setup,
@@ -432,6 +588,7 @@ class TradingDaemon:
             self.store.remove_position(pos.symbol)
         else:
             self.store.upsert_position(pos)
+        self._sync_sim_virtual_cash(delta * fill_px - sell_fee, tier_hint)
 
         msg = f"{pos.symbol}: server-side stop filled {delta} sh @ ${fill_px:.2f} ({reason.value})"
         self.notifier.send("Server-Side Stop Triggered", msg, level="WARN")
@@ -585,13 +742,11 @@ class TradingDaemon:
 
         if alpaca_ready and hasattr(self.market_data, "get_snapshots_batch"):
             quotes = self.market_data.get_snapshots_batch(pool_syms)  # type: ignore[attr-defined]
-            bars_1d_map = self.market_data.get_bars_batch(  # type: ignore[attr-defined]
-                pool_syms, timeframe="1d", days=5
-            )
-            for sym, d_bars in bars_1d_map.items():
-                if len(d_bars) >= 2 and d_bars[-2].close > 0:
-                    q_last = quotes[sym].last_price if sym in quotes else d_bars[-1].close
-                    intraday_rets[sym] = (q_last - d_bars[-2].close) / d_bars[-2].close
+            prev_closes = getattr(self.market_data, "last_prev_closes", {})
+            for sym, q_snap in quotes.items():
+                prev_c = float(prev_closes.get(sym) or 0.0)
+                if prev_c > 0:
+                    intraday_rets[sym] = (q_snap.last_price - prev_c) / prev_c
             if check_edgar:
                 for sec in scan_pool:
                     insiders[sec.symbol] = self.edgar_scanner.fetch_insider_activity(
@@ -804,41 +959,19 @@ class TradingDaemon:
                             )
                     else:
                         # PAPER-LOCAL mode (no Futu sub-account): preserve immediate virtual fill
-                        sell_fee = self.fee_model.estimate_leg(
-                            action.shares_to_sell, action.exit_price, OrderSide.SELL
-                        ).total_friction_usd
-                        alloc_buy_fee = float(pos.metadata.get("buy_fee_usd") or 0.0) * (
-                            action.shares_to_sell / max(1e-6, pos.initial_shares)
-                        )
-                        self.store.update_order_status(
+                        self._settle_paper_local_sell(
                             cid,
-                            OrderStatus.FILLED,
-                            broker_order_id="PAPER-LOCAL",
-                            fill_price=action.exit_price,
-                            avg_fill_price=action.exit_price,
-                            fee_usd=sell_fee,
-                            filled_shares=action.shares_to_sell,
-                            reconciled_shares=action.shares_to_sell,
+                            sym,
+                            pos,
+                            action.shares_to_sell,
+                            action.exit_price,
+                            action.reason.value if action.reason else "EXIT",
+                            tier_override or self.settings.active_tier_key,
+                            tier,
                         )
-                        self.store.record_closed_trade(
-                            symbol=sym,
-                            setup=pos.setup,
-                            shares=action.shares_to_sell,
-                            entry_price=pos.entry_price,
-                            exit_price=action.exit_price,
-                            fee_usd=round(alloc_buy_fee + sell_fee, 4),
-                            risk_per_share=pos.risk_per_share,
-                            exit_reason=action.reason.value if action.reason else "EXIT",
-                            entry_time=pos.entry_time.isoformat(),
-                        )
-                        pos.shares = round(pos.shares - action.shares_to_sell, 6)
                         if pos.shares <= 1e-5:
-                            self.store.remove_position(sym)
                             open_positions.pop(sym, None)
-                        else:
-                            self.store.upsert_position(pos)
                         exits_triggered.append(f"{sym} ({action.note})")
-                        self.notifier.send("Position Exit", f"{sym}: {action.note}", level="WARN")
             else:
                 # If Chandelier / Breakeven ratcheted stop upward, sync protective stop to Futu server!
                 if (
@@ -1003,50 +1136,13 @@ class TradingDaemon:
                     open_positions = self.store.get_positions()
                 else:
                     # PAPER-LOCAL Mode (no activated Futu sub-account): immediate virtual fill
-                    self.store.update_order_status(
-                        cid,
-                        OrderStatus.FILLED,
-                        broker_order_id="PAPER-LOCAL",
-                        fill_price=plan.entry_price,
-                        avg_fill_price=plan.entry_price,
-                        fee_usd=est_buy_fee,
-                        filled_shares=plan.shares,
-                        reconciled_shares=plan.shares,
+                    t_key_eff = tier_override or self.settings.active_tier_key
+                    self._settle_paper_local_buy(
+                        cid, sym, plan, sig, est_buy_fee, now, t_key_eff, tier
                     )
-                    stop_oid = None
-                    if self.settings.strategy_cfg.daemon.place_server_side_stop:
-                        stop_oid = self.gateway.place_or_update_protective_stop(
-                            sym, plan.shares, plan.initial_stop
-                        )
-                    new_pos = OpenPosition(
-                        symbol=sym,
-                        sector=plan.sector,
-                        shares=plan.shares,
-                        initial_shares=plan.shares,
-                        entry_price=plan.entry_price,
-                        entry_time=now,
-                        initial_stop=plan.initial_stop,
-                        current_stop=plan.initial_stop,
-                        highest_price=plan.entry_price,
-                        risk_per_share=plan.risk_per_share,
-                        broker_stop_order_id=stop_oid,
-                        setup=plan.setup.value,
-                        metadata={
-                            "buy_fee_usd": est_buy_fee,
-                            "expectancy_r": plan.expectancy_r,
-                            "last_bar_ts": sig.timestamp.isoformat(),
-                            "last_mark_price": plan.entry_price,
-                        },
-                    )
-                    self.store.upsert_position(new_pos)
-                    open_positions[sym] = new_pos
+                    open_positions = self.store.get_positions()
                     cash -= plan.notional_usd + est_buy_fee
                     entries_placed.append(f"{sym} x{plan.shares} @ ${plan.entry_price:.2f}")
-                    self.notifier.send(
-                        "New Entry Executed",
-                        f"{sym} ({plan.setup.value}): {plan.shares} sh @ ${plan.entry_price:.2f}, "
-                        f"Server Stop=${plan.initial_stop:.2f}, Expectancy=+{plan.expectancy_r:.2f}R",
-                    )
 
         open_positions = self.store.get_positions()
         in_flight_count = len(self.store.get_active_orders())
@@ -1088,6 +1184,31 @@ class TradingDaemon:
             "next_sleep_minutes": sleep_min,
         }
 
+    def step_scheduled(
+        self,
+        tier_override: Optional[str] = None,
+        check_edgar: bool = False,
+        force_when_closed: bool = False,
+        now_override: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        Dispatches to the 4-Phase Daily Swing Pipeline when `strategy.mode == 'swing_1d'`,
+        or the legacy 15m intraday loop when `strategy.mode == 'intraday_15m'`.
+        """
+        if self.settings.strategy_cfg.mode == "swing_1d":
+            return self.swing_pipeline.run_due_phase(
+                now_utc=now_override,
+                tier_override=tier_override,
+                force_eod_when_closed=force_when_closed,
+                check_edgar=check_edgar,
+            )
+        return self.run_cycle(
+            tier_override=tier_override,
+            check_edgar=check_edgar,
+            force_when_closed=force_when_closed,
+            now_override=now_override,
+        )
+
     def run_forever(self, tier_override: Optional[str] = None) -> None:
         def _handle_sig(_sig: int, _frame: Any) -> None:
             self._stop_requested = True
@@ -1096,17 +1217,18 @@ class TradingDaemon:
         signal.signal(signal.SIGTERM, _handle_sig)
 
         self.startup_reconcile()
-        logger.info("zy-quant Two-Speed Daemon started.")
+        logger.info("zy-quant Daemon started (mode=%s).", self.settings.strategy_cfg.mode)
         while not self._stop_requested:
             try:
-                res = self.run_cycle(tier_override=tier_override)
-                sleep_sec = max(30, int(res["next_sleep_minutes"] * 60))
+                res = self.step_scheduled(tier_override=tier_override)
+                sleep_sec = max(30, int(res.get("next_sleep_minutes", 5) * 60))
                 logger.info(
-                    "Cycle complete: regime=%s, entries=%d, exits=%d, next_check=%dm",
-                    res["regime"],
-                    len(res["entries"]),
-                    len(res["exits"]),
-                    res["next_sleep_minutes"],
+                    "Daemon step complete: phase=%s, regime=%s, entries=%d, exits=%d, next_check=%dm",
+                    res.get("phase", res.get("market_phase", "N/A")),
+                    res.get("regime", "IDLE"),
+                    len(res.get("entries", [])),
+                    len(res.get("exits", [])),
+                    res.get("next_sleep_minutes", 5),
                 )
             except Exception as exc:
                 logger.exception("Unhandled error in daemon cycle: %s", exc)

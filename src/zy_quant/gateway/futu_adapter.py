@@ -579,12 +579,21 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 return 0.0
 
         equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
-        cash = _f(row.get("us_cash")) if _f(row.get("us_cash")) > 0 else _f(row.get("cash"))
+        raw_cash = _f(row.get("us_cash")) if _f(row.get("us_cash")) > 0 else _f(row.get("cash"))
+        fund_assets = _f(row.get("fund_assets"))
+        buying_power = _f(row.get("power"))
+        # Futu HK Cash Plus (USD MMF auto-sweep) parks idle USD in `fund_assets` with `us_cash == 0`;
+        # include `fund_assets` and cap at non-leveraged equity/buying_power so real cash isn't masked as $0!
+        liquid_cash = raw_cash + fund_assets
+        if buying_power > 0:
+            liquid_cash = min(liquid_cash, buying_power)
         return {
             "equity_usd": equity,
-            "cash_usd": cash,
+            "cash_usd": liquid_cash,
+            "raw_cash_usd": raw_cash,
+            "fund_assets_usd": fund_assets,
             "market_val_usd": _f(row.get("market_val")),
-            "buying_power_usd": _f(row.get("power")),
+            "buying_power_usd": buying_power,
             "connected": 1.0,
             "note": note,
         }
@@ -676,32 +685,56 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         shares: float,
         stop_price: float,
         existing_order_id: Optional[str] = None,
+        order_mode: str = "STOP",
     ) -> Optional[str]:
         """
-        Server-Side Safety Net: Places or ratchets a native STOP order on Futu's servers
-        so downside risk is capped even if local network/host goes completely dark.
+        Server-Side Safety Net (`TimeInForce.GTC` + `fill_outside_rth=False`):
+        - Guards `< 1.0` fractional positions (`SIM-CLIENT-FRAC-STOP-{symbol}`), since Futu US
+          rejects server-side `STOP` and `GTC` orders on fractional lots.
+        - For whole-share (`>= 1.0`) positions in `REAL` mode, places/modifies a persistent
+          `TimeInForce.GTC` protective stop (`OrderType.STOP` default so overnight gap-downs never
+          leave `STOP_LIMIT` orders stranded unfilled; `OrderType.STOP_LIMIT` also supported).
         """
+        if shares <= 0:
+            return None
+        # Fractional share guard (< 1.0 sh): route strictly through client-side RTH stop monitor
+        if shares < 1.0:
+            if (
+                existing_order_id
+                and not existing_order_id.startswith(("SIM-", "PAPER-"))
+                and self.is_connected()
+            ):
+                self.cancel_order(existing_order_id)
+            return f"SIM-CLIENT-FRAC-STOP-{symbol}"
+
+        whole_shares = float(math.floor(shares)) if shares != math.floor(shares) else float(shares)
+
+        # Note: Futu SIMULATE / offline PAPER-LOCAL environment only supports NORMAL/MARKET orders;
+        # native GTC STOP orders are supported in REAL US trading.
+        if self.trd_env_name != "REAL":
+            return existing_order_id or f"SIM-LOCAL-STOP-{symbol}"
+
         if not self.is_connected() or self._trade_ctx is None:
             return existing_order_id
         ft = self._futu_mod
-
-        # Note: Futu SIMULATE paper environment only supports NORMAL/MARKET orders;
-        # native STOP orders are supported in REAL US trading.
-        if self.trd_env_name != "REAL":
-            return existing_order_id or f"SIM-LOCAL-STOP-{symbol}"
 
         acc_id = self._select_acc_id("REAL")
         if acc_id == 0:
             return existing_order_id
 
-        if existing_order_id:
+        use_stop_market = order_mode.strip().upper() != "STOP_LIMIT"
+        ord_type = ft.OrderType.STOP if use_stop_market else ft.OrderType.STOP_LIMIT
+        lim_px = round(stop_price, 2) if use_stop_market else round(stop_price * 0.995, 2)
+        trig_px = round(stop_price, 2)
+
+        if existing_order_id and not existing_order_id.startswith(("SIM-", "PAPER-")):
             with self._rpc_lock:
                 ret, _ = self._trade_ctx.modify_order(
                     modify_order_op=ft.ModifyOrderOp.NORMAL,
                     order_id=existing_order_id,
-                    qty=shares,
-                    price=round(stop_price * 0.995, 2),
-                    aux_price=round(stop_price, 2),
+                    qty=whole_shares,
+                    price=lim_px,
+                    aux_price=trig_px,
                     trd_env=self._trd_env(),
                     acc_id=acc_id,
                 )
@@ -710,18 +743,20 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
 
         with self._rpc_lock:
             ret, df = self._trade_ctx.place_order(
-                price=round(stop_price * 0.995, 2),
-                aux_price=round(stop_price, 2),
-                qty=shares,
+                price=lim_px,
+                aux_price=trig_px,
+                qty=whole_shares,
                 code=to_futu_us_code(symbol),
                 trd_side=ft.TrdSide.SELL,
-                order_type=ft.OrderType.STOP_LIMIT,
+                order_type=ord_type,
+                time_in_force=ft.TimeInForce.GTC,
+                fill_outside_rth=False,
                 trd_env=self._trd_env(),
                 acc_id=acc_id,
-                remark="zy-quant protective stop",
+                remark="zy-quant protective GTC stop",
             )
-        if ret != ft.RET_OK or df is None or df.empty:
-            logger.error("Failed placing server-side stop for %s: %s", symbol, df)
+        if ret != ft.RET_OK or df is None or isinstance(df, str) or df.empty:
+            logger.error("Failed placing server-side GTC stop for %s: %s", symbol, df)
             return None
         return str(df.iloc[0]["order_id"])
 

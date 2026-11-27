@@ -88,22 +88,23 @@ class ControlCenterApplication:
         while self.auto_loop_enabled:
             try:
                 res = await asyncio.to_thread(
-                    self.daemon.run_cycle, self.settings.active_tier_key, False, False
+                    self.daemon.step_scheduled, self.settings.active_tier_key, False, False
                 )
-                if not res.get("market_open", True):
+                if res.get("phase") == "MARKET_CLOSED" or not res.get("market_open", True):
                     if not was_closed_logged:
-                        self.logger.info("%s", res.get("session_message", "Market closed — scan paused"))
+                        self.logger.info("%s", res.get("session_message", "Market closed — pipeline idle"))
                         was_closed_logged = True
                 else:
                     was_closed_logged = False
                     self.logger.info(
-                        "Scan cycle completed: regime=%s, entries=%d, exits=%d, next=%dm",
-                        res["regime"],
-                        len(res["entries"]),
-                        len(res["exits"]),
-                        res["next_sleep_minutes"],
+                        "Pipeline tick completed: phase=%s, regime=%s, entries=%d, exits=%d, next=%dm",
+                        res.get("phase", res.get("market_phase", "ACTIVE")),
+                        res.get("regime", "IDLE"),
+                        len(res.get("entries", [])),
+                        len(res.get("exits", [])),
+                        res.get("next_sleep_minutes", 5),
                     )
-                sleep_s = max(30, int(res["next_sleep_minutes"] * 60))
+                sleep_s = max(30, int(res.get("next_sleep_minutes", 5) * 60))
             except Exception as exc:
                 self.logger.error("Scheduler cycle error: %s", exc)
                 sleep_s = 60
@@ -275,6 +276,8 @@ class BacktestRequest(BaseModel):
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     symbols: Optional[List[str]] = None
+    mode: Optional[str] = None
+    clock_mode: str = "auto"
 
 
 class DaemonToggleRequest(BaseModel):
@@ -358,6 +361,8 @@ def run_strategy_backtest(req: BacktestRequest) -> Dict[str, Any]:
         days=max(7, min(max_days, req.days)),
         start_date=req.start_date,
         end_date=req.end_date,
+        mode=req.mode,
+        clock_mode=req.clock_mode,
     )
     ctx.logger.info(
         "Backtest completed (%s -> %s): Net=%+.2f%%, Trades=%d, Fees=$%.2f",
@@ -388,15 +393,15 @@ def get_backend_logs(
 @app.post("/api/scan")
 def trigger_manual_scan() -> Dict[str, Any]:
     ctx.daemon._last_watchlist_scan_at = None
-    cycle = ctx.daemon.run_cycle(
+    cycle = ctx.daemon.step_scheduled(
         tier_override=ctx.settings.active_tier_key,
         check_edgar=False,
         force_when_closed=True,
     )
     ctx.logger.info(
-        "Manual market scan completed: regime=%s, watchlist_refreshed=%s",
-        cycle["regime"],
-        cycle["watchlist_refreshed"],
+        "Manual market scan completed: phase=%s, regime=%s",
+        cycle.get("phase", cycle.get("market_phase", "MANUAL")),
+        cycle.get("regime", "OK"),
     )
     return {"cycle": cycle}
 

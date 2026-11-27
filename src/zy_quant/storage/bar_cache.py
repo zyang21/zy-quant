@@ -194,3 +194,21 @@ class HistoricalBarCache:
             "total_bars": int(row["total_bars"] or 0) if row else 0,
             "distinct_symbols": int(row["distinct_symbols"] or 0) if row else 0,
         }
+
+    def get_close_at(self, symbol: str, timeframe: str, dt: datetime) -> Optional[float]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT close FROM market_bars WHERE symbol = ? AND timeframe = ? AND ts_epoch = ?",
+                (symbol.upper(), timeframe, self._to_utc_epoch(dt)),
+            ).fetchone()
+        return float(row["close"]) if row else None
+
+    def delete_symbol(self, symbol: str, timeframe: Optional[str] = None) -> None:
+        with self._connect() as conn:
+            if timeframe is None:
+                conn.execute("DELETE FROM market_bars WHERE symbol = ?", (symbol.upper(),))
+            else:
+                conn.execute(
+                    "DELETE FROM market_bars WHERE symbol = ? AND timeframe = ?",
+                    (symbol.upper(), timeframe),
+                )
