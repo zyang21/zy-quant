@@ -111,11 +111,18 @@ class QuantCLI:
             print("  (None)")
         else:
             for pos in snap["positions"]:
+                earn_txt = (
+                    f"  Earn=T-{pos['earnings_countdown_td']}d({pos.get('earnings_timing') or 'UNK'})"
+                    if pos.get("earnings_countdown_td") is not None
+                    else ""
+                )
+                cush_txt = pos.get("earnings_cushion_tier", "—")
                 print(
                     f"  {pos['symbol']:<6} {pos['setup']:<20} qty={pos['shares']:>6.2f}  "
                     f"${pos['entry_price']:.2f} -> ${pos['mark_price']:.2f}  "
                     f"PnL ${pos['unrealized_pnl_usd']:+.2f} ({pos['current_r']:+.2f}R)  "
-                    f"Stop ${pos['current_stop']:.2f} [{pos.get('stop_order_type', 'GTC')}] days={pos.get('days_held', 0)}"
+                    f"Stop ${pos['current_stop']:.2f} [{pos.get('stop_order_type', 'GTC')}] "
+                    f"days={pos.get('days_held', 0)}  Cushion={cush_txt}{earn_txt}"
                 )
 
     def run_history(

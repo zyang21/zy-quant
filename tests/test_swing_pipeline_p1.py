@@ -20,22 +20,31 @@ from zy_quant.gateway.alpaca_adapter import (
 )
 from zy_quant.gateway.futu_adapter import FutuGatewayAdapter
 from zy_quant.gateway.yfinance_adapter import YahooMarketDataAdapter
-from zy_quant.intel.earnings_calendar import normalize_nasdaq_earnings_timing
+from zy_quant.intel.earnings_calendar import (
+    EarningsCalendarFeed,
+    normalize_nasdaq_earnings_timing,
+)
 from zy_quant.intel.market_hours import (
     ET_TZ,
     add_trading_days,
     count_trading_days_between,
+    daily_bar_session_date,
+    is_trading_day,
 )
+from zy_quant.intel.watchlist_scorer import SwingWatchlistScorer
 from zy_quant.models import (
     Bar,
     BrokerOrderUpdate,
     EarningsEvent,
+    EntrySignal,
     ExitReason,
     OpenPosition,
     OrderSide,
     OrderStatus,
     PipelinePhase,
     PositionPlan,
+    QuoteSnapshot,
+    RegimeLight,
     SetupType,
 )
 from zy_quant.risk.correlation import compute_max_pairwise_correlation
@@ -102,45 +111,221 @@ def test_strategy_protocol_conformance_and_phase_clock_early_close() -> None:
     assert resolve_swing_phase(datetime(2026, 11, 26, 15, 40, tzinfo=ET_TZ).astimezone(timezone.utc)) == PipelinePhase.MARKET_CLOSED
 
 
+def _make_consistent_1d_and_15m_series(
+    symbol: str,
+    n_days: int = 270,
+    intraday_days: int = 45,
+    end_d: date = date(2026, 11, 25),
+    start_px: float = 140.0,
+    daily_drift: float = 0.0024,
+    seed_offset: int = 0,
+    breakout_on_last_offset: int = -1,
+) -> tuple[List[Bar], List[Bar]]:
+    """
+    Builds coherent 1d + 15m RTH bar series where every recent trading day's 26 x 15m candles
+    (09:30..15:45 ET) aggregate consistently to that day's 1d OHLCV and include clean VCP/Donchian breakouts.
+    """
+    trading_dates: List[date] = []
+    cur = end_d - timedelta(days=int(n_days * 1.65))
+    while cur <= end_d:
+        if is_trading_day(cur):
+            trading_dates.append(cur)
+        cur += timedelta(days=1)
+    trading_dates = trading_dates[-n_days:]
+
+    bars_1d: List[Bar] = []
+    bars_15m: List[Bar] = []
+    px = start_px
+    first_15m_idx = max(0, len(trading_dates) - intraday_days)
+
+    for idx, d_cur in enumerate(trading_dates):
+        # Engineer periodic tight contraction -> high-volume breakout cycles so swing setups fire deterministically
+        cycle_pos = (idx + seed_offset) % 32
+        is_breakout_day = (cycle_pos == 26) or (
+            breakout_on_last_offset >= 0 and idx == len(trading_dates) - 1 - breakout_on_last_offset
+        )
+        if 20 <= cycle_pos <= 25 and not is_breakout_day:
+            # Tight 6-day VCP consolidation
+            ret = 0.0008 if (cycle_pos % 2 == 0) else -0.0005
+            span_pct = 0.0045
+            day_vol = 6_500_000.0
+        elif is_breakout_day:
+            # Institutional breakout day (> prior 20d high on 1.85x RVOL, strong close near high)
+            ret = 0.032
+            span_pct = 0.006
+            day_vol = 15_500_000.0
+        else:
+            wave = math.sin((idx + seed_offset) * 0.29) * 0.004
+            ret = daily_drift + wave
+            span_pct = 0.010
+            day_vol = 8_200_000.0
+
+        o_px = round(px, 2)
+        c_px = round(max(25.0, o_px * (1.0 + ret)), 2)
+        h_px = round(max(o_px, c_px) * (1.0 + span_pct * 0.35), 2)
+        l_px = round(min(o_px, c_px) * (1.0 - span_pct * 0.45), 2)
+        if is_breakout_day:
+            # Close in upper 85% of day's range so both 15:45 ET and 16:00 ET confirm breakout cleanly
+            h_px = round(c_px * 1.0015, 2)
+            l_px = round(min(o_px, c_px) * 0.996, 2)
+
+        # Stamp 1d bars at 00:00 UTC on half the symbols and 05:00 UTC on the rest to exercise Finding #1!
+        hr_utc = 0 if (idx % 2 == 0) else 5
+        ts_1d = datetime(d_cur.year, d_cur.month, d_cur.day, hr_utc, 0, tzinfo=timezone.utc)
+        bars_1d.append(Bar(symbol, ts_1d, o_px, h_px, l_px, c_px, day_vol))
+
+        if idx >= first_15m_idx:
+            close_t = time(13, 0) if (d_cur == date(2026, 11, 27)) else time(16, 0)
+            n_15m = max(4, ((close_t.hour * 60 + close_t.minute) - (9 * 60 + 30)) // 15)
+            per_bar_vol = round(day_vol / float(n_15m), 2)
+            for b_i in range(n_15m):
+                frac_0 = b_i / float(n_15m)
+                # Reach 99.5% of daily move by 15:45 ET so 15:45 ET and T+1 Open have realistic institutional parity
+                frac_1 = min(1.0, (b_i + 1) / float(max(1, n_15m - 1))) if b_i < n_15m - 1 else 1.0
+                bo = o_px if b_i == 0 else round(o_px + (c_px - o_px) * min(1.0, (b_i) / float(max(1, n_15m - 1))), 2)
+                bc = c_px if b_i >= n_15m - 2 else round(o_px + (c_px - o_px) * frac_1, 2)
+                bh = h_px if b_i == n_15m // 2 else max(bo, bc)
+                bl = l_px if b_i == 1 else min(bo, bc)
+                ts_et = datetime.combine(d_cur, time(9, 30), tzinfo=ET_TZ) + timedelta(minutes=15 * b_i)
+                bars_15m.append(Bar(symbol, ts_et.astimezone(timezone.utc), bo, bh, bl, bc, per_bar_vol))
+
+        px = c_px
+
+    return bars_1d, bars_15m
+
+
 def test_swing_poison_bar_zero_lookahead_and_dual_clock_backtester(tmp_path: Path) -> None:
     """
-    Gate G1 Mandatory Poison-Bar Test:
-    Mutating `session_day`'s 16:00 ET `1d` close (stamped at 05:00 UTC) to $0.01 (-99.99%)
-    must produce 100% identical regime, correlation, signals, and `hybrid_1545` PnL!
+    Gate G1 & G7 Mandatory Poison-Bar + Dual-Clock Parity (< 0.3% drift) Test:
+      1. Mutating `session_day`'s 16:00 ET `1d` bar (both `00:00Z` & `05:00Z`) AND `15:45-16:00 ET`
+         closing `15m` bar to $0.01 (-99.99%) produces 100% identical regime, watchlist scores,
+         60d correlation, entry signals, non-empty `hybrid_1545` trades (`len > 0`), and PnL!
+      2. `clock_mode="1d"` vs `clock_mode="hybrid_1545"` over a shared active trading window
+         achieves `< 0.3%` net return parity (`abs(ret_1d - ret_hybrid) < 0.30`)!
     """
     settings = AppSettings.load()
     cache_clean = HistoricalBarCache(tmp_path / "swing_clean.db")
     cache_poison = HistoricalBarCache(tmp_path / "swing_poison.db")
 
-    for idx, sym in enumerate(["QQQ", "SPY", "NVDA", "XOM", "JPM"]):
-        b15 = YahooMarketDataAdapter.generate_synthetic_bars(sym, "15m", days=40)
-        last_d = b15[-1].timestamp.astimezone(ET_TZ).date()
-        b1d = _make_daily_series(sym, n_days=270, end_d=last_d - timedelta(days=1), seed_offset=idx * 5)
-        day_ts = datetime(last_d.year, last_d.month, last_d.day, 5, 0, tzinfo=timezone.utc)
+    syms = ["QQQ", "SPY", "NVDA", "XOM", "JPM"]
+    clean_map_1d: Dict[str, List[Bar]] = {}
+    poison_map_1d: Dict[str, List[Bar]] = {}
+    partial_1545_map: Dict[str, Bar] = {}
+    target_d = date(2026, 11, 25)
+    dec_1545_utc = datetime(2026, 11, 25, 15, 45, tzinfo=ET_TZ).astimezone(timezone.utc)
 
-        clean_1d = [*b1d, Bar(sym, day_ts, 210.0, 215.0, 208.0, 214.0, 12_000_000.0)]
-        poison_1d = [*b1d, Bar(sym, day_ts, 210.0, 215.0, 0.01, 0.01, 999_999_999.0)]
+    for idx, sym in enumerate(syms):
+        drift = 0.0018 if sym in ("QQQ", "SPY") else 0.0028
+        b1d, b15 = _make_consistent_1d_and_15m_series(
+            sym,
+            n_days=270,
+            intraday_days=45,
+            end_d=target_d,
+            start_px=150.0 + idx * 20.0,
+            daily_drift=drift,
+            seed_offset=idx * 7,
+            breakout_on_last_offset=0 if sym == "NVDA" else -1,
+        )
+        clean_map_1d[sym] = list(b1d)
+        # Poison BOTH `target_d`'s 00:00Z 1d bar AND `target_d`'s 15:45-16:00 ET closing 15m bar!
+        poison_1d = [
+            Bar(sym, datetime(target_d.year, target_d.month, target_d.day, 0, 0, tzinfo=timezone.utc), 200.0, 210.0, 0.01, 0.01, 999_999_999.0)
+            if daily_bar_session_date(x.timestamp) == target_d
+            else x
+            for x in b1d
+        ]
+        poison_15m = [
+            Bar(sym, x.timestamp, x.open, x.high, 0.01, 0.01, 999_999_999.0)
+            if (
+                x.timestamp.astimezone(ET_TZ).date() == target_d
+                and x.timestamp.astimezone(ET_TZ).time() >= time(15, 45)
+            )
+            else x
+            for x in b15
+        ]
+        poison_map_1d[sym] = poison_1d
+        p_bar = build_causal_partial_1d_bar(sym, [x for x in b15 if x.timestamp.astimezone(ET_TZ).date() == target_d], decision_ts_utc=dec_1545_utc)
+        assert p_bar is not None
+        partial_1545_map[sym] = p_bar
 
         cache_clean.upsert_bars("15m", b15)
-        cache_clean.upsert_bars("1d", clean_1d)
-        cache_poison.upsert_bars("15m", b15)
+        cache_clean.upsert_bars("1d", b1d)
+        cache_poison.upsert_bars("15m", poison_15m)
         cache_poison.upsert_bars("1d", poison_1d)
 
+    # 1. Direct Component Poison-Bar Invariance (Regime, Scorer, Correlation, Signal Engine)
+    swing_eng = DailySwingSignalEngine(
+        settings.strategy_cfg.entry, settings.strategy_cfg.regime, settings.strategy_cfg.swing
+    )
+    scorer = SwingWatchlistScorer(settings.watchlist_cfg, settings.strategy_cfg.swing)
+    reg_clean = swing_eng.evaluate_regime(
+        clean_map_1d["QQQ"], clean_map_1d["SPY"], clean_map_1d, as_of_date=target_d,
+        qqq_partial_bar=partial_1545_map["QQQ"], spy_partial_bar=partial_1545_map["SPY"], universe_partial_bars=partial_1545_map,
+    )
+    reg_poison = swing_eng.evaluate_regime(
+        poison_map_1d["QQQ"], poison_map_1d["SPY"], poison_map_1d, as_of_date=target_d,
+        qqq_partial_bar=partial_1545_map["QQQ"], spy_partial_bar=partial_1545_map["SPY"], universe_partial_bars=partial_1545_map,
+    )
+    assert reg_clean.light == reg_poison.light
+    assert reg_clean.qqq_sma50 == reg_poison.qqq_sma50
+    assert reg_clean.breadth_above_sma50_pct == reg_poison.breadth_above_sma50_pct
+
+    wl_clean = scorer.rank_swing_universe(
+        {}, clean_map_1d, clean_map_1d["QQQ"], reg_clean.light, target_d,
+        qqq_partial_bar=partial_1545_map["QQQ"], partial_bars_map=partial_1545_map,
+    )
+    wl_poison = scorer.rank_swing_universe(
+        {}, poison_map_1d, poison_map_1d["QQQ"], reg_poison.light, target_d,
+        qqq_partial_bar=partial_1545_map["QQQ"], partial_bars_map=partial_1545_map,
+    )
+    assert [(c.symbol, c.total_score) for c in wl_clean] == [(c.symbol, c.total_score) for c in wl_poison]
+
+    corr_clean, _ = compute_max_pairwise_correlation("NVDA", ["XOM", "JPM"], clean_map_1d, as_of_date=target_d)
+    corr_poison, _ = compute_max_pairwise_correlation("NVDA", ["XOM", "JPM"], poison_map_1d, as_of_date=target_d)
+    assert corr_clean == corr_poison
+
+    sig_clean = swing_eng.evaluate_entry(
+        "NVDA", "Semiconductors", reg_clean.light, 82.0, clean_map_1d["NVDA"], clean_map_1d["QQQ"],
+        as_of_date=target_d, partial_today_bar=partial_1545_map["NVDA"], qqq_partial_bar=partial_1545_map["QQQ"],
+    )
+    sig_poison = swing_eng.evaluate_entry(
+        "NVDA", "Semiconductors", reg_poison.light, 82.0, poison_map_1d["NVDA"], poison_map_1d["QQQ"],
+        as_of_date=target_d, partial_today_bar=partial_1545_map["NVDA"], qqq_partial_bar=partial_1545_map["QQQ"],
+    )
+    assert sig_clean is not None and sig_poison is not None
+    assert sig_clean.entry_price == sig_poison.entry_price and sig_clean.setup == sig_poison.setup
+
+    # 2. End-to-End Backtest Poison-Bar Test with non-empty closed trades (`len > 0`)!
     ad_clean = AlpacaMarketDataAdapter(AlpacaDataConfig(api_key="", secret_key=""), bar_cache=cache_clean)
     ad_poison = AlpacaMarketDataAdapter(AlpacaDataConfig(api_key="", secret_key=""), bar_cache=cache_poison)
+    earn_close_d = daily_bar_session_date(clean_map_1d["XOM"][-3].timestamp)
+    bt_earn = {
+        "XOM": EarningsEvent("XOM", earn_close_d, "AMC"),
+        "JPM": EarningsEvent("JPM", earn_close_d, "AMC"),
+    }
 
     bt_clean = BacktestEngine(settings, ad_clean).run(
-        tier_key="tier_10k", symbols=["NVDA", "XOM", "JPM"], days=30, mode="swing_1d", clock_mode="hybrid_1545"
+        tier_key="tier_10k", symbols=["NVDA", "XOM", "JPM"], days=40, mode="swing_1d", clock_mode="hybrid_1545", earnings_events=bt_earn
     )
     bt_poison = BacktestEngine(settings, ad_poison).run(
-        tier_key="tier_10k", symbols=["NVDA", "XOM", "JPM"], days=30, mode="swing_1d", clock_mode="hybrid_1545"
+        tier_key="tier_10k", symbols=["NVDA", "XOM", "JPM"], days=40, mode="swing_1d", clock_mode="hybrid_1545", earnings_events=bt_earn
     )
     assert bt_clean.clock_mode == "hybrid_1545"
+    assert len(bt_clean.trades) >= 1  # Non-vacuous: real swing trades executed & closed!
     assert bt_clean.trades == bt_poison.trades
     assert bt_clean.net_pnl_usd == bt_poison.net_pnl_usd
+    assert bt_clean.final_equity_usd == bt_poison.final_equity_usd
     assert bt_clean.green_bars == bt_poison.green_bars
 
-    # Also verify pure `1d` Primary Clock runs fast across 200+ days without needing 15m bars
+    # 3. Clock-Parity Verification Gate (`< 0.3%` return drift between `1d` and `hybrid_1545`)!
+    bt_1d_parity = BacktestEngine(settings, ad_clean).run(
+        tier_key="tier_10k", symbols=["NVDA", "XOM", "JPM"], days=40, mode="swing_1d", clock_mode="1d", earnings_events=bt_earn
+    )
+    assert bt_1d_parity.clock_mode == "1d"
+    assert len(bt_1d_parity.trades) >= 1
+    assert abs(bt_1d_parity.net_return_pct - bt_clean.net_return_pct) < 0.30
+
+    # 4. Multi-month pure `1d` Primary Clock speed & coverage check
     bt_1d = BacktestEngine(settings, ad_clean).run(
         tier_key="tier_10k", symbols=["NVDA", "XOM", "JPM"], days=180, mode="swing_1d", clock_mode="1d"
     )
@@ -495,3 +680,306 @@ def test_consolidate_local_preserves_alpaca_keys_and_split_cliff_resync(tmp_path
     )["NVDA"]
     assert calls >= 2  # Tail delta detected cliff -> purged -> full re-sync!
     assert synced[0].close == 38.5  # Pre-split $385 bar replaced with split-adjusted $38.50!
+
+
+def test_midnight_utc_daily_bar_and_completed_15m_partial_bar_causality(tmp_path: Path) -> None:
+    """
+    Regression tests for Review Findings #1 & #2:
+      - `00:00Z` daily bars resolve to `YYYY-MM-DD` (never `YYYY-MM-DD - 1` under `ET_TZ`)
+      - `build_causal_partial_1d_bar` requires full 15m bar completion (`ts + 15m <= decision_ts`)
+        and strictly excludes the `15:45-16:00 ET` closing bar even if evaluated at `15:52 ET`
+      - `get_effective_15m_volume_scale()` returns `1.0` for cached SIP / fallback bars and empirical
+        `SIP/IEX` median ratio only when live IEX bars were fetched
+    """
+    assert daily_bar_session_date(datetime(2026, 11, 25, 0, 0, tzinfo=timezone.utc)) == date(2026, 11, 25)
+    assert daily_bar_session_date(datetime(2026, 11, 25, 5, 0, tzinfo=timezone.utc)) == date(2026, 11, 25)
+
+    # Build 26 x 15m bars for 2026-11-25 where 15:30-15:45 closes at $155 and 15:45-16:00 closes at $0.01 (poison!)
+    d_sess = date(2026, 11, 25)
+    session_15m: List[Bar] = []
+    for k in range(26):
+        ts_et = datetime.combine(d_sess, time(9, 30), tzinfo=ET_TZ) + timedelta(minutes=15 * k)
+        c_val = 0.01 if k == 25 else (155.0 if k == 24 else 150.0 + k * 0.1)
+        session_15m.append(Bar("NVDA", ts_et.astimezone(timezone.utc), 150.0, max(151.0, c_val), min(149.0, c_val), c_val, 400_000.0))
+
+    # At 15:40 ET: 15:30-15:45 bar (k=24) is NOT yet complete -> close must come from k=23 (15:15-15:30)!
+    p_1540 = build_causal_partial_1d_bar("NVDA", session_15m, decision_ts_utc=datetime(2026, 11, 25, 15, 40, tzinfo=ET_TZ).astimezone(timezone.utc))
+    assert p_1540 is not None and p_1540.close == round(150.0 + 23 * 0.1, 2)
+
+    # At 15:45 ET: k=24 (15:30-15:45) IS complete ($155.0), k=25 (15:45-16:00) is excluded!
+    p_1545 = build_causal_partial_1d_bar("NVDA", session_15m, decision_ts_utc=datetime(2026, 11, 25, 15, 45, tzinfo=ET_TZ).astimezone(timezone.utc))
+    assert p_1545 is not None and p_1545.close == 155.0
+
+    # At 15:52 ET: `close - 15m` cap still strictly excludes k=25 ($0.01 closing bar)!
+    p_1552 = build_causal_partial_1d_bar("NVDA", session_15m, decision_ts_utc=datetime(2026, 11, 25, 15, 52, tzinfo=ET_TZ).astimezone(timezone.utc))
+    assert p_1552 is not None and p_1552.close == 155.0
+
+    # Verify SIP/IEX empirical calibration & source-aware `get_effective_15m_volume_scale`
+    cache = HistoricalBarCache(tmp_path / "vol_cal.db")
+    sip_bar_dt = datetime.now(timezone.utc).replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(days=3)
+    d_str = sip_bar_dt.strftime("%Y-%m-%d")
+    cache.upsert_bars("1d", [Bar("NVDA", sip_bar_dt, 140.0, 145.0, 139.0, 143.0, 44_000_000.0)])
+
+    def iex_handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"bars": {"NVDA": [{"t": f"{d_str}T05:00:00Z", "o": 140.0, "h": 145.0, "l": 139.0, "c": 143.0, "v": 2_000_000.0}]}, "next_page_token": None},
+        )
+
+    apca = AlpacaMarketDataAdapter(
+        AlpacaDataConfig(api_key="PK", secret_key="SK", feed="iex"),
+        bar_cache=cache,
+        http_client=httpx.Client(transport=httpx.MockTransport(iex_handler)),
+    )
+    ratios = apca.calibrate_sip_iex_volume_ratios(["NVDA"])
+    assert ratios["NVDA"] == 22.0  # Empirical 44M / 2M = 22.0x (NOT hardcoded 35x!)
+    apca.last_bars_feed[("NVDA", "15m")] = "SIP"
+    assert apca.get_effective_15m_volume_scale("NVDA") == 1.0  # Cached SIP -> 1.0x!
+    apca.last_bars_feed[("NVDA", "15m")] = "IEX"
+    assert apca.get_effective_15m_volume_scale("NVDA") == 22.0  # Live IEX -> 22.0x!
+
+
+def test_gtc_modify_failure_short_flip_guard_fractional_gap_and_multifill_ledger(tmp_path: Path) -> None:
+    """
+    Regression tests for Review Findings #3 & #4:
+      - `place_or_update_protective_stop` NEVER submits a duplicate `GTC STOP` if `modify_order`
+        AND `cancel_order` fail (zero short-flip hazard), and cancels before re-placing when needed
+      - Fractional `<1 sh` stop ignores pre-entry yesterday bars and prices marketable SELL below live bid on crash
+      - `_mark_order_submitted_safely` preserves fast push `FILLED` under `_order_lock`
+      - Multi-fill cumulative `avg_fill_price` (`5 @ $200` + `5 @ $202`) keeps stateful `virtual_cash` drift `$0.00`
+    """
+    adapter = FutuGatewayAdapter(trd_env="REAL")
+
+    class DummyFutu:
+        RET_OK = 0
+
+        class TrdEnv:
+            REAL = "REAL"
+            SIMULATE = "SIMULATE"
+
+        class TrdSide:
+            BUY = "BUY"
+            SELL = "SELL"
+
+        class OrderType:
+            STOP = "STOP"
+            STOP_LIMIT = "STOP_LIMIT"
+
+        class TimeInForce:
+            GTC = "GTC"
+
+        class ModifyOrderOp:
+            NORMAL = "NORMAL"
+            CANCEL = "CANCEL"
+
+    class GuardedTradeCtx:
+        def __init__(self) -> None:
+            self.allow_cancel = False
+            self.placed: List[Dict[str, Any]] = []
+            self.cancelled: List[str] = []
+
+        def get_acc_list(self) -> tuple[int, pd.DataFrame]:
+            return 0, pd.DataFrame([{"acc_id": 888, "trd_env": "REAL", "acc_type": "MARGIN"}])
+
+        def modify_order(self, **kwargs: Any) -> tuple[int, Any]:
+            if kwargs.get("modify_order_op") == "CANCEL":
+                if self.allow_cancel:
+                    self.cancelled.append(str(kwargs["order_id"]))
+                    return 0, pd.DataFrame([{"order_id": kwargs["order_id"]}])
+                return -1, "cancel timeout"
+            return -1, "modify rejected"
+
+        def place_order(self, **kwargs: Any) -> tuple[int, pd.DataFrame]:
+            self.placed.append(kwargs)
+            return 0, pd.DataFrame([{"order_id": f"NEW-GTC-{len(self.placed)}"}])
+
+    ctx = GuardedTradeCtx()
+    adapter._futu_mod = DummyFutu
+    adapter._trade_ctx = ctx
+    adapter.is_connected = lambda: True  # type: ignore[method-assign]
+    adapter.sync_open_orders = lambda refresh_cache=False: [  # type: ignore[method-assign]
+        BrokerOrderUpdate(
+            broker_order_id="OLD-GTC-12",
+            symbol="NVDA",
+            side=OrderSide.SELL,
+            order_type="STOP",
+            status=OrderStatus.SUBMITTED,
+            raw_status="SUBMITTED",
+            qty=12.0,
+            price=142.0,
+            filled_shares=0.0,
+            avg_fill_price=None,
+            remark="stop",
+        )
+    ]
+
+    # 1. Both modify AND cancel fail -> MUST keep OLD-GTC-12 and place ZERO duplicate GTC stops!
+    kept_oid = adapter.place_or_update_protective_stop("NVDA", 6.0, 148.0, existing_order_id="OLD-GTC-12")
+    assert kept_oid == "OLD-GTC-12"
+    assert len(ctx.placed) == 0
+
+    # 2. Modify fails, cancel succeeds -> cancels OLD-GTC-12 first, then places single 6-sh replacement GTC stop!
+    ctx.allow_cancel = True
+    replaced_oid = adapter.place_or_update_protective_stop("NVDA", 6.0, 148.0, existing_order_id="OLD-GTC-12")
+    assert replaced_oid == "NEW-GTC-1"
+    assert ctx.cancelled == ["OLD-GTC-12"]
+    assert len(ctx.placed) == 1 and ctx.placed[0]["qty"] == 6.0
+
+    # 3. Fractional stop: ignores yesterday's pre-entry low, and prices marketable sell near live $840 bid on crash!
+    settings = AppSettings.load()
+    store = StateStore(tmp_path / "frac_multifill.db")
+    daemon = TradingDaemon(settings, store=store, notifier=AlertNotifier())
+    pipe = DailySwingPipeline(daemon)
+
+    entry_t = datetime(2026, 11, 24, 20, 45, tzinfo=timezone.utc)
+    store.upsert_position(
+        OpenPosition("LLY", "Healthcare", 0.50, 0.50, 920.0, entry_t, 900.0, 900.0, 925.0, 20.0, stop_order_type="CLIENT_FRAC_RTH")
+    )
+    # Yesterday 14:00 ET bar (before entry_t!) had low $880, today quote is healthy $930 -> NO false stop!
+    daemon.market_data.get_bars = lambda sym, timeframe="15m", days=2: [  # type: ignore[method-assign]
+        Bar("LLY", datetime(2026, 11, 24, 19, 0, tzinfo=timezone.utc), 890.0, 895.0, 880.0, 892.0, 100_000.0)
+    ]
+    daemon.market_data.get_quote = lambda sym: QuoteSnapshot("LLY", 930.0, 929.8, 930.2, 900_000_000.0, datetime(2026, 11, 25, 14, 35, tzinfo=timezone.utc))  # type: ignore[method-assign]
+    assert pipe.execute_fractional_client_stops(datetime(2026, 11, 25, 14, 35, tzinfo=timezone.utc)) == []
+
+    # Now simulate live gap-down crash to $840 (well below $900 stop) with real broker account active:
+    submitted_limits: List[float] = []
+    daemon.gateway.has_target_account = lambda: True  # type: ignore[method-assign]
+    daemon.gateway.place_limit_order = lambda sym, side, qty, px, remark="": (submitted_limits.append(px) or "BRK-FRAC-1")  # type: ignore[method-assign]
+    daemon.market_data.get_quote = lambda sym: QuoteSnapshot("LLY", 840.0, 839.5, 840.5, 900_000_000.0, datetime(2026, 11, 25, 14, 36, tzinfo=timezone.utc))  # type: ignore[method-assign]
+    trig = pipe.execute_fractional_client_stops(datetime(2026, 11, 25, 14, 36, tzinfo=timezone.utc))
+    assert len(trig) == 1
+    assert submitted_limits[0] < 840.0  # Anchored below crashing $839.50 bid, NEVER hung at $900!
+
+    # 4. Fast push FILLED race on `_mark_order_submitted_safely` + Multi-fill `virtual_cash` exactness!
+    store_mf = StateStore(tmp_path / "multifill_exact.db")
+    daemon_mf = TradingDaemon(settings, store=store_mf, notifier=AlertNotifier())
+    tier_key = "tier_10k"
+    tier = settings.tiers_cfg.get_active(tier_key)
+    t0 = datetime(2026, 11, 25, 20, 40, tzinfo=timezone.utc)
+
+    buy_meta = {
+        "symbol": "MSFT", "sector": "Technology", "planned_shares": 10.0, "planned_entry_price": 200.0,
+        "limit_price": 202.5, "initial_stop": 188.0, "risk_per_share": 12.0, "entry_atr_1d": 5.5,
+        "setup": "DAILY_PULLBACK_EMA21", "tier_key": tier_key,
+    }
+    store_mf.record_order_intent("MF-BUY-1", "MSFT", OrderSide.BUY, 10.0, 202.5, "test", plan_meta=buy_meta, created_at=t0)
+    store_mf.update_order_status("MF-BUY-1", OrderStatus.SUBMITTED, broker_order_id="B-MF-1")
+
+    # Print 1: 5 sh @ $200.00 -> Print 2: remaining 5 sh @ $202.00 (cumulative avg_fill_price = $201.00!)
+    daemon_mf.on_broker_order_update(
+        BrokerOrderUpdate(
+            broker_order_id="B-MF-1", symbol="MSFT", side=OrderSide.BUY, order_type="NORMAL", status=OrderStatus.PARTIAL_FILLED,
+            raw_status="FILLED_PART", qty=10.0, price=202.5, filled_shares=5.0, avg_fill_price=200.0, remark="MF-BUY-1",
+        )
+    )
+    daemon_mf.on_broker_order_update(
+        BrokerOrderUpdate(
+            broker_order_id="B-MF-1", symbol="MSFT", side=OrderSide.BUY, order_type="NORMAL", status=OrderStatus.FILLED,
+            raw_status="FILLED_ALL", qty=10.0, price=202.5, filled_shares=10.0, avg_fill_price=201.0, remark="MF-BUY-1",
+        )
+    )
+    # Even if main thread calls `_mark_order_submitted_safely` AFTER fast FILLED push, status stays FILLED!
+    assert daemon_mf._mark_order_submitted_safely("MF-BUY-1", "B-MF-1", "fail") is True
+    ord_row = store_mf.get_order("MF-BUY-1")
+    assert ord_row is not None and ord_row["status"] == "FILLED"
+
+    rec_after_buy = store_mf.reconcile_stateful_ledger(tier_key, tier.reference_equity_usd)
+    assert rec_after_buy["ok"] is True
+    assert abs(rec_after_buy["drift_usd"]) <= 0.01  # $0.00 drift (NOT $5.00)!
+
+    # Multi-print SELL: 4 sh @ $215.00 -> 6 sh @ $220.00 (cumulative avg = $218.00)
+    sell_meta = {
+        "symbol": "MSFT", "entry_price": 201.0, "risk_per_share": 13.0, "setup": "DAILY_PULLBACK_EMA21",
+        "entry_time": t0.isoformat(), "exit_reason": "CHANDELIER_TRAIL", "is_scale_out": False, "tier_key": tier_key,
+    }
+    store_mf.record_order_intent("MF-SELL-1", "MSFT", OrderSide.SELL, 10.0, 215.0, "exit", plan_meta=sell_meta, created_at=t0)
+    store_mf.update_order_status("MF-SELL-1", OrderStatus.SUBMITTED, broker_order_id="S-MF-1")
+    daemon_mf.on_broker_order_update(
+        BrokerOrderUpdate(
+            broker_order_id="S-MF-1", symbol="MSFT", side=OrderSide.SELL, order_type="NORMAL", status=OrderStatus.PARTIAL_FILLED,
+            raw_status="FILLED_PART", qty=10.0, price=215.0, filled_shares=4.0, avg_fill_price=215.0, remark="MF-SELL-1",
+        )
+    )
+    daemon_mf.on_broker_order_update(
+        BrokerOrderUpdate(
+            broker_order_id="S-MF-1", symbol="MSFT", side=OrderSide.SELL, order_type="NORMAL", status=OrderStatus.FILLED,
+            raw_status="FILLED_ALL", qty=10.0, price=215.0, filled_shares=10.0, avg_fill_price=218.0, remark="MF-SELL-1",
+        )
+    )
+
+    rec_after_sell = store_mf.reconcile_stateful_ledger(tier_key, tier.reference_equity_usd)
+    assert rec_after_sell["ok"] is True
+    assert abs(rec_after_sell["drift_usd"]) <= 0.01
+
+
+def test_earnings_cache_resilience_amc_pead_yellow_sizing_and_web_swing_mode(tmp_path: Path) -> None:
+    """
+    Regression tests for Review Findings #5, #6, & #8:
+      - `EarningsCalendarFeed` preserves valid disk cache when Nasdaq HTTP fails (never overwrites with `{}`)
+      - `PEAD_CONTINUATION` evaluates gap reaction bar on `T+1` for `AMC` earnings
+      - Un-splittable 1-share lot at `+1.8R` (`< +2.5R`) exits 100% before earnings
+      - `YELLOW` (`0.65x`) & `tier_10k` `6%+` daily stops size cleanly without floor starvation
+      - `ControlCenterApplication.get_strategy_summary()` exposes `swing_1d` blueprint
+    """
+    cache_file = tmp_path / "earnings_calendar.json"
+    cache_file.write_text(
+        json.dumps({"updated_at": "2020-01-01T00:00:00+00:00", "events": {"NVDA": {"date": "2026-12-03", "timing": "AMC"}}}),
+        encoding="utf-8",
+    )
+
+    def broken_nasdaq(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, text="Service Unavailable")
+
+    feed = EarningsCalendarFeed(cache_path=cache_file, http_client=httpx.Client(transport=httpx.MockTransport(broken_nasdaq)))
+    ev_out = feed.get_upcoming_events(symbols=["NVDA"], ref_day=date(2026, 11, 25), allow_network=True)
+    assert "NVDA" in ev_out and ev_out["NVDA"].timing == "AMC"
+    disk_after = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert "NVDA" in disk_after["events"]  # Disk cache NOT wiped on HTTP 503!
+
+    # AMC PEAD Continuation: Wednesday AMC report (Nov 18) gaps up Thursday (Nov 19 = reaction_date), breaks out Monday Nov 23 (T+2)!
+    settings = AppSettings.load()
+    swing_eng = DailySwingSignalEngine(settings.strategy_cfg.entry, settings.strategy_cfg.regime, settings.strategy_cfg.swing)
+    qqq_d = _make_daily_series("QQQ", n_days=120, end_d=date(2026, 11, 23), start_px=480.0, daily_drift=0.001)
+    nvda_d = _make_daily_series("NVDA", n_days=120, end_d=date(2026, 11, 18), start_px=130.0, daily_drift=0.0015)
+    pre_c = nvda_d[-1].close
+    nvda_d.extend([
+        # Thu Nov 19 (AMC reaction gap-up +6.5%!)
+        Bar("NVDA", datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc), round(pre_c * 1.05, 2), round(pre_c * 1.07, 2), round(pre_c * 1.045, 2), round(pre_c * 1.065, 2), 18_000_000.0),
+        # Fri Nov 20 (tight inside consolidation holding above gap low)
+        Bar("NVDA", datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc), round(pre_c * 1.06, 2), round(pre_c * 1.068, 2), round(pre_c * 1.052, 2), round(pre_c * 1.064, 2), 9_000_000.0),
+        # Mon Nov 23 (T+2 PEAD continuation breakout above post-earnings high on 1.5x RVOL!)
+        Bar("NVDA", datetime(2026, 11, 23, 12, 0, tzinfo=timezone.utc), round(pre_c * 1.066, 2), round(pre_c * 1.09, 2), round(pre_c * 1.062, 2), round(pre_c * 1.085, 2), 16_000_000.0),
+    ])
+    pead_sig = swing_eng.evaluate_entry(
+        "NVDA", "Semiconductors", RegimeLight.GREEN, 85.0, nvda_d, qqq_d,
+        as_of_date=date(2026, 11, 23), recent_earnings=EarningsEvent("NVDA", date(2026, 11, 18), "AMC"), include_completed_as_of=True,
+    )
+    assert pead_sig is not None and pead_sig.setup == SetupType.PEAD_CONTINUATION
+
+    # Un-splittable 1-share lot at +1.8R (< +2.5R) exits 100% before earnings!
+    exit_eng = ScientificExitAndSizingEngine(settings.strategy_cfg.exit_models, FutuUSFeeModel())
+    tier_10k = settings.tiers_cfg.get_active("tier_10k")
+    pos_1sh = OpenPosition("COST", "Consumer", 1.0, 1.0, 900.0, datetime(2026, 11, 5, 15, 0, tzinfo=timezone.utc), 850.0, 850.0, 995.0, 50.0)
+    act_1sh = exit_eng.step_daily_position(
+        pos_1sh,
+        Bar("COST", datetime(2026, 11, 19, 12, 0, tzinfo=timezone.utc), 985.0, 995.0, 980.0, 990.0, 1_500_000.0),
+        atr_1d=18.0,
+        tier=tier_10k,
+        upcoming_earnings=EarningsEvent("COST", date(2026, 11, 19), "AMC"),
+    )
+    assert act_1sh.should_exit is True and act_1sh.shares_to_sell == 1.0
+
+    # YELLOW regime (`0.65x` scale) & `tier_10k` `6.05%` 1d stop approve whole-share swing sizing!
+    sig_200 = EntrySignal("META", "Communication", SetupType.VCP_PIVOT_BREAKOUT, datetime(2026, 11, 23, 20, 45, tzinfo=timezone.utc), 200.0, 5.5, 195.0, 1.6, 84.0, "test")
+    plan_green, st_g = exit_eng.build_swing_position_plan(sig_200, 10000.0, 10000.0, tier_10k, position_scale=1.0)
+    plan_yellow, st_y = exit_eng.build_swing_position_plan(sig_200, 10000.0, 10000.0, tier_10k, position_scale=0.65)
+    assert st_g == "APPROVED" and plan_green is not None and plan_green.shares == 8.0
+    assert st_y == "APPROVED" and plan_yellow is not None and plan_yellow.shares == 5.0
+
+    # Web strategy blueprint reflects `swing_1d`
+    from zy_quant.web.app import ctx as web_ctx
+
+    bp = web_ctx.get_strategy_summary(mode_override="swing_1d")
+    assert bp["mode"] == "swing_1d"
+    assert "GTC STOP" in bp["initial_stop_rule"]

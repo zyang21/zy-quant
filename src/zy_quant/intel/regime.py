@@ -5,7 +5,7 @@ from datetime import date, datetime, timezone
 from typing import Mapping, Optional, Sequence
 
 from zy_quant.config import RegimeConfig, SwingPipelineConfig
-from zy_quant.intel.market_hours import ET_TZ
+from zy_quant.intel.market_hours import ET_TZ, daily_bar_session_date
 from zy_quant.models import Bar, RegimeLight, RegimeSnapshot
 from zy_quant.strategy.indicators import compute_session_vwap, compute_sma
 
@@ -59,8 +59,7 @@ class MarketRegimeDetector:
         # Compute today's intraday return against prior completed daily close (anchored to ET_TZ)
         last_ts = qqq_intraday_15m[-1].timestamp
         session_d = last_ts.date() if last_ts.tzinfo is None else last_ts.astimezone(ET_TZ).date()
-        last_d_ts = qqq_daily[-1].timestamp
-        last_d_date = last_d_ts.date() if last_d_ts.tzinfo is None else last_d_ts.astimezone(ET_TZ).date()
+        last_d_date = daily_bar_session_date(qqq_daily[-1].timestamp)
         if last_d_date < session_d:
             prev_close = qqq_daily[-1].close
         elif len(qqq_daily) >= 2:
@@ -169,7 +168,7 @@ class DailyRegimeDetector:
 
     @staticmethod
     def _et_date(b: Bar) -> date:
-        return b.timestamp.date() if b.timestamp.tzinfo is None else b.timestamp.astimezone(ET_TZ).date()
+        return daily_bar_session_date(b.timestamp)
 
     def _slice_causal(
         self,
@@ -195,6 +194,7 @@ class DailyRegimeDetector:
         as_of_date: Optional[date] = None,
         qqq_partial_bar: Optional[Bar] = None,
         spy_partial_bar: Optional[Bar] = None,
+        universe_partial_bars: Optional[Mapping[str, Optional[Bar]]] = None,
         vix_level: Optional[float] = None,
         include_completed_as_of: bool = False,
     ) -> RegimeSnapshot:
@@ -238,7 +238,8 @@ class DailyRegimeDetector:
             for sym, ubars in universe_daily.items():
                 if sym in ("QQQ", "SPY"):
                     continue
-                u_slice = self._slice_causal(ubars, as_of_date, None, include_completed_as_of)
+                u_part = universe_partial_bars.get(sym) if universe_partial_bars else None
+                u_slice = self._slice_causal(ubars, as_of_date, u_part, include_completed_as_of)
                 if len(u_slice) >= 25:
                     counted += 1
                     u_c = [x.close for x in u_slice]

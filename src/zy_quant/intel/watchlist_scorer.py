@@ -4,7 +4,11 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from zy_quant.config import SwingPipelineConfig, UniverseSecurity, WatchlistScoringConfig
-from zy_quant.intel.market_hours import ET_TZ, count_trading_days_between
+from zy_quant.intel.market_hours import (
+    ET_TZ,
+    count_trading_days_between,
+    daily_bar_session_date,
+)
 from zy_quant.models import (
     Bar,
     CapitalFlowSnapshot,
@@ -233,46 +237,77 @@ class SwingWatchlistScorer(ConservativeWatchlistScorer):
         capital_flows: Optional[Mapping[str, CapitalFlowSnapshot]] = None,
         insiders: Optional[Mapping[str, InsiderActivity]] = None,
         earnings_events: Optional[Mapping[str, EarningsEvent]] = None,
+        qqq_partial_bar: Optional[Bar] = None,
+        partial_bars_map: Optional[Mapping[str, Optional[Bar]]] = None,
+        include_completed_as_of: bool = False,
+        universe_override: Optional[Sequence[UniverseSecurity]] = None,
     ) -> List[WatchlistCandidate]:
         flows = capital_flows or {}
         ins_map = insiders or {}
         earn_map = earnings_events or {}
+        part_map = partial_bars_map or {}
         hf = self.cfg.hard_filters
         w = self.cfg.weights
         now = datetime.now(timezone.utc)
 
-        q_causal = [
-            b
-            for b in qqq_daily_bars
-            if (b.timestamp.date() if b.timestamp.tzinfo is None else b.timestamp.astimezone(ET_TZ).date())
-            < as_of_date
-        ]
+        if include_completed_as_of:
+            q_series = [
+                b for b in qqq_daily_bars if daily_bar_session_date(b.timestamp) <= as_of_date
+            ]
+            q_causal = q_series[:-1]
+            q_curr_px = q_series[-1].close if q_series else 0.0
+        else:
+            q_causal = [
+                b for b in qqq_daily_bars if daily_bar_session_date(b.timestamp) < as_of_date
+            ]
+            q_quote = quotes.get("QQQ")
+            q_curr_px = (
+                qqq_partial_bar.close
+                if qqq_partial_bar is not None
+                else (q_quote.last_price if q_quote is not None else (q_causal[-1].close if q_causal else 0.0))
+            )
+
         q_ret_20 = 0.0
         q_ret_60 = 0.0
-        if len(q_causal) >= 2:
-            lb20 = min(20, len(q_causal) - 1)
-            lb60 = min(60, len(q_causal) - 1)
-            q_ret_20 = (q_causal[-1].close - q_causal[-1 - lb20].close) / max(0.01, q_causal[-1 - lb20].close)
-            q_ret_60 = (q_causal[-1].close - q_causal[-1 - lb60].close) / max(0.01, q_causal[-1 - lb60].close)
+        if len(q_causal) >= 2 and q_curr_px > 0:
+            lb20 = min(20, len(q_causal))
+            lb60 = min(60, len(q_causal))
+            q_ret_20 = (q_curr_px - q_causal[-lb20].close) / max(0.01, q_causal[-lb20].close)
+            q_ret_60 = (q_curr_px - q_causal[-lb60].close) / max(0.01, q_causal[-lb60].close)
 
         scored: List[WatchlistCandidate] = []
-        for sec in self.cfg.universe:
+        active_universe = universe_override if universe_override is not None else self.cfg.universe
+        for sec in active_universe:
             if sec.sector == "Broad_ETF":
                 continue
             q = quotes.get(sec.symbol)
             s_all = daily_bars_map.get(sec.symbol, [])
-            s_causal = [
-                b
-                for b in s_all
-                if (b.timestamp.date() if b.timestamp.tzinfo is None else b.timestamp.astimezone(ET_TZ).date())
-                < as_of_date
-            ]
-            if q is None and not s_causal:
-                continue
+            if include_completed_as_of:
+                s_upto = [
+                    b for b in s_all if daily_bar_session_date(b.timestamp) <= as_of_date
+                ]
+                if not s_upto:
+                    continue
+                s_today = s_upto[-1]
+                s_causal = s_upto[:-1]
+                curr_px = s_today.close
+                adv_bars = s_upto[-20:]
+            else:
+                s_causal = [
+                    b for b in s_all if daily_bar_session_date(b.timestamp) < as_of_date
+                ]
+                p_bar = part_map.get(sec.symbol)
+                if q is None and p_bar is None and not s_causal:
+                    continue
+                curr_px = (
+                    p_bar.close
+                    if p_bar is not None
+                    else (q.last_price if q is not None else s_causal[-1].close)
+                )
+                adv_bars = s_causal[-20:]
 
-            curr_px = q.last_price if q is not None else s_causal[-1].close
             adv = q.avg_daily_dollar_vol if q is not None else (
-                sum(b.close * b.volume for b in s_causal[-20:]) / max(1, min(20, len(s_causal)))
+                sum(b.close * b.volume for b in adv_bars) / max(1, len(adv_bars))
             )
             spread_bps = q.spread_bps if q is not None else 3.0
 
@@ -291,21 +326,21 @@ class SwingWatchlistScorer(ConservativeWatchlistScorer):
                 cal_d = (ev.report_date - as_of_date).days
                 trd_d = count_trading_days_between(as_of_date, ev.report_date)
                 if (
-                    cal_d <= self.swing_cfg.pre_earnings_buffer_calendar_days
+                    cal_d < self.swing_cfg.pre_earnings_buffer_calendar_days
                     or trd_d < self.swing_cfg.pre_earnings_buffer_trading_days
                 ):
                     reasons.append(f"earnings buffer ({trd_d}td/{cal_d}cd, {ev.timing})")
 
-            # Stage-2 + 20d/60d RS + Volatility Contraction scoring
+            # Stage-2 + 20d/60d RS + Volatility Contraction scoring (symmetric `curr_px` vs `N` completed days ago)
             rs_20 = 0.0
             rs_60 = 0.0
             stage2_bonus = 0.0
             vcp_bonus = 0.0
             if len(s_causal) >= 21:
-                lb20 = min(20, len(s_causal) - 1)
-                lb60 = min(60, len(s_causal) - 1)
-                rs_20 = ((curr_px - s_causal[-1 - lb20].close) / max(0.01, s_causal[-1 - lb20].close)) - q_ret_20
-                rs_60 = ((curr_px - s_causal[-1 - lb60].close) / max(0.01, s_causal[-1 - lb60].close)) - q_ret_60
+                lb20 = min(20, len(s_causal))
+                lb60 = min(60, len(s_causal))
+                rs_20 = ((curr_px - s_causal[-lb20].close) / max(0.01, s_causal[-lb20].close)) - q_ret_20
+                rs_60 = ((curr_px - s_causal[-lb60].close) / max(0.01, s_causal[-lb60].close)) - q_ret_60
                 closes = [b.close for b in s_causal]
                 sma50 = compute_sma(closes, min(50, len(closes)))
                 sma200 = compute_sma(closes, min(200, len(closes)))

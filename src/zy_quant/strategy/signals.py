@@ -4,7 +4,7 @@ from datetime import date
 from typing import Mapping, Optional, Sequence
 
 from zy_quant.config import EntryConfig, RegimeConfig
-from zy_quant.intel.market_hours import ET_TZ
+from zy_quant.intel.market_hours import ET_TZ, daily_bar_session_date
 from zy_quant.models import (
     Bar,
     CapitalFlowSnapshot,
@@ -54,22 +54,12 @@ class IntradaySignalEngine:
             return False
 
         prior_stock_d = (
-            [
-                b
-                for b in stock_daily_bars
-                if (b.timestamp.date() if b.timestamp.tzinfo is None else b.timestamp.astimezone(ET_TZ).date())
-                < session_day  # type: ignore[operator]
-            ]
+            [b for b in stock_daily_bars if daily_bar_session_date(b.timestamp) < session_day]  # type: ignore[operator]
             if stock_daily_bars
             else []
         )
         prior_qqq_d = (
-            [
-                b
-                for b in qqq_daily_bars
-                if (b.timestamp.date() if b.timestamp.tzinfo is None else b.timestamp.astimezone(ET_TZ).date())
-                < session_day  # type: ignore[operator]
-            ]
+            [b for b in qqq_daily_bars if daily_bar_session_date(b.timestamp) < session_day]  # type: ignore[operator]
             if qqq_daily_bars
             else []
         )

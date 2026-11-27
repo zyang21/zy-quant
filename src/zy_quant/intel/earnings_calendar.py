@@ -52,10 +52,12 @@ class EarningsCalendarFeed:
         cache_path: Optional[Path] = None,
         ttl_hours: int = 12,
         lookahead_days: int = 16,
+        http_client: Optional[httpx.Client] = None,
     ) -> None:
         self.cache_path = cache_path
         self.ttl = timedelta(hours=ttl_hours)
         self.lookahead_days = lookahead_days
+        self._http_client = http_client
         self._mem_cache: Optional[tuple[datetime, Dict[str, EarningsEvent]]] = None
 
     def get_upcoming_events(
@@ -80,15 +82,20 @@ class EarningsCalendarFeed:
 
         today = ref_day or now.astimezone(ET_TZ).date()
         fetched: Dict[str, EarningsEvent] = {}
+        any_http_ok = False
         try:
-            with httpx.Client(timeout=6.0, headers=self.HEADERS) as client:
-                for offset in range(-2, self.lookahead_days + 1):
+            owned = self._http_client is None
+            client = self._http_client or httpx.Client(timeout=6.0, headers=self.HEADERS)
+            try:
+                # Look back 10 calendar days (~7 trading days) so PEAD T+1..T+5 is reachable!
+                for offset in range(-10, self.lookahead_days + 1):
                     q_day = today + timedelta(days=offset)
                     if q_day.weekday() >= 5:
                         continue
                     resp = client.get(self.NASDAQ_URL, params={"date": q_day.isoformat()})
                     if resp.status_code != 200:
                         continue
+                    any_http_ok = True
                     rows = ((resp.json().get("data") or {}).get("rows")) or []
                     for r in rows:
                         sym = str(r.get("symbol") or "").strip().upper()
@@ -99,18 +106,27 @@ class EarningsCalendarFeed:
                         if sym not in fetched:
                             fetched[sym] = ev
                         else:
-                            # Prefer upcoming (>= today) or closest report_date to `today`
                             prev_d = fetched[sym].report_date
                             if (q_day >= today and prev_d < today) or (
                                 abs((q_day - today).days) < abs((prev_d - today).days)
                             ):
                                 fetched[sym] = ev
+            finally:
+                if owned:
+                    client.close()
         except Exception as exc:
             logger.debug("Earnings calendar network refresh skipped: %s", exc)
 
-        self._mem_cache = (now, fetched)
-        self._write_disk_cache(now, fetched)
-        return self._filter(fetched, target_set)
+        if any_http_ok:
+            self._mem_cache = (now, fetched)
+            self._write_disk_cache(now, fetched)
+            return self._filter(fetched, target_set)
+
+        # Never poison disk/memory cache with `{}` on network failure; fall back to stale disk cache if present!
+        stale_disk = self._read_disk_cache(now, ignore_ttl=True)
+        if stale_disk is not None:
+            return self._filter(stale_disk, target_set)
+        return {}
 
     def get_upcoming_earnings(
         self,
@@ -130,13 +146,15 @@ class EarningsCalendarFeed:
             return dict(full_map)
         return {k: v for k, v in full_map.items() if k in target_set}
 
-    def _read_disk_cache(self, now: datetime) -> Optional[Dict[str, EarningsEvent]]:
+    def _read_disk_cache(
+        self, now: datetime, ignore_ttl: bool = False
+    ) -> Optional[Dict[str, EarningsEvent]]:
         if self.cache_path is None or not self.cache_path.exists():
             return None
         try:
             raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
             updated_at = datetime.fromisoformat(str(raw["updated_at"]))
-            if (now - updated_at) >= self.ttl:
+            if not ignore_ttl and (now - updated_at) >= self.ttl:
                 return None
             out: Dict[str, EarningsEvent] = {}
             events_raw = raw.get("events")

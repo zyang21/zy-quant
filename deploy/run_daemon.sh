@@ -15,10 +15,16 @@ if [[ -f "${MANUAL_FLAG}" ]]; then
 else
     # Triggered by launchd StartCalendarInterval (Two-Window Wake: 09:20 ET Open Guard & 15:25 ET EOD Window):
     SHOULD_START="$(
-        "${ROOT_DIR}/.venv/bin/python" - <<'PY'
-from datetime import datetime, timezone
-from zy_quant.intel.market_hours import ET_TZ, get_us_market_session, is_trading_day, session_close_time
+        "${ROOT_DIR}/.venv/bin/python" - "${ROOT_DIR}" <<'PY'
+import sys
+from datetime import datetime, time, timezone
+from pathlib import Path
 
+from zy_quant.config import AppSettings
+from zy_quant.intel.market_hours import ET_TZ, get_us_market_session, is_trading_day, session_close_time
+from zy_quant.storage.state_store import StateStore
+
+root = Path(sys.argv[1])
 now_utc = datetime.now(timezone.utc)
 now_et = now_utc.astimezone(ET_TZ)
 s = get_us_market_session(now_utc)
@@ -26,14 +32,41 @@ d = now_et.date()
 
 if not is_trading_day(d):
     print(f"NO|{s.phase}|{s.et_now_str}|{s.minutes_until_open}")
-else:
-    hm = now_et.hour * 60 + now_et.minute
-    close_t = session_close_time(d)
-    close_m = close_t.hour * 60 + close_t.minute
+    sys.exit(0)
+
+settings = AppSettings.load(root)
+hm = now_et.hour * 60 + now_et.minute
+close_t = session_close_time(d)
+close_m = close_t.hour * 60 + close_t.minute
+
+if settings.strategy_cfg.mode != "swing_1d":
     if s.is_open or (s.phase == "PRE_MARKET" and s.minutes_until_open <= 45) or (close_m <= hm <= close_m + 15):
         print(f"YES|{s.phase}|{s.et_now_str}|{s.minutes_until_open}")
     else:
         print(f"NO|{s.phase}|{s.et_now_str}|{s.minutes_until_open}")
+    sys.exit(0)
+
+# swing_1d Two-Window Filter (prevents false wakes at 10:20 EDT summer / 14:25 EST winter & 08:20 EST / 16:25 EDT):
+store = StateStore(settings.resolve_db_path())
+today_iso = d.isoformat()
+is_early_close_day = close_t != time(16, 0)
+in_open_window = (9 * 60 + 10) <= hm <= (9 * 60 + 50)
+in_eod_window = (close_m - 40) <= hm <= (close_m + 20)
+
+# Catch-up safety: if Mac lid opened late and missed OPEN_GAP_GUARD or has <1sh fractional positions, allow start
+open_guard_done = store.has_completed_pipeline_phase(today_iso, "OPEN_GAP_GUARD")
+settlement_done = store.has_completed_pipeline_phase(today_iso, "POST_CLOSE_SETTLEMENT")
+positions = store.get_positions()
+needs_rth_watch = is_early_close_day or any(
+    p.shares < 1.0 or not p.broker_stop_order_id for p in positions.values()
+)
+missed_open_guard = s.is_open and not open_guard_done
+missed_settlement = (close_m < hm <= close_m + 35) and not settlement_done
+
+if in_open_window or in_eod_window or (s.is_open and needs_rth_watch) or missed_open_guard or missed_settlement:
+    print(f"YES|{s.phase}|{s.et_now_str}|{s.minutes_until_open}")
+else:
+    print(f"NO|{s.phase}|{s.et_now_str}|{s.minutes_until_open}")
 PY
     )"
     IFS='|' read -r DECISION PHASE ET_NOW MINS_UNTIL <<< "${SHOULD_START}"
@@ -65,13 +98,14 @@ from datetime import datetime, time, timezone
 from pathlib import Path
 
 from zy_quant.config import AppSettings
-from zy_quant.intel.market_hours import ET_TZ, get_us_market_session, session_close_time
+from zy_quant.intel.market_hours import ET_TZ, get_us_market_session, is_trading_day, session_close_time
 from zy_quant.storage.state_store import StateStore
 
 root = Path(sys.argv[1])
 now_utc = datetime.now(timezone.utc)
 now_et = now_utc.astimezone(ET_TZ)
-today_iso = now_et.date().isoformat()
+today_d = now_et.date()
+today_iso = today_d.isoformat()
 sess = get_us_market_session(now_utc)
 settings = AppSettings.load(root)
 store = StateStore(settings.resolve_db_path())
@@ -81,15 +115,28 @@ if active_orders:
     print(f"WAIT_ORDERS|{len(active_orders)}")
     sys.exit(0)
 
-close_t = session_close_time(now_et.date())
+if not is_trading_day(today_d):
+    print(f"EXIT_IDLE_NON_TRADING_DAY|{sess.et_now_str}")
+    sys.exit(0)
+
+close_t = session_close_time(today_d)
 close_m = close_t.hour * 60 + close_t.minute
 now_m = now_et.hour * 60 + now_et.minute
 is_early_close_day = close_t != time(16, 0)
 
-# 1. Post-close exit: once >= 5m past close (and POST_CLOSE_SETTLEMENT done in swing_1d mode), sleep overnight!
+# 0. Overnight / early pre-market (< 09:10 ET): never hold caffeinate overnight across midnight rollover!
+if now_m < (9 * 60 + 10):
+    print(f"EXIT_IDLE_OVERNIGHT|{sess.et_now_str}")
+    sys.exit(0)
+
+# 1. Post-close exit: once >= 5m past close (and POST_CLOSE_SETTLEMENT done, or hard +35m timeout reached), sleep!
 if not sess.is_open and sess.phase != "PRE_MARKET":
     if now_m >= close_m + 5:
-        if settings.strategy_cfg.mode != "swing_1d" or store.has_completed_pipeline_phase(today_iso, "POST_CLOSE_SETTLEMENT"):
+        if (
+            settings.strategy_cfg.mode != "swing_1d"
+            or store.has_completed_pipeline_phase(today_iso, "POST_CLOSE_SETTLEMENT")
+            or now_m >= close_m + 35
+        ):
             print(f"EXIT_IDLE_POST_CLOSE|{sess.et_now_str}")
             sys.exit(0)
     print("KEEP_RUNNING")
@@ -118,7 +165,11 @@ PY
 
 # Keep system and network awake with caffeinate -is (allows display sleep) and auto-restart on unexpected crash.
 while [[ "${STOP_REQUESTED}" -eq 0 ]]; do
-    /usr/bin/caffeinate -is "${ROOT_DIR}/.venv/bin/zy-quant" dashboard &
+    if [[ "${LAUNCH_MODE}" == "MANUAL" ]]; then
+        /usr/bin/caffeinate -is "${ROOT_DIR}/.venv/bin/zy-quant" dashboard &
+    else
+        /usr/bin/caffeinate -is "${ROOT_DIR}/.venv/bin/zy-quant" dashboard --auto-daemon &
+    fi
     CHILD_PID=$!
 
     if [[ "${LAUNCH_MODE}" == "MANUAL" ]]; then

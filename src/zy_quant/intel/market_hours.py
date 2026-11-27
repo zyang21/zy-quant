@@ -110,6 +110,23 @@ def count_trading_days_between(start_d: date, end_d: date) -> int:
     return cnt
 
 
+def daily_bar_session_date(bar_ts: datetime) -> date:
+    """
+    Canonical US session-date extractor for `1d` daily bars across all providers:
+      - Futu (`YYYY-MM-DD 00:00:00Z`), Alpaca (`04:00Z`/`05:00Z`), and Noon-UTC (`12:00Z`) daily
+        bars encode the exact session calendar date in UTC (`hour < 17`) — converting `00:00Z`
+        via `.astimezone(ET_TZ)` would erroneously roll back `-1` day to `19:00/20:00 ET`!
+      - Timestamps at or after `17:00 UTC` (e.g. EOD snapshots stamped at `20:00/21:00 UTC`)
+        are converted via `ET_TZ`.
+    """
+    if bar_ts.tzinfo is None:
+        return bar_ts.date()
+    utc_dt = bar_ts.astimezone(timezone.utc)
+    if utc_dt.hour < 17:
+        return utc_dt.date()
+    return utc_dt.astimezone(ET_TZ).date()
+
+
 def next_regular_open(now_et: datetime) -> datetime:
     cur_date = now_et.date()
     open_today = datetime.combine(cur_date, time(9, 30), tzinfo=ET_TZ)

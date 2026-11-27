@@ -102,6 +102,8 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         self.used_alpaca: bool = False
         self.last_prev_closes: Dict[str, float] = {}
         self.sip_iex_vol_ratios: Dict[str, float] = {}
+        self.last_bars_feed: Dict[tuple[str, str], str] = {}
+        self._last_http_feed_used: str = self.feed
 
     def _get_http_client(self) -> httpx.Client:
         if self._client is not None:
@@ -139,6 +141,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             if resp.status_code == 200:
                 self.last_error = ""
                 self.used_alpaca = True
+                self._last_http_feed_used = str(params.get("feed") or self.feed)
                 return resp.json()
 
             # Free tier restricts real-time (<15m) SIP; transparently retry with 'iex'
@@ -150,6 +153,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                 if resp2.status_code == 200:
                     self.last_error = ""
                     self.used_alpaca = True
+                    self._last_http_feed_used = "iex"
                     return resp2.json()
 
             self.last_error = f"Alpaca HTTP {resp.status_code}: {resp.text[:180]}"
@@ -418,12 +422,14 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
 
             merged_out: Dict[str, List[Bar]] = {}
             new_bars_flat: List[Bar] = []
+            actual_feed = self._last_http_feed_used if pref_feed == "sip" else pref_feed
             for batch, fmap in zip(batches, batch_outputs):
                 for s in batch:
                     s_bars = sorted(fmap[s], key=lambda b: b.timestamp)
                     if s_bars:
                         merged_out[s] = s_bars
                         new_bars_flat.extend(s_bars)
+                        self.last_bars_feed[(s, timeframe)] = actual_feed
             if new_bars_flat and self.bar_cache is not None:
                 self.bar_cache.upsert_bars(timeframe, new_bars_flat)
             return merged_out
@@ -489,8 +495,22 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         if bars:
             return bars
         if self.fallback is not None:
-            return self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
+            fb_bars = self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
+            if fb_bars:
+                self.last_bars_feed[(symbol.upper(), timeframe)] = "sip_consolidated"
+            return fb_bars
         return []
+
+    def get_effective_15m_volume_scale(self, symbol: str) -> float:
+        """
+        Returns the SIP/IEX volume calibration factor ONLY when the latest 15m bars for `symbol`
+        actually came from live `iex` feed; returns `1.0` for cached `sip` or Futu fallback bars!
+        """
+        sym_u = symbol.upper()
+        src_feed = str(self.last_bars_feed.get((sym_u, "15m"), "sip")).lower()
+        if src_feed == "iex":
+            return float(self.sip_iex_vol_ratios.get(sym_u, 35.0))
+        return 1.0
 
     def get_quote(self, symbol: str) -> Optional[QuoteSnapshot]:
         snaps = self.get_snapshots_batch([symbol])
@@ -537,24 +557,65 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
     def calibrate_sip_iex_volume_ratios(self, symbols: Sequence[str]) -> Dict[str, float]:
         """
         Computes empirical 20-day consolidated SIP / IEX volume multipliers during PRE_OPEN_SYNC
-        so live 15:40 ET `partial_1d_bar` volume matches historical SIP `1d` bars without distortion.
+        by comparing historical `sip` 1d volume against `iex` 1d volume per symbol.
         """
         clean = [s.strip().upper() for s in symbols if s and not s.startswith("^")]
         if not clean:
             return {}
-        if self.bar_cache is not None:
-            start_35d = datetime.now(timezone.utc) - timedelta(days=38)
-            sip_1d = self.bar_cache.get_bars_batch(clean, "1d", start_dt=start_35d)
-        else:
-            sip_1d = {}
-
-        default_ratio = 35.0 if self.feed == "iex" else 1.0
-        for sym in clean:
-            d_list = sip_1d.get(sym, [])
-            if d_list and self.feed != "iex":
+        if self.feed != "iex":
+            for sym in clean:
                 self.sip_iex_vol_ratios[sym] = 1.0
+            return dict(self.sip_iex_vol_ratios)
+
+        start_35d = datetime.now(timezone.utc) - timedelta(days=35)
+        end_hist = datetime.now(timezone.utc) - timedelta(days=1)
+        sip_1d = (
+            self.bar_cache.get_bars_batch(clean, "1d", start_dt=start_35d)
+            if self.bar_cache is not None
+            else {}
+        )
+        iex_vols: Dict[str, Dict[str, float]] = {}
+        if self.has_credentials():
+            s_iso = start_35d.strftime("%Y-%m-%dT%H:%M:%SZ")
+            e_iso = end_hist.strftime("%Y-%m-%dT%H:%M:%SZ")
+            for idx in range(0, len(clean), 50):
+                batch = clean[idx : idx + 50]
+                payload = self._request_json(
+                    "/v2/stocks/bars",
+                    params={
+                        "symbols": ",".join(batch),
+                        "timeframe": "1Day",
+                        "start": s_iso,
+                        "end": e_iso,
+                        "adjustment": "all",
+                        "feed": "iex",
+                        "limit": 5000,
+                    },
+                )
+                if payload and isinstance(payload.get("bars"), dict):
+                    for sym_k, rlist in payload["bars"].items():
+                        dmap: Dict[str, float] = {}
+                        for item in rlist or []:
+                            v = float(item.get("v") or 0.0)
+                            if v > 0:
+                                dmap[str(item["t"])[:10]] = v
+                        iex_vols[sym_k.upper()] = dmap
+
+        for sym in clean:
+            s_bars = sip_1d.get(sym, [])
+            imap = iex_vols.get(sym, {})
+            ratios: List[float] = []
+            for b in s_bars[-20:]:
+                d_key = b.timestamp.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                iv = imap.get(d_key, 0.0)
+                if iv > 0 and b.volume > 0:
+                    ratios.append(b.volume / iv)
+            if ratios:
+                ratios.sort()
+                med = ratios[len(ratios) // 2]
+                self.sip_iex_vol_ratios[sym] = round(max(10.0, min(65.0, med)), 2)
             elif sym not in self.sip_iex_vol_ratios:
-                self.sip_iex_vol_ratios[sym] = default_ratio
+                self.sip_iex_vol_ratios[sym] = 35.0
         return dict(self.sip_iex_vol_ratios)
 
 
@@ -565,25 +626,36 @@ def build_causal_partial_1d_bar(
     volume_scale_mult: float = 1.0,
 ) -> Optional[Bar]:
     """
-    Constructs a strictly causal `partial_1d_bar` from `[09:30 ET .. decision_ts]` 15m bars:
-      - Zero look-ahead: ignores any 15m bar starting after `decision_ts_utc`
-      - Normalizes partial-day volume by an empirical intraday U-curve completion fraction
-        (e.g. at 15:40 ET ~82% of full-day volume has traded; final 20m closing auction is ~18%)
-        and `volume_scale_mult` (1.0 when bars come from SIP cache/Futu, ~35.0 when live raw IEX).
+    Constructs a strictly causal `partial_1d_bar` from completed `[09:30 ET .. decision_ts]` 15m bars:
+      - Zero intrabar look-ahead: 15m bars are stamped at bar OPEN (`09:30, ..., 15:30 ET`),
+        so only bars that have FULLY CLOSED (`b.timestamp + 15m <= decision_ts_utc`) and precede
+        the final 15-minute closing bar (`< close - 15m`) are admitted!
+      - Normalizes partial-day volume by intraday U-curve completion fraction and `volume_scale_mult`.
     """
     if not bars_15m_session:
         return None
-    sliced = (
-        [b for b in bars_15m_session if b.timestamp <= decision_ts_utc]
-        if decision_ts_utc is not None
-        else list(bars_15m_session)
-    )
+    if decision_ts_utc is not None:
+        # Enforce full 15m bar completion AND cap at `close - 15m` so the 15:45-16:00 closing bar never leaks
+        dec_et = decision_ts_utc.astimezone(ET_TZ)
+        close_t = session_close_time(dec_et.date())
+        max_eod_cutoff_utc = datetime(
+            dec_et.year, dec_et.month, dec_et.day, close_t.hour, close_t.minute, 0, tzinfo=ET_TZ
+        ).astimezone(timezone.utc) - timedelta(minutes=15)
+        # Note: at `15:45 ET` (`close - 15m`), the `15:30-15:45 ET` bar has just finished (`15:30 + 15m <= 15:45`),
+        # while the `15:45-16:00 ET` closing bar (`15:45 + 15m = 16:00 > 15:45`) is strictly excluded!
+        eff_cutoff = min(decision_ts_utc, max_eod_cutoff_utc) if dec_et.date() == bars_15m_session[-1].timestamp.astimezone(ET_TZ).date() else decision_ts_utc
+        sliced = [b for b in bars_15m_session if (b.timestamp + timedelta(minutes=15)) <= eff_cutoff]
+    else:
+        sliced = list(bars_15m_session)
+
     if not sliced:
         return None
 
     last_ts = sliced[-1].timestamp
     et_last = last_ts.astimezone(ET_TZ)
     session_d = et_last.date()
+    if decision_ts_utc is not None and session_d != decision_ts_utc.astimezone(ET_TZ).date():
+        return None
     session_bars = [b for b in sliced if b.timestamp.astimezone(ET_TZ).date() == session_d]
     if not session_bars:
         return None
@@ -591,12 +663,11 @@ def build_causal_partial_1d_bar(
     close_t = session_close_time(session_d)
     total_expected_bars = max(1, ((close_t.hour * 60 + close_t.minute) - (9 * 60 + 30)) // 15)
     elapsed_bars = len(session_bars)
-    # Account for closing-auction volume concentration (~18% in final bar)
     progress_frac = min(1.0, max(0.20, (elapsed_bars / float(total_expected_bars)) * 0.85))
     raw_vol = sum(max(0.0, b.volume) for b in session_bars)
     projected_full_day_vol = (raw_vol * max(0.01, volume_scale_mult)) / progress_frac
 
-    day_anchor = datetime(session_d.year, session_d.month, session_d.day, 5, 0, tzinfo=timezone.utc)
+    day_anchor = datetime(session_d.year, session_d.month, session_d.day, 12, 0, tzinfo=timezone.utc)
     return Bar(
         symbol=symbol.upper(),
         timestamp=day_anchor,

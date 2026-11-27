@@ -56,7 +56,11 @@ class YahooMarketDataAdapter(MarketDataAdapter):
                 if df is not None and not df.empty:
                     for idx, row in df.iterrows():
                         ts = idx.to_pydatetime()
-                        if ts.tzinfo is None:
+                        if timeframe == "1d":
+                            # Anchor 1d session bars to 12:00 UTC on their trading date so ET_TZ never shifts -1 day
+                            d_sess = idx.date()
+                            ts = datetime(d_sess.year, d_sess.month, d_sess.day, 12, 0, tzinfo=timezone.utc)
+                        elif ts.tzinfo is None:
                             ts = ts.replace(tzinfo=timezone.utc)
                         bars.append(
                             Bar(

@@ -37,7 +37,7 @@ export class BacktestLabView {
         <div class="panel-header">
           <div>
             <div class="panel-title">Historical Strategy Backtest</div>
-            <div class="panel-subtitle">Replay chronological 15-minute US market candles with exact 2026 Futu commission, platform, settlement, and spread deductions</div>
+            <div class="panel-subtitle">Dual-Clock replay (1d Primary Clock &amp; 15:45 ET Causal Hybrid Clock) with exact 2026 Futu HK fee floors and slippage</div>
           </div>
           <span class="txt-muted" id="btWindowLabel" style="font-family:var(--font-mono);font-size:12px;">—</span>
         </div>

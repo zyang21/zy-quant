@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 from zy_quant.config import ExitModelsConfig, TierProfile
 from zy_quant.fees import FutuUSFeeModel
-from zy_quant.intel.market_hours import ET_TZ, add_trading_days
+from zy_quant.intel.market_hours import ET_TZ, add_trading_days, daily_bar_session_date
 from zy_quant.models import (
     Bar,
     EarningsEvent,
@@ -359,10 +359,11 @@ class ScientificExitAndSizingEngine:
             return None, "Insufficient buying power for >=1 share or fractional swing lot"
 
         notional_usd = shares * px
+        risk_implied_floor = (max_risk_budget_usd / max(0.04, self.cfg.swing_max_hard_stop_pct)) * 0.60
         eff_min_notional = (
-            min(tier.min_order_notional_usd, account_equity_usd * single_cap_pct * 0.65)
+            min(tier.min_order_notional_usd * scale, max(450.0 * scale, risk_implied_floor))
             if account_equity_usd >= 5000.0
-            else tier.min_order_notional_usd
+            else tier.min_order_notional_usd * scale
         )
         if notional_usd < eff_min_notional:
             return None, f"Swing notional ${notional_usd:.2f} < floor ${eff_min_notional:.2f}"
@@ -455,11 +456,7 @@ class ScientificExitAndSizingEngine:
 
         peak_r = (pos.highest_price - pos.entry_price) / max(0.01, pos.risk_per_share)
         curr_r = (daily_bar.close - pos.entry_price) / max(0.01, pos.risk_per_share)
-        bar_d = (
-            daily_bar.timestamp.date()
-            if daily_bar.timestamp.tzinfo is None
-            else daily_bar.timestamp.astimezone(ET_TZ).date()
-        )
+        bar_d = daily_bar_session_date(daily_bar.timestamp)
 
         # Check BMO (act on T-1 close) vs AMC (act on T-0 close) Pre-Earnings Cushion
         if upcoming_earnings is not None:
@@ -496,15 +493,15 @@ class ScientificExitAndSizingEngine:
                             updated_stop=pos.current_stop,
                             note=f"Pre-earnings ({timing} {rep_iso}) 50% house-money scale-out at {curr_r:+.2f}R",
                         )
-                    if curr_r < 1.5:
-                        return ExitAction(
-                            should_exit=True,
-                            shares_to_sell=pos.shares,
-                            exit_price=round(daily_bar.close, 2),
-                            reason=ExitReason.PRE_EARNINGS_CUSHION,
-                            updated_stop=pos.current_stop,
-                            note=f"Pre-earnings ({timing} {rep_iso}) small-lot exit at {curr_r:+.2f}R",
-                        )
+                    # Position too small to split into two whole-share legs (< +2.5R): exit 100% rather than gambling full lot!
+                    return ExitAction(
+                        should_exit=True,
+                        shares_to_sell=pos.shares,
+                        exit_price=round(daily_bar.close, 2),
+                        reason=ExitReason.PRE_EARNINGS_CUSHION,
+                        updated_stop=pos.current_stop,
+                        note=f"Pre-earnings ({timing} {rep_iso}) un-splittable lot 100% exit at {curr_r:+.2f}R (< +2.50R)",
+                    )
 
         # Breakeven + Chandelier 1d ATR upward ratchet
         if peak_r >= self.cfg.breakeven_trigger_r:

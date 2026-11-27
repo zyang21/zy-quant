@@ -136,6 +136,28 @@ class TradingDaemon:
         t_prof = self.settings.tiers_cfg.get_active(t_key)
         self.store.get_virtual_cash(t_key, t_prof.reference_equity_usd)
 
+    def _mark_order_submitted_safely(
+        self, cid: str, broker_oid: Optional[str], fail_reason: str = "Broker rejected order"
+    ) -> bool:
+        """
+        Thread-safe status transition guarding against fast push callbacks that may have already
+        transitioned `cid` from `PENDING -> PARTIAL_FILLED / FILLED` before `place_limit_order` returned!
+        """
+        if not broker_oid:
+            self.store.update_order_status(cid, status=OrderStatus.FAILED, reason=fail_reason)
+            return False
+        with self._order_lock:
+            curr_ord = self.store.get_order(cid)
+            if curr_ord and curr_ord["status"] == OrderStatus.PENDING.value:
+                self.store.update_order_status(
+                    cid, status=OrderStatus.SUBMITTED, broker_order_id=broker_oid
+                )
+            elif curr_ord and not curr_ord.get("broker_order_id"):
+                self.store.update_order_status(
+                    cid, status=OrderStatus(curr_ord["status"]), broker_order_id=broker_oid
+                )
+        return True
+
     def _settle_paper_local_buy(
         self,
         cid: str,
@@ -357,6 +379,18 @@ class TradingDaemon:
             tier_hint = str(plan_meta.get("tier_key") or self.settings.active_tier_key)
             if delta_shares > 1e-6:
                 self._ensure_sim_virtual_cash_bootstrapped(tier_hint)
+                # Compute exact incremental notional from cumulative dealt_avg_price so multi-print
+                # partial fills at different prices preserve $0.0000 cash/PnL ledger identity!
+                prev_avg_px = float(
+                    order_row.get("avg_fill_price")
+                    or order_row.get("fill_price")
+                    or eff_fill_px
+                )
+                prev_notional = prev_reconciled * prev_avg_px
+                new_notional = new_filled * eff_fill_px
+                delta_notional = max(0.0, round(new_notional - prev_notional, 6))
+                slice_fill_px = round(delta_notional / delta_shares, 4)
+
                 if side == OrderSide.BUY:
                     pos = open_positions.get(sym)
                     planned_stop = float(
@@ -406,7 +440,7 @@ class TradingDaemon:
                             sym, pos.shares, pos.current_stop, pos.broker_stop_order_id
                         )
                     self.store.upsert_position(pos)
-                    self._sync_sim_virtual_cash(-(delta_shares * eff_fill_px + delta_fee), tier_hint)
+                    self._sync_sim_virtual_cash(-(delta_notional + delta_fee), tier_hint)
                     event_summary = (
                         f"BUY {sym} filled +{delta_shares} sh (total {pos.shares} sh) "
                         f"@ ${eff_fill_px:.2f} [{update.status.value}]"
@@ -424,7 +458,7 @@ class TradingDaemon:
                     entry_px = (
                         pos.entry_price
                         if pos is not None
-                        else float(plan_meta.get("entry_price") or eff_fill_px)
+                        else float(plan_meta.get("entry_price") or slice_fill_px)
                     )
                     risk_ps = (
                         pos.risk_per_share
@@ -458,7 +492,7 @@ class TradingDaemon:
                         setup=setup_name,
                         shares=delta_shares,
                         entry_price=entry_px,
-                        exit_price=eff_fill_px,
+                        exit_price=slice_fill_px,
                         fee_usd=leg_round_trip_fee,
                         risk_per_share=risk_ps,
                         exit_reason=exit_reason_val,
@@ -489,7 +523,7 @@ class TradingDaemon:
                                 )
                             self.store.upsert_position(pos)
 
-                    self._sync_sim_virtual_cash(delta_shares * eff_fill_px - delta_fee, tier_hint)
+                    self._sync_sim_virtual_cash(delta_notional - delta_fee, tier_hint)
 
                     event_summary = (
                         f"SELL {sym} filled {delta_shares} sh @ ${eff_fill_px:.2f} "

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import math
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from zy_quant.config import AppSettings
+from zy_quant.config import AppSettings, UniverseSecurity
 from zy_quant.fees import FutuUSFeeModel
 from zy_quant.gateway.alpaca_adapter import build_causal_partial_1d_bar
 from zy_quant.gateway.base import MarketDataAdapter
@@ -14,10 +15,12 @@ from zy_quant.intel.market_hours import (
     ET_TZ,
     add_trading_days,
     count_trading_days_between,
+    daily_bar_session_date,
     session_close_time,
 )
 from zy_quant.intel.regime import MarketRegimeDetector
 from zy_quant.intel.universe_manager import PointInTimeUniverseFilter
+from zy_quant.intel.watchlist_scorer import SwingWatchlistScorer
 from zy_quant.models import Bar, EarningsEvent, OpenPosition, OrderSide, RegimeLight
 from zy_quant.risk.correlation import compute_max_pairwise_correlation
 from zy_quant.risk.mandate_gate import compute_portfolio_heat
@@ -74,6 +77,10 @@ class BacktestEngine:
         self.swing_engine = DailySwingSignalEngine(
             settings.strategy_cfg.entry,
             settings.strategy_cfg.regime,
+            settings.strategy_cfg.swing,
+        )
+        self.swing_scorer = SwingWatchlistScorer(
+            settings.watchlist_cfg,
             settings.strategy_cfg.swing,
         )
         self.exit_engine = ScientificExitAndSizingEngine(
@@ -304,10 +311,11 @@ class BacktestEngine:
         for sym, blist in symbol_bars.items():
             bar_lookup[sym] = {b.timestamp: (i, b) for i, b in enumerate(blist)}
 
-        qqq_1d_dates = [d.timestamp.date() for d in qqq_1d]
-        spy_1d_dates = [d.timestamp.date() for d in spy_1d]
+        qqq_1d_dates = [daily_bar_session_date(d.timestamp) for d in qqq_1d]
+        spy_1d_dates = [daily_bar_session_date(d.timestamp) for d in spy_1d]
         sym_1d_dates: Dict[str, List[Any]] = {
-            sym: [d.timestamp.date() for d in dlist] for sym, dlist in symbol_daily.items()
+            sym: [daily_bar_session_date(d.timestamp) for d in dlist]
+            for sym, dlist in symbol_daily.items()
         }
 
         positions: Dict[str, OpenPosition] = {}
@@ -694,7 +702,7 @@ class BacktestEngine:
             )
             batch_15m = (
                 self.data.get_bars_batch(  # type: ignore[attr-defined]
-                    [s for s in all_syms if s != "SPY"],
+                    all_syms,
                     timeframe="15m",
                     days=fetch_days,
                     start_dt=(
@@ -713,11 +721,7 @@ class BacktestEngine:
                 s: self.data.get_bars(s, timeframe="1d", days=history_1d_days) for s in all_syms
             }
             batch_15m = (
-                {
-                    s: self.data.get_bars(s, timeframe="15m", days=fetch_days)
-                    for s in all_syms
-                    if s != "SPY"
-                }
+                {s: self.data.get_bars(s, timeframe="15m", days=fetch_days) for s in all_syms}
                 if clock_mode == "hybrid_1545"
                 else {}
             )
@@ -774,8 +778,11 @@ class BacktestEngine:
                 data_warnings=warnings_list or ["Insufficient daily market data for swing backtest."],
             )
 
-        def _et_d(b: Bar) -> date:
+        def _intraday_et_d(b: Bar) -> date:
             return b.timestamp.date() if b.timestamp.tzinfo is None else b.timestamp.astimezone(ET_TZ).date()
+
+        def _daily_d(b: Bar) -> date:
+            return daily_bar_session_date(b.timestamp)
 
         # Partition 15m bars by (symbol, et_date) when in hybrid_1545 mode
         intraday_by_day: Dict[str, Dict[date, List[Bar]]] = {}
@@ -783,15 +790,15 @@ class BacktestEngine:
             for sym_k, b15_list in batch_15m.items():
                 by_d: Dict[date, List[Bar]] = {}
                 for b in b15_list:
-                    by_d.setdefault(_et_d(b), []).append(b)
+                    by_d.setdefault(_intraday_et_d(b), []).append(b)
                 intraday_by_day[sym_k] = by_d
 
         daily_by_date: Dict[str, Dict[date, tuple[int, Bar]]] = {}
         sym_1d_dates: Dict[str, List[date]] = {}
         sym_1d_atrs: Dict[str, List[float]] = {}
         for s_k, d_list in {**symbol_daily, "QQQ": qqq_1d, "SPY": spy_1d}.items():
-            daily_by_date[s_k] = {_et_d(b): (idx, b) for idx, b in enumerate(d_list)}
-            sym_1d_dates[s_k] = [_et_d(b) for b in d_list]
+            daily_by_date[s_k] = {_daily_d(b): (idx, b) for idx, b in enumerate(d_list)}
+            sym_1d_dates[s_k] = [_daily_d(b) for b in d_list]
             sym_1d_atrs[s_k] = compute_wilder_atr_series(d_list, 14)
 
         if clock_mode == "hybrid_1545":
@@ -826,7 +833,8 @@ class BacktestEngine:
 
         def _decision_cutoff_utc(d_val: date) -> datetime:
             close_t = session_close_time(d_val)
-            dec_mins = (close_t.hour * 60 + close_t.minute) - 20
+            # 15:45 ET normal / 12:45 ET early-close: admits completed [09:30..15:30 ET] bars up to 15:45 ET
+            dec_mins = (close_t.hour * 60 + close_t.minute) - 15
             et_dt = datetime.combine(d_val, dt_time(dec_mins // 60, dec_mins % 60), tzinfo=ET_TZ)
             return et_dt.astimezone(timezone.utc)
 
@@ -915,11 +923,28 @@ class BacktestEngine:
                     )
                 queued_next_open = []
 
-            # Build causal bar for `cur_d`
+            # Build causal bars for `cur_d` in `hybrid_1545` mode
             qqq_partial = (
                 build_causal_partial_1d_bar(
                     "QQQ", intraday_by_day.get("QQQ", {}).get(cur_d, []), decision_ts_utc=dec_utc
                 )
+                if clock_mode == "hybrid_1545"
+                else None
+            )
+            spy_partial = (
+                build_causal_partial_1d_bar(
+                    "SPY", intraday_by_day.get("SPY", {}).get(cur_d, []), decision_ts_utc=dec_utc
+                )
+                if clock_mode == "hybrid_1545"
+                else None
+            )
+            uni_partials: Optional[Dict[str, Optional[Bar]]] = (
+                {
+                    s_sym: build_causal_partial_1d_bar(
+                        s_sym, intraday_by_day.get(s_sym, {}).get(cur_d, []), decision_ts_utc=dec_utc
+                    )
+                    for s_sym in symbol_daily.keys()
+                }
                 if clock_mode == "hybrid_1545"
                 else None
             )
@@ -928,18 +953,19 @@ class BacktestEngine:
             for sym in list(positions.keys()):
                 pos = positions[sym]
                 if clock_mode == "hybrid_1545":
-                    s_15m_today = intraday_by_day.get(sym, {}).get(cur_d, [])
-                    step_bar = build_causal_partial_1d_bar(sym, s_15m_today, decision_ts_utc=dec_utc)
+                    step_bar = uni_partials.get(sym) if uni_partials is not None else None
                     if step_bar is None:
                         continue
-                    d_cut = bisect_left(sym_1d_dates[sym], cur_d)
-                    atr_val = sym_1d_atrs[sym][d_cut - 1] if d_cut > 0 else pos.entry_atr_1d
+                    causal_d = build_strictly_causal_daily_series(
+                        symbol_daily[sym], as_of_date=cur_d, partial_today_bar=step_bar
+                    )
+                    atr_val = compute_wilder_atr_series(causal_d[-35:], 14)[-1] if causal_d else pos.entry_atr_1d
                 else:
                     pair = daily_by_date.get(sym, {}).get(cur_d)
                     if pair is None:
                         continue
                     d_idx, step_bar = pair
-                    atr_val = sym_1d_atrs[sym][max(0, d_idx - 1)]
+                    atr_val = sym_1d_atrs[sym][d_idx]
 
                 pos.metadata["last_mark_price"] = step_bar.close
                 act = self.exit_engine.step_daily_position(
@@ -979,6 +1005,8 @@ class BacktestEngine:
                 universe_daily=symbol_daily,
                 as_of_date=cur_d,
                 qqq_partial_bar=qqq_partial,
+                spy_partial_bar=spy_partial,
+                universe_partial_bars=uni_partials,
                 include_completed_as_of=include_today_1d,
             )
             if regime.light == RegimeLight.GREEN:
@@ -994,7 +1022,7 @@ class BacktestEngine:
                 }
             )
 
-            # 3. Entry Evaluation (respecting StoplossGuard cooldown, Portfolio Heat, & 60d Correlation)
+            # 3. Entry Evaluation (SwingWatchlistScorer + StoplossGuard + Portfolio Heat + 60d Correlation)
             if regime.light == RegimeLight.RED:
                 continue
             if cooldown_until_d is not None and cur_d <= cooldown_until_d:
@@ -1002,69 +1030,83 @@ class BacktestEngine:
             if len(positions) >= tier.max_concurrent_positions:
                 continue
 
-            buys_7d = sum(1 for bd in buy_dates if (cur_d - bd).days <= 7)
-            if buys_7d >= tier.max_trades_per_week:
-                continue
-
-            # Strictly causal RS ranking (`bisect_left` on `hybrid_1545`; `<= cur_d` on `1d` queued for T+1 open)
-            def _causal_rs(sym_k: str) -> float:
-                d_list = symbol_daily.get(sym_k, [])
-                if not d_list:
-                    return -999.0
-                if clock_mode == "hybrid_1545":
-                    cut = bisect_left(sym_1d_dates[sym_k], cur_d)
-                    if cut < 2:
-                        return -999.0
-                    p_b = build_causal_partial_1d_bar(
-                        sym_k, intraday_by_day.get(sym_k, {}).get(cur_d, []), decision_ts_utc=dec_utc
-                    )
-                    c_now = p_b.close if p_b is not None else d_list[cut - 1].close
-                    lb = min(20, cut)
-                    return (c_now - d_list[cut - lb].close) / max(0.01, d_list[cut - lb].close)
-                pair_d = daily_by_date[sym_k].get(cur_d)
-                if pair_d is None or pair_d[0] < 2:
-                    return -999.0
-                idx_now = pair_d[0]
-                lb = min(20, idx_now)
-                return (d_list[idx_now].close - d_list[idx_now - lb].close) / max(0.01, d_list[idx_now - lb].close)
-
-            eligible = [
+            eligible_syms = [
                 s for s in symbol_daily.keys() if pit_filter is None or pit_filter.is_member_on(s, cur_d)
             ]
-            sorted_rs = sorted(eligible, key=_causal_rs, reverse=True)
-            sec_cap = self.settings.watchlist_cfg.scoring_thresholds.max_per_sector_in_top_n
-            top_n_cap = self.settings.watchlist_cfg.scoring_thresholds.top_n_active
-            candidates: List[str] = []
-            sec_cnt: Dict[str, int] = {}
-            for s in sorted_rs:
-                sec_n = universe_map[s].sector if s in universe_map else "Technology"
-                if sec_cnt.get(sec_n, 0) >= sec_cap:
-                    continue
-                candidates.append(s)
-                sec_cnt[sec_n] = sec_cnt.get(sec_n, 0) + 1
-                if len(candidates) >= max(top_n_cap, 12):
-                    break
+            pit_universe = [
+                universe_map[s]
+                if s in universe_map
+                else UniverseSecurity(
+                    symbol=s,
+                    sector="Technology",
+                    cik="",
+                    etf_core_score=0.82,
+                    baseline_inst_pct=0.72,
+                )
+                for s in eligible_syms
+            ]
+            scored_list = self.swing_scorer.rank_swing_universe(
+                quotes={},
+                daily_bars_map=symbol_daily,
+                qqq_daily_bars=qqq_1d,
+                regime_light=regime.light,
+                as_of_date=cur_d,
+                earnings_events=earn_map,
+                qqq_partial_bar=qqq_partial,
+                partial_bars_map=uni_partials,
+                include_completed_as_of=include_today_1d,
+                universe_override=pit_universe,
+            )
+            scored_rows = [
+                {
+                    "symbol": c.symbol,
+                    "sector": c.sector,
+                    "price": c.price,
+                    "total_score": c.total_score,
+                    "passed_hard_filters": c.passed_hard_filters,
+                    "filter_reason": c.filter_reason,
+                }
+                for c in scored_list
+            ]
+            top_candidates = self.swing_scorer.select_active_top_n(scored_rows)
 
             pos_scale = (
                 1.0
                 if regime.light == RegimeLight.GREEN
                 else self.settings.strategy_cfg.regime.yellow_position_scale
             )
-            batch_pending_syms = set(positions.keys())
-            avail_cash = cash
+            batch_pending_syms = set(positions.keys()) | {qp.symbol for qp, _ in queued_next_open}
+            avail_cash = cash - sum(qp.notional_usd for qp, _ in queued_next_open)
+            queued_active_buys: List[Dict[str, Any]] = [
+                {
+                    "shares": qp.shares,
+                    "filled_shares": 0.0,
+                    "limit_price": qp.limit_price,
+                    "plan_json": json.dumps(
+                        {
+                            "risk_per_share": qp.risk_per_share,
+                            "initial_stop": qp.initial_stop,
+                            "sector": qp.sector,
+                        }
+                    ),
+                }
+                for qp, _ in queued_next_open
+            ]
 
-            for sym in candidates:
+            for cand_row in top_candidates:
+                sym = str(cand_row["symbol"])
                 if sym in batch_pending_syms:
                     continue
-                sec_meta = universe_map.get(sym)
-                sector = sec_meta.sector if sec_meta else "Technology"
-                part_bar = (
-                    build_causal_partial_1d_bar(
-                        sym, intraday_by_day.get(sym, {}).get(cur_d, []), decision_ts_utc=dec_utc
-                    )
-                    if clock_mode == "hybrid_1545"
-                    else None
-                )
+                buys_today = sum(1 for bd in buy_dates if bd == cur_d) + len(queued_next_open)
+                if buys_today >= tier.max_trades_per_day:
+                    break
+                buys_7d = sum(1 for bd in buy_dates if (cur_d - bd).days <= 7) + len(queued_next_open)
+                if buys_7d >= tier.max_trades_per_week:
+                    break
+
+                sector = str(cand_row["sector"])
+                wl_score = float(cand_row["total_score"])
+                part_bar = uni_partials.get(sym) if uni_partials is not None else None
                 if clock_mode == "hybrid_1545" and part_bar is None:
                     continue
 
@@ -1072,11 +1114,12 @@ class BacktestEngine:
                     symbol=sym,
                     sector=sector,
                     regime_light=regime.light,
-                    watchlist_score=80.0,
+                    watchlist_score=wl_score,
                     stock_daily_bars=symbol_daily[sym],
                     qqq_daily_bars=qqq_1d,
                     as_of_date=cur_d,
                     partial_today_bar=part_bar,
+                    qqq_partial_bar=qqq_partial,
                     recent_earnings=earn_map.get(sym),
                     include_completed_as_of=include_today_1d,
                 )
@@ -1086,21 +1129,34 @@ class BacktestEngine:
                 plan, st = self.exit_engine.build_swing_position_plan(
                     signal=sig,
                     account_equity_usd=curr_eq,
-                    available_cash_usd=avail_cash * 0.992,
+                    available_cash_usd=max(0.0, avail_cash) * 0.992,
                     tier=tier,
                     position_scale=pos_scale,
                 )
                 if plan is None or st != "APPROVED":
                     continue
 
-                # Portfolio Heat + Sector Cap + Shared 60d Pairwise Correlation Guard
-                heat = compute_portfolio_heat(positions, [], curr_eq)
-                if (heat.principal_heat_usd + plan.total_risk_usd) / max(1.0, curr_eq) > tier.max_portfolio_heat_pct:
+                # Single-Asset Cap + Portfolio Heat (Principal & Open-Equity Drawdown) + Sector Cap + 60d Correlation
+                single_cap = (
+                    tier.max_sector_etf_pct
+                    if sector.endswith("_ETF")
+                    else tier.max_single_equity_pct
+                )
+                if (plan.notional_usd / max(1.0, curr_eq)) > single_cap + 1e-6:
                     continue
+
+                heat = compute_portfolio_heat(positions, queued_active_buys, curr_eq)
+                if (heat.principal_heat_usd + plan.total_risk_usd) / max(1.0, curr_eq) > tier.max_portfolio_heat_pct + 1e-6:
+                    continue
+                if (heat.open_drawdown_heat_usd + plan.total_risk_usd) / max(1.0, curr_eq) > tier.max_drawdown_heat_pct + 1e-6:
+                    continue
+
                 sec_notional = sum(
                     p.shares * p.entry_price for p in positions.values() if p.sector == sector
+                ) + sum(
+                    qp.shares * qp.limit_price for qp, _ in queued_next_open if qp.sector == sector
                 )
-                if (sec_notional + plan.notional_usd) / max(1.0, curr_eq) > tier.max_sector_weight_pct:
+                if (sec_notional + plan.notional_usd) / max(1.0, curr_eq) > tier.max_sector_weight_pct + 1e-6:
                     continue
 
                 corr_ref_d = add_trading_days(cur_d, 1) if include_today_1d else cur_d
@@ -1116,6 +1172,20 @@ class BacktestEngine:
 
                 if clock_mode == "1d":
                     queued_next_open.append((plan, sig))
+                    queued_active_buys.append(
+                        {
+                            "shares": plan.shares,
+                            "filled_shares": 0.0,
+                            "limit_price": plan.limit_price,
+                            "plan_json": json.dumps(
+                                {
+                                    "risk_per_share": plan.risk_per_share,
+                                    "initial_stop": plan.initial_stop,
+                                    "sector": plan.sector,
+                                }
+                            ),
+                        }
+                    )
                     batch_pending_syms.add(sym)
                     avail_cash -= plan.notional_usd
                     if len(batch_pending_syms) >= tier.max_concurrent_positions:

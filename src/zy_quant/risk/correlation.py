@@ -5,13 +5,12 @@ from bisect import bisect_left
 from datetime import date
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from zy_quant.intel.market_hours import ET_TZ
+from zy_quant.intel.market_hours import daily_bar_session_date
 from zy_quant.models import Bar
 
 
 def _bar_et_date(b: Bar) -> date:
-    ts = b.timestamp
-    return ts.date() if ts.tzinfo is None else ts.astimezone(ET_TZ).date()
+    return daily_bar_session_date(b.timestamp)
 
 
 def _extract_causal_daily_returns(

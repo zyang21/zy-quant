@@ -17,11 +17,13 @@ from pydantic import BaseModel
 
 from zy_quant.backtest.engine import BacktestEngine
 from zy_quant.config import AppSettings
-from zy_quant.intel.market_hours import get_us_market_session
+from zy_quant.intel.market_hours import ET_TZ, get_us_market_session
+from zy_quant.intel.watchlist_scorer import SwingWatchlistScorer
 from zy_quant.runtime.daemon import TradingDaemon
 from zy_quant.services.analytics import HistoryQueryService, PortfolioAnalyticsService
 from zy_quant.services.log_stream import RingBufferLogHandler
 from zy_quant.storage.state_store import StateStore
+from zy_quant.strategy.signals_swing import DailySwingSignalEngine
 
 
 class ControlCenterApplication:
@@ -122,6 +124,15 @@ class ControlCenterApplication:
         self.settings = fresh
         self.daemon.settings = fresh
         self.daemon.watchlist_scorer.cfg = fresh.watchlist_cfg
+        self.daemon.swing_pipeline.swing_engine = DailySwingSignalEngine(
+            entry_cfg=fresh.strategy_cfg.entry,
+            regime_cfg=fresh.strategy_cfg.regime,
+            swing_cfg=fresh.strategy_cfg.swing,
+        )
+        self.daemon.swing_pipeline.swing_scorer = SwingWatchlistScorer(
+            cfg=fresh.watchlist_cfg,
+            swing_cfg=fresh.strategy_cfg.swing,
+        )
         self.portfolio_svc.settings = fresh
 
         if hasattr(self.daemon.market_data, "api_key"):
@@ -228,12 +239,39 @@ class ControlCenterApplication:
         except Exception:
             return {"branch": "unknown", "commit": ""}
 
-    def get_strategy_summary(self) -> Dict[str, Any]:
+    def get_strategy_summary(self, mode_override: Optional[str] = None) -> Dict[str, Any]:
+        eff_mode = (mode_override or self.settings.strategy_cfg.mode or "swing_1d").strip().lower()
         e = self.settings.strategy_cfg.entry
         x = self.settings.strategy_cfg.exit_models
         t = self.settings.active_tier_profile
+        if eff_mode == "swing_1d":
+            return {
+                "profile": t.label,
+                "mode": "swing_1d",
+                "timeframe": "1d + 15:45 ET Causal Partial Bar",
+                "entry_setups": [
+                    "VCP 20d Pivot Breakout",
+                    "Daily EMA21 Pullback",
+                    "Donchian 20d RS Leader",
+                    "PEAD T+1..T+5 Continuation",
+                ],
+                "initial_stop_rule": (
+                    f"{x.initial_atr_1d_multiplier}x Wilder 1d ATR(14) "
+                    f"(Max {x.swing_max_hard_stop_pct*100:.1f}%, Server GTC STOP)"
+                ),
+                "profit_protection": (
+                    f"Breakeven @ +{x.breakeven_trigger_r}R -> Chandelier "
+                    f"{x.chandelier_atr_1d_multiplier}x 1d ATR + BMO/AMC Earnings Cushion"
+                ),
+                "time_barrier": (
+                    f"{x.time_stop_trading_days} trading days if < +0.25R "
+                    f"(Heat <= {t.max_portfolio_heat_pct*100:.1f}%, Corr <= {t.max_pair_corr:.2f})"
+                ),
+                "min_expectancy": f"+{x.min_expectancy_r}R net of 2026 Futu HK fees",
+            }
         return {
             "profile": t.label,
+            "mode": "intraday_15m",
             "timeframe": e.bar_timeframe,
             "entry_setups": ["VWAP Institutional Pullback", f"{e.opening_range_breakout.orb_minutes}m Opening Range Breakout"],
             "initial_stop_rule": f"{x.atr_stop_multiplier}x Wilder ATR({e.atr_period}) (Max {x.max_hard_stop_pct*100:.1f}%)",
@@ -300,10 +338,55 @@ def get_dashboard() -> Dict[str, Any]:
     ctx.refresh_config_if_needed()
     regime = ctx.store.get_flag("latest_regime")
     if regime is None:
-        snap = ctx.daemon.evaluate_regime()
-        regime = ctx.store.get_flag("latest_regime")
-        if not ctx.store.get_watchlist_scores():
-            ctx.daemon.refresh_watchlist(snap, check_edgar=False)
+        if ctx.settings.strategy_cfg.mode == "swing_1d":
+            pipe = ctx.daemon.swing_pipeline
+            today_et = datetime.now(timezone.utc).astimezone(ET_TZ).date()
+            scan_syms = [u.symbol for u in ctx.daemon._select_quota_safe_universe()]
+            d_map = pipe._fetch_260d_universe(scan_syms)
+            snap = pipe.swing_engine.evaluate_regime(
+                qqq_daily=d_map.get("QQQ", []),
+                spy_daily=d_map.get("SPY", []),
+                universe_daily=d_map,
+                as_of_date=today_et,
+            )
+            regime = {
+                "light": snap.light.value,
+                "mode": "swing_1d",
+                "qqq_price": round(snap.qqq_price, 2),
+                "qqq_vwap": round(snap.qqq_vwap, 2),
+                "qqq_sma20": round(snap.qqq_sma20, 2),
+                "qqq_sma50": snap.qqq_sma50,
+                "qqq_sma200": snap.qqq_sma200,
+                "spy_price": round(snap.spy_price, 2),
+                "spy_sma50": snap.spy_sma50,
+                "spy_sma200": snap.spy_sma200,
+                "breadth_above_sma50_pct": snap.breadth_above_sma50_pct,
+                "qqq_intraday_return_pct": round(snap.qqq_intraday_return * 100.0, 2),
+                "vix_level": round(snap.vix_level, 2),
+                "recommended_scan_minutes": snap.recommended_scan_minutes,
+                "reason": snap.reason,
+                "evaluated_at": snap.evaluated_at.isoformat(),
+            }
+            ctx.store.set_flag("latest_regime", regime)
+            if not ctx.store.get_watchlist_scores():
+                earn_ev = ctx.daemon.earnings_feed.get_upcoming_events(
+                    symbols=scan_syms, ref_day=today_et, allow_network=False
+                )
+                scored = pipe.swing_scorer.rank_swing_universe(
+                    quotes={},
+                    daily_bars_map=d_map,
+                    qqq_daily_bars=d_map.get("QQQ", []),
+                    regime_light=snap.light,
+                    as_of_date=today_et,
+                    earnings_events=earn_ev,
+                )
+                if scored:
+                    ctx.store.save_watchlist_scores(scored, prune_stale=True)
+        else:
+            snap = ctx.daemon.evaluate_regime()
+            regime = ctx.store.get_flag("latest_regime")
+            if not ctx.store.get_watchlist_scores():
+                ctx.daemon.refresh_watchlist(snap, check_edgar=False)
 
     raw_broker = ctx.daemon.gateway.get_broker_status()
     live_snap = ctx.portfolio_svc.build_live_portfolio_snapshot(
@@ -353,7 +436,11 @@ def run_strategy_backtest(req: BacktestRequest) -> Dict[str, Any]:
     alpaca_ready = hasattr(ctx.daemon.market_data, "has_credentials") and bool(
         getattr(ctx.daemon.market_data, "has_credentials")()
     )
-    max_days = 2500 if alpaca_ready else 58
+    has_cached_bars = (
+        ctx.daemon.bar_cache is not None
+        and ctx.daemon.bar_cache.stats().get("total_bars", 0) > 0
+    )
+    max_days = 2500 if (alpaca_ready or has_cached_bars) else 58
     engine = BacktestEngine(ctx.settings, ctx.daemon.market_data)
     result = engine.run(
         tier_key=ctx.settings.active_tier_key,
@@ -373,7 +460,8 @@ def run_strategy_backtest(req: BacktestRequest) -> Dict[str, Any]:
         result.total_fees_usd,
     )
     out = asdict(result)
-    out["strategy_summary"] = ctx.get_strategy_summary()
+    eff_bt_mode = "intraday_15m" if result.clock_mode == "intraday_15m" else "swing_1d"
+    out["strategy_summary"] = ctx.get_strategy_summary(mode_override=eff_bt_mode)
     return out
 
 

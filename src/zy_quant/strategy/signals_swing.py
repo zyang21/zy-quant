@@ -4,7 +4,12 @@ from datetime import date
 from typing import List, Mapping, Optional, Sequence
 
 from zy_quant.config import EntryConfig, RegimeConfig, SwingPipelineConfig
-from zy_quant.intel.market_hours import ET_TZ, count_trading_days_between
+from zy_quant.intel.market_hours import (
+    ET_TZ,
+    add_trading_days,
+    count_trading_days_between,
+    daily_bar_session_date,
+)
 from zy_quant.models import (
     Bar,
     CapitalFlowSnapshot,
@@ -23,10 +28,7 @@ from zy_quant.strategy.indicators import (
 
 
 def _bar_et_date(b: Bar) -> date:
-    ts = b.timestamp
-    if ts.tzinfo is None:
-        return ts.date()
-    return ts.astimezone(ET_TZ).date()
+    return daily_bar_session_date(b.timestamp)
 
 
 def build_strictly_causal_daily_series(
@@ -89,6 +91,7 @@ class DailySwingSignalEngine:
         as_of_date: Optional[date] = None,
         qqq_partial_bar: Optional[Bar] = None,
         spy_partial_bar: Optional[Bar] = None,
+        universe_partial_bars: Optional[Mapping[str, Optional[Bar]]] = None,
         vix_level: Optional[float] = None,
         include_completed_as_of: bool = False,
     ) -> RegimeSnapshot:
@@ -99,6 +102,7 @@ class DailySwingSignalEngine:
             as_of_date=as_of_date,
             qqq_partial_bar=qqq_partial_bar,
             spy_partial_bar=spy_partial_bar,
+            universe_partial_bars=universe_partial_bars,
             vix_level=vix_level,
             include_completed_as_of=include_completed_as_of,
         )
@@ -113,6 +117,7 @@ class DailySwingSignalEngine:
         qqq_daily_bars: Sequence[Bar],
         as_of_date: date,
         partial_today_bar: Optional[Bar] = None,
+        qqq_partial_bar: Optional[Bar] = None,
         bars_15m: Optional[Sequence[Bar]] = None,
         capital_flow: Optional[CapitalFlowSnapshot] = None,
         recent_earnings: Optional[EarningsEvent] = None,
@@ -130,19 +135,19 @@ class DailySwingSignalEngine:
         q_bars = build_strictly_causal_daily_series(
             qqq_daily_bars,
             as_of_date=as_of_date,
-            partial_today_bar=None,
+            partial_today_bar=qqq_partial_bar,
             include_completed_as_of=include_completed_as_of,
         )
 
         if len(s_bars) < 55 or len(q_bars) < 25:
             return None
 
-        # Pre-earnings entry buffer veto (>= 10 trading days / 14 calendar days before report)
+        # Pre-earnings entry buffer veto (strictly `<` 10 trading days or `<` 14 calendar days)
         if recent_earnings is not None and recent_earnings.report_date >= as_of_date:
             cal_days = (recent_earnings.report_date - as_of_date).days
             trd_days = count_trading_days_between(as_of_date, recent_earnings.report_date)
             if (
-                cal_days <= self.swing_cfg.pre_earnings_buffer_calendar_days
+                cal_days < self.swing_cfg.pre_earnings_buffer_calendar_days
                 or trd_days < self.swing_cfg.pre_earnings_buffer_trading_days
             ):
                 return None
@@ -185,34 +190,41 @@ class DailySwingSignalEngine:
         if capital_flow is not None and capital_flow.big_order_net_inflow < 0:
             return None
 
-        # --- Setup 4: PEAD Continuation (T+1..T+5 trading days after earnings gap-up) ---
-        if recent_earnings is not None and recent_earnings.report_date < as_of_date:
-            post_days = count_trading_days_between(recent_earnings.report_date, as_of_date)
-            if 1 <= post_days <= 5:
-                earn_bars = [b for b in s_bars[-7:] if _bar_et_date(b) >= recent_earnings.report_date]
-                if len(earn_bars) >= 2:
-                    earn_day_bar = earn_bars[0]
-                    prior_earn_idx = len(s_bars) - len(earn_bars) - 1
-                    pre_earn_close = s_bars[max(0, prior_earn_idx)].close
-                    gapped_up = earn_day_bar.close > pre_earn_close * 1.03
-                    held_gap_low = all(b.low >= earn_day_bar.low * 0.995 for b in earn_bars[1:])
-                    post_high = max(b.high for b in earn_bars[:-1])
-                    if gapped_up and held_gap_low and curr.close > post_high and rvol_now >= 1.15:
-                        return EntrySignal(
-                            symbol=symbol,
-                            sector=sector,
-                            setup=SetupType.PEAD_CONTINUATION,
-                            timestamp=curr.timestamp,
-                            entry_price=curr.close,
-                            atr_14=atr_now,
-                            vwap=ema21,
-                            rvol=round(rvol_now, 2),
-                            watchlist_score=watchlist_score,
-                            rationale=(
-                                f"[{regime_light.value}] PEAD T+{post_days} breakout above ${post_high:.2f}; "
-                                f"1d ATR=${atr_now:.2f}"
-                            ),
-                        )
+        # --- Setup 4: PEAD Continuation (T+1..T+5 trading days after earnings reaction gap-up) ---
+        if recent_earnings is not None:
+            # AMC earnings react on the next NYSE trading day (`T+1` open); BMO reacts on `report_date`
+            reaction_date = (
+                add_trading_days(recent_earnings.report_date, 1)
+                if (recent_earnings.timing or "").upper() == "AMC"
+                else recent_earnings.report_date
+            )
+            if reaction_date < as_of_date:
+                post_days = count_trading_days_between(reaction_date, as_of_date)
+                if 1 <= post_days <= 5:
+                    earn_bars = [b for b in s_bars[-8:] if _bar_et_date(b) >= reaction_date]
+                    if len(earn_bars) >= 2:
+                        earn_day_bar = earn_bars[0]
+                        prior_earn_idx = len(s_bars) - len(earn_bars) - 1
+                        pre_earn_close = s_bars[max(0, prior_earn_idx)].close
+                        gapped_up = earn_day_bar.close > pre_earn_close * 1.03
+                        held_gap_low = all(b.low >= earn_day_bar.low * 0.995 for b in earn_bars[1:])
+                        post_high = max(b.high for b in earn_bars[:-1])
+                        if gapped_up and held_gap_low and curr.close > post_high and rvol_now >= 1.15:
+                            return EntrySignal(
+                                symbol=symbol,
+                                sector=sector,
+                                setup=SetupType.PEAD_CONTINUATION,
+                                timestamp=curr.timestamp,
+                                entry_price=curr.close,
+                                atr_14=atr_now,
+                                vwap=ema21,
+                                rvol=round(rvol_now, 2),
+                                watchlist_score=watchlist_score,
+                                rationale=(
+                                    f"[{regime_light.value}] PEAD T+{post_days} breakout above ${post_high:.2f}; "
+                                    f"1d ATR=${atr_now:.2f}"
+                                ),
+                            )
 
         # --- Setup 1: VCP Volatility-Contraction 20-Day Pivot Breakout ---
         prior_20 = s_bars[-21:-1]

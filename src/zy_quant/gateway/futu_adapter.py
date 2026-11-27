@@ -339,7 +339,12 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 for frame in frames:
                     for _, row in frame.iterrows():
                         ts_str = str(row["time_key"]).replace(" ", "T")
-                        ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+                        parsed_dt = datetime.fromisoformat(ts_str)
+                        if timeframe == "1d" and parsed_dt.hour == 0 and parsed_dt.minute == 0:
+                            # Anchor daily bars at 12:00 UTC (07:00/08:00 ET) so UTC and ET_TZ dates match identically
+                            ts = parsed_dt.replace(hour=12, tzinfo=timezone.utc)
+                        else:
+                            ts = parsed_dt.replace(tzinfo=timezone.utc)
                         out.append(
                             Bar(
                                 symbol=symbol,
@@ -579,7 +584,8 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 return 0.0
 
         equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
-        raw_cash = _f(row.get("us_cash")) if _f(row.get("us_cash")) > 0 else _f(row.get("cash"))
+        has_us_cash_field = "us_cash" in row and row.get("us_cash") not in (None, "N/A", "")
+        raw_cash = _f(row.get("us_cash")) if has_us_cash_field else _f(row.get("cash"))
         fund_assets = _f(row.get("fund_assets"))
         buying_power = _f(row.get("power"))
         # Futu HK Cash Plus (USD MMF auto-sweep) parks idle USD in `fund_assets` with `us_cash == 0`;
@@ -740,6 +746,18 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 )
             if ret == ft.RET_OK:
                 return existing_order_id
+
+            # Short-flip prevention: NEVER submit a second GTC STOP while `existing_order_id` may still be live!
+            open_map = {u.broker_order_id: u for u in self.sync_open_orders(refresh_cache=True)}
+            prev_ord = open_map.get(existing_order_id)
+            if prev_ord is None or prev_ord.status.is_active:
+                if not self.cancel_order(existing_order_id):
+                    logger.error(
+                        "Refusing to place duplicate GTC STOP for %s while existing stop %s could not be cancelled",
+                        symbol,
+                        existing_order_id,
+                    )
+                    return existing_order_id
 
         with self._rpc_lock:
             ret, df = self._trade_ctx.place_order(

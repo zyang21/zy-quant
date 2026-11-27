@@ -61,7 +61,7 @@ def resolve_swing_phase(now_utc: datetime) -> PipelinePhase:
         return PipelinePhase.IDLE_GTC_ARMED
     if (close_m - 25) <= hm < close_m:
         return PipelinePhase.EOD_DECISION_WINDOW
-    if close_m <= hm <= (close_m + 20):
+    if close_m <= hm <= (close_m + 120):
         return PipelinePhase.POST_CLOSE_SETTLEMENT
     return PipelinePhase.MARKET_CLOSED
 
@@ -126,7 +126,8 @@ class DailySwingPipeline:
                 if b_upd is None:
                     # Missing from broker open/today order list -> re-arm fresh GTC stop!
                     needs_rearm = True
-                elif b_upd.status in (OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.FAILED) and b_upd.filled_shares <= 1e-6:
+                elif b_upd.status in (OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.FAILED):
+                    # Includes both 0-fill ex-dividend cancellations AND CANCELLED_PART where remaining shares need protection!
                     needs_rearm = True
                 elif abs(b_upd.qty - expected_whole_qty) > 1e-5:
                     # Quantity mismatch after partial scale-out -> modify GTC stop qty immediately!
@@ -160,23 +161,48 @@ class DailySwingPipeline:
         active_tier_key = d.settings.active_tier_key
         tier = d.settings.tiers_cfg.get_active(active_tier_key)
 
+        today_et = now_utc.astimezone(ET_TZ).date()
         for sym, pos in list(d.store.get_positions().items()):
             if pos.shares >= 1.0:
                 continue
             if d.store.get_active_orders(side=OrderSide.SELL, symbol=sym):
                 continue
 
-            bars_15m = d.market_data.get_bars(sym, timeframe="15m", days=2)
-            q = d.market_data.get_quote(sym) if not bars_15m else None
-            low_px = bars_15m[-1].low if bars_15m else (q.last_price if q else None)
-            open_px = bars_15m[-1].open if bars_15m else (q.last_price if q else None)
-            if low_px is None or open_px is None or low_px > pos.current_stop:
+            entry_utc = (
+                pos.entry_time.replace(tzinfo=timezone.utc)
+                if pos.entry_time.tzinfo is None
+                else pos.entry_time.astimezone(timezone.utc)
+            )
+            raw_15m = d.market_data.get_bars(sym, timeframe="15m", days=2)
+            today_15m = [
+                b
+                for b in raw_15m
+                if b.timestamp.astimezone(ET_TZ).date() == today_et and b.timestamp >= entry_utc
+            ]
+            q = d.market_data.get_quote(sym)
+            if today_15m:
+                low_px = min(today_15m[-1].low, q.last_price) if q else today_15m[-1].low
+                open_px = today_15m[0].open
+                live_mark_px = q.bid if (q and q.bid > 0) else today_15m[-1].close
+            elif q is not None:
+                low_px = q.last_price
+                open_px = q.last_price
+                live_mark_px = q.bid if q.bid > 0 else q.last_price
+            else:
                 continue
 
-            fill_px = round(min(open_px, pos.current_stop) if open_px < pos.current_stop else pos.current_stop, 2)
+            if low_px > pos.current_stop:
+                continue
+
+            paper_fill_px = round(min(open_px, pos.current_stop) if open_px < pos.current_stop else pos.current_stop, 2)
+            # Marketable limit sell price: anchor to live bid/mark (never submit limit $20 above crashing market!)
+            marketable_sell_px = round(
+                min(live_mark_px, paper_fill_px) * (1.0 - max(5.0, tier.order_protection_bps) / 10000.0),
+                2,
+            )
             reason = ExitReason.CHANDELIER_TRAIL if pos.current_stop > pos.entry_price else ExitReason.INITIAL_ATR_STOP
             cid = f"FRACSTOP-{sym}-{now_utc.strftime('%Y%m%d%H%M')}"
-            note = f"Client-side fractional RTH stop hit at ${fill_px:.2f} ({reason.value})"
+            note = f"Client-side fractional RTH stop hit (stop=${pos.current_stop:.2f}, mkt=${live_mark_px:.2f})"
             plan_meta = {
                 "symbol": sym,
                 "entry_price": pos.entry_price,
@@ -188,22 +214,17 @@ class DailySwingPipeline:
                 "tier_key": active_tier_key,
             }
             if not d.store.record_order_intent(
-                cid, sym, OrderSide.SELL, pos.shares, fill_px, note, plan_meta=plan_meta, created_at=now_utc
+                cid, sym, OrderSide.SELL, pos.shares, marketable_sell_px, note, plan_meta=plan_meta, created_at=now_utc
             ):
                 continue
 
             if has_acc:
-                oid = d.gateway.place_limit_order(sym, OrderSide.SELL, pos.shares, fill_px, remark=cid)
-                d.store.update_order_status(
-                    cid,
-                    status=OrderStatus.SUBMITTED if oid else OrderStatus.FAILED,
-                    broker_order_id=oid,
-                )
-                if oid:
-                    triggered.append(f"{sym} SUBMITTED fractional stop ({pos.shares} sh @ ${fill_px:.2f})")
+                oid = d.gateway.place_limit_order(sym, OrderSide.SELL, pos.shares, marketable_sell_px, remark=cid)
+                if d._mark_order_submitted_safely(cid, oid, f"{note} | Broker rejected fractional SELL"):
+                    triggered.append(f"{sym} SUBMITTED fractional stop ({pos.shares} sh @ limit ${marketable_sell_px:.2f})")
             else:
-                d._settle_paper_local_sell(cid, sym, pos, pos.shares, fill_px, reason.value, active_tier_key, tier)
-                triggered.append(f"{sym} fractional stop filled ({pos.shares} sh @ ${fill_px:.2f})")
+                d._settle_paper_local_sell(cid, sym, pos, pos.shares, paper_fill_px, reason.value, active_tier_key, tier)
+                triggered.append(f"{sym} fractional stop filled ({pos.shares} sh @ ${paper_fill_px:.2f})")
 
         return triggered
 
@@ -299,6 +320,9 @@ class DailySwingPipeline:
             earn_events = d.earnings_feed.get_upcoming_events(
                 symbols=pool_syms, ref_day=now_et.date(), allow_network=(d.bar_cache is not None)
             )
+            if check_edgar or d.bar_cache is not None:
+                for u in scan_pool[:16]:
+                    d.edgar_scanner.fetch_insider_activity(u.symbol, u.cik)
             healed = self.heal_overnight_gtc_stops(now)
             summary["gtc_healed"] = healed
             summary["upcoming_earnings_count"] = len(earn_events)
@@ -341,6 +365,10 @@ class DailySwingPipeline:
                 cancelled_day.append(str(ord_row["client_order_id"]))
 
             self._fetch_260d_universe(pool_syms)
+            if has_acc:
+                summary["post_close_reconciliation"] = d.store.reconcile_broker_positions(
+                    d.gateway.get_open_positions()
+                )
             healed = self.heal_overnight_gtc_stops(now)
 
             trd_env_name = getattr(d.gateway, "trd_env_name", "SIMULATE")
@@ -357,6 +385,12 @@ class DailySwingPipeline:
                 }
             else:
                 ledger_check = d.store.reconcile_stateful_ledger(tier_key, tier.reference_equity_usd)
+                if not ledger_check["ok"]:
+                    d.notifier.send(
+                        "Ledger Arithmetic Drift Alert",
+                        f"Tier {tier_key} drift=${ledger_check['drift_usd']:+.4f} exceeds tolerance",
+                        level="ERROR",
+                    )
                 cash_usd = float(ledger_check["virtual_cash_usd"])
                 mkt_val = sum(
                     p.shares * float(p.metadata.get("last_mark_price") or p.entry_price)
@@ -378,6 +412,11 @@ class DailySwingPipeline:
             )
             gtc_covered = all(
                 (p.shares < 1.0) or bool(p.broker_stop_order_id) for p in open_pos.values()
+            )
+            d.notifier.send(
+                "Daily Swing Settlement Digest",
+                f"[{trading_date_iso}] NAV=${equity_usd:,.2f} (Cash=${cash_usd:,.2f}), "
+                f"Positions={len(open_pos)}, Heat={heat.principal_heat_pct:.2f}%, GTC_OK={gtc_covered}",
             )
             summary["cancelled_dangling_orders"] = cancelled_day
             summary["gtc_healed"] = healed
@@ -456,27 +495,48 @@ class DailySwingPipeline:
 
         def _make_partial_bar(sym_key: str) -> Optional[Bar]:
             b15 = d.market_data.get_bars(sym_key, timeframe="15m", days=2)
-            v_mult = float(vol_ratios.get(sym_key, 35.0 if getattr(d.market_data, "feed", "") == "iex" else 1.0))
+            v_mult = (
+                d.market_data.get_effective_15m_volume_scale(sym_key)  # type: ignore[attr-defined]
+                if hasattr(d.market_data, "get_effective_15m_volume_scale")
+                else 1.0
+            )
             p_bar = build_causal_partial_1d_bar(sym_key, b15, decision_ts_utc=now_utc, volume_scale_mult=v_mult)
             if p_bar is not None:
                 return p_bar
             q_s = quotes.get(sym_key)
             if q_s is not None:
-                anchor = datetime(session_date.year, session_date.month, session_date.day, 5, 0, tzinfo=timezone.utc)
+                anchor = datetime(session_date.year, session_date.month, session_date.day, 12, 0, tzinfo=timezone.utc)
                 return Bar(sym_key, anchor, q_s.last_price, q_s.last_price, q_s.last_price, q_s.last_price, max(1.0, q_s.avg_daily_dollar_vol / max(1.0, q_s.last_price)))
             return None
 
         qqq_partial = _make_partial_bar("QQQ")
         spy_partial = _make_partial_bar("SPY")
+        uni_partials = {
+            s: (
+                Bar(
+                    s,
+                    datetime(session_date.year, session_date.month, session_date.day, 12, 0, tzinfo=timezone.utc),
+                    quotes[s].last_price,
+                    quotes[s].last_price,
+                    quotes[s].last_price,
+                    quotes[s].last_price,
+                    1.0,
+                )
+                if s in quotes
+                else None
+            )
+            for s in all_target_syms
+        }
 
         # --- Step (a): Daily Macro & Breadth Regime ---
-        regime = self.swing_engine.evaluate_regime(
+        regime = self.swing_engine.regime_detector.evaluate_daily(
             qqq_daily=daily_bars_map.get("QQQ", []),
             spy_daily=daily_bars_map.get("SPY", []),
             universe_daily=daily_bars_map,
             as_of_date=session_date,
             qqq_partial_bar=qqq_partial,
             spy_partial_bar=spy_partial,
+            universe_partial_bars=uni_partials,
         )
         d.store.set_flag(
             "latest_regime",
@@ -560,16 +620,17 @@ class DailySwingPipeline:
                             d.gateway.cancel_order(pos.broker_stop_order_id)
                             pos.broker_stop_order_id = None
                         d.store.upsert_position(pos)
-
+                        # Marketable sell limit anchored to live price so stop exits never hang above market!
+                        q_live = quotes.get(sym)
+                        live_ref = q_live.bid if (q_live and q_live.bid > 0) else today_bar.close
+                        sell_lim_px = round(
+                            min(live_ref, action.exit_price) * (1.0 - max(4.0, tier.order_protection_bps) / 10000.0),
+                            2,
+                        )
                         b_oid = d.gateway.place_limit_order(
-                            sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, remark=cid
+                            sym, OrderSide.SELL, action.shares_to_sell, sell_lim_px, remark=cid
                         )
-                        d.store.update_order_status(
-                            cid,
-                            status=OrderStatus.SUBMITTED if b_oid else OrderStatus.FAILED,
-                            broker_order_id=b_oid,
-                        )
-                        if b_oid:
+                        if d._mark_order_submitted_safely(cid, b_oid, f"{action.note} | Broker rejected SELL"):
                             exits_triggered.append(f"{sym} SUBMITTED ({action.note})")
                     else:
                         d._settle_paper_local_sell(
@@ -599,6 +660,7 @@ class DailySwingPipeline:
             capital_flows=flows,
             insiders=insiders,
             earnings_events=earn_events,
+            qqq_partial_bar=qqq_partial,
         )
         d.store.save_watchlist_scores(scored_candidates, prune_stale=True)
         top_candidates = self.swing_scorer.select_active_top_n(d.store.get_watchlist_scores())
@@ -648,6 +710,7 @@ class DailySwingPipeline:
                     qqq_daily_bars=daily_bars_map.get("QQQ", []),
                     as_of_date=session_date,
                     partial_today_bar=p_bar,
+                    qqq_partial_bar=qqq_partial,
                     capital_flow=flow,
                     recent_earnings=earn_events.get(sym),
                 )
@@ -708,17 +771,10 @@ class DailySwingPipeline:
                     b_oid = d.gateway.place_limit_order(
                         sym, OrderSide.BUY, plan.shares, plan.limit_price, remark=cid
                     )
-                    if not b_oid:
-                        d.store.update_order_status(
-                            cid, status=OrderStatus.FAILED, reason=f"{sig.rationale} | Broker rejected BUY"
-                        )
+                    if not d._mark_order_submitted_safely(
+                        cid, b_oid, f"{sig.rationale} | Broker rejected BUY"
+                    ):
                         continue
-                    with d._order_lock:
-                        curr_ord = d.store.get_order(cid)
-                        if curr_ord and curr_ord["status"] == OrderStatus.PENDING.value:
-                            d.store.update_order_status(cid, status=OrderStatus.SUBMITTED, broker_order_id=b_oid)
-                        elif curr_ord and not curr_ord.get("broker_order_id"):
-                            d.store.update_order_status(cid, status=OrderStatus(curr_ord["status"]), broker_order_id=b_oid)
                     pending_buy_syms.add(sym)
                     cash -= plan.shares * plan.limit_price + est_buy_fee
                     entries_placed.append(
