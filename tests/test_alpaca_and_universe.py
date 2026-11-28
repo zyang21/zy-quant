@@ -112,8 +112,9 @@ def test_alpaca_adapter_batch_snapshots_pagination_sip_fallback_and_sqlite_cache
             )
 
         if request.url.path == "/v2/stocks/bars":
-            # Simulate Free Tier 403 on real-time SIP -> automatic retry on IEX!
-            if request.url.params.get("feed") == "sip":
+            # Simulate Free Tier 403 ONLY on recent (<15m) un-clamped SIP queries; historical SIP succeeds!
+            end_param = str(request.url.params.get("end") or "")
+            if request.url.params.get("feed") == "sip" and end_param >= "2026-11-28":
                 return httpx.Response(403, text="subscription does not permit querying recent SIP data")
 
             call_counter["bars"] += 1

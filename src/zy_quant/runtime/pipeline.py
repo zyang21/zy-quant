@@ -6,7 +6,12 @@ from datetime import date, datetime, time, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from zy_quant.gateway.alpaca_adapter import build_causal_partial_1d_bar
-from zy_quant.intel.market_hours import ET_TZ, is_trading_day, session_close_time
+from zy_quant.intel.market_hours import (
+    ET_TZ,
+    daily_bar_session_date,
+    is_trading_day,
+    session_close_time,
+)
 from zy_quant.intel.watchlist_scorer import SwingWatchlistScorer
 from zy_quant.models import (
     Bar,
@@ -206,20 +211,36 @@ class DailySwingPipeline:
 
         return healed
 
+    @staticmethod
+    def _needs_client_stop_watch(pos: OpenPosition, has_acc: bool, trd_env_name: str) -> bool:
+        """
+        True whenever a position lacks a live broker-hosted GTC STOP on Futu REAL:
+          - `< 1.0 sh` fractional lots (unsupported by Futu US STOP / GTC)
+          - Unarmed whole-share positions (`not pos.broker_stop_order_id`)
+          - `SIM-*` / `PAPER-*` synthetic stop IDs (e.g. `PAPER-LOCAL` or Futu `SIMULATE` sub-accounts)
+        """
+        if pos.shares < 1.0:
+            return True
+        oid = str(pos.broker_stop_order_id or "")
+        if not oid or oid.startswith(("SIM-", "PAPER-")):
+            return True
+        return not (has_acc and trd_env_name == "REAL")
+
     def execute_fractional_client_stops(self, now_utc: datetime) -> List[str]:
         """
-        Executes client-side RTH stop exits for `< 1.0 sh` fractional positions unsupported by
-        Futu US server-side `OrderType.STOP` / `GTC`.
+        Executes client-side RTH stop exits for `< 1.0 sh` fractional positions and any unarmed /
+        simulated whole-share positions lacking a live Futu `REAL` server-side `GTC STOP`.
         """
         d = self.daemon
         triggered: List[str] = []
         has_acc = d.gateway.has_target_account()
+        trd_env_name = getattr(d.gateway, "trd_env_name", "SIMULATE")
         active_tier_key = d.settings.active_tier_key
         tier = d.settings.tiers_cfg.get_active(active_tier_key)
 
         today_et = now_utc.astimezone(ET_TZ).date()
         for sym, pos in list(d.store.get_positions().items()):
-            if pos.shares >= 1.0:
+            if not self._needs_client_stop_watch(pos, has_acc, trd_env_name):
                 continue
             if d.store.get_active_orders(side=OrderSide.SELL, symbol=sym):
                 continue
@@ -237,7 +258,10 @@ class DailySwingPipeline:
             ]
             q = d.market_data.get_quote(sym)
             if today_15m:
-                low_px = min(today_15m[-1].low, q.last_price) if q else today_15m[-1].low
+                # Inspect the minimum low across ALL post-entry RTH bars today so intrabar breaches
+                # during a prior 15m sleep interval are never missed!
+                session_low = min(b.low for b in today_15m)
+                low_px = min(session_low, q.last_price) if q else session_low
                 open_px = today_15m[0].open
                 live_mark_px = q.bid if (q and q.bid > 0) else today_15m[-1].close
             elif q is not None:
@@ -257,8 +281,8 @@ class DailySwingPipeline:
                 2,
             )
             reason = ExitReason.CHANDELIER_TRAIL if pos.current_stop > pos.entry_price else ExitReason.INITIAL_ATR_STOP
-            cid = f"FRACSTOP-{sym}-{now_utc.strftime('%Y%m%d%H%M')}"
-            note = f"Client-side fractional RTH stop hit (stop=${pos.current_stop:.2f}, mkt=${live_mark_px:.2f})"
+            cid = f"FRACSTOP-{sym}-{now_utc.strftime('%Y%m%d%H%M%S')}"
+            note = f"Client-side RTH stop hit (stop=${pos.current_stop:.2f}, mkt=${live_mark_px:.2f})"
             plan_meta = {
                 "symbol": sym,
                 "entry_price": pos.entry_price,
@@ -337,13 +361,17 @@ class DailySwingPipeline:
             and not force_rerun
             and d.store.has_completed_pipeline_phase(trading_date_iso, phase.value)
         ):
+            trd_env_now = getattr(d.gateway, "trd_env_name", "SIMULATE")
             frac_exits = (
                 self.execute_fractional_client_stops(now)
                 if phase in (PipelinePhase.OPEN_GAP_GUARD, PipelinePhase.IDLE_GTC_ARMED)
                 else []
             )
             in_flight = len(d.store.get_active_orders())
-            has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
+            needs_watch = any(
+                self._needs_client_stop_watch(p, has_acc, trd_env_now)
+                for p in d.store.get_positions().values()
+            )
             return {
                 "trading_date": trading_date_iso,
                 "phase": phase.value,
@@ -352,7 +380,7 @@ class DailySwingPipeline:
                 "entries": [],
                 "exits": frac_exits,
                 "in_flight_orders": in_flight,
-                "next_sleep_minutes": _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac),
+                "next_sleep_minutes": _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, needs_watch),
             }
 
         summary: Dict[str, Any] = {
@@ -390,25 +418,41 @@ class DailySwingPipeline:
             d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
 
         elif phase == PipelinePhase.OPEN_GAP_GUARD:
+            trd_env_now = getattr(d.gateway, "trd_env_name", "SIMULATE")
             frac_exits = self.execute_fractional_client_stops(now)
             healed = self.heal_overnight_gtc_stops(now, already_reconciled=True)
             summary["exits"] = frac_exits
             summary["gtc_healed"] = healed
             in_flight = len(d.store.get_active_orders())
-            has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
-            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac)
+            needs_watch = any(
+                self._needs_client_stop_watch(p, has_acc, trd_env_now)
+                for p in d.store.get_positions().values()
+            )
+            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, needs_watch)
             d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
 
         elif phase == PipelinePhase.IDLE_GTC_ARMED:
+            trd_env_now = getattr(d.gateway, "trd_env_name", "SIMULATE")
             frac_exits = self.execute_fractional_client_stops(now)
             summary["exits"] = frac_exits
             in_flight = len(d.store.get_active_orders())
-            has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
-            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, has_frac)
+            needs_watch = any(
+                self._needs_client_stop_watch(p, has_acc, trd_env_now)
+                for p in d.store.get_positions().values()
+            )
+            summary["next_sleep_minutes"] = _compute_phase_aware_sleep_minutes(now_et, phase, in_flight, needs_watch)
 
         elif phase == PipelinePhase.EOD_DECISION_WINDOW:
-            summary.update(self._execute_eod_decision_dag(now, now_et.date(), tier_key, tier, pool_syms, check_edgar))
-            d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
+            eod_out = self._execute_eod_decision_dag(
+                now, now_et.date(), tier_key, tier, pool_syms, check_edgar, force_rerun=force_rerun
+            )
+            summary.update(eod_out)
+            # Only latch EOD_DECISION_WINDOW as COMPLETED once all required exits are filled/settled
+            # (never strand an unfilled/rejected pre-earnings or stop exit across 15:35-15:59 ET!)
+            if summary.get("eod_all_exits_settled", True):
+                d.store.record_pipeline_phase(trading_date_iso, phase.value, "COMPLETED", summary)
+            else:
+                summary["next_sleep_minutes"] = 1
 
         elif phase == PipelinePhase.POST_CLOSE_SETTLEMENT:
             # Cancel any dangling DAY limit orders left unfilled past market close (with fill-race re-poll)
@@ -530,6 +574,7 @@ class DailySwingPipeline:
         tier: Any,
         pool_syms: List[str],
         check_edgar: bool,
+        force_rerun: bool = False,
     ) -> Dict[str, Any]:
         """
         Phase 3 (`EOD_DECISION_WINDOW`, `15:35-15:55 ET`):
@@ -544,6 +589,7 @@ class DailySwingPipeline:
         open_positions = d.store.get_positions()
         held_syms = list(open_positions.keys())
         all_target_syms = list(dict.fromkeys([*pool_syms, *held_syms]))
+        all_with_bench = list(dict.fromkeys(["QQQ", "SPY", *all_target_syms]))
 
         # Load >= 260 completed daily bars (`<= T-1` enforced by `build_strictly_causal_daily_series`!)
         daily_bars_map = self._fetch_260d_universe(all_target_syms)
@@ -551,22 +597,37 @@ class DailySwingPipeline:
             symbols=all_target_syms, ref_day=session_date, allow_network=(d.bar_cache is not None)
         )
 
-        # Build causal `partial_1d_bar` for benchmarks & open positions
+        # Batch-fetch quotes AND 2-day 15m session bars once so all `partial_1d_bar`s share exact OHLCV parity
+        # with `hybrid_1545` backtesting without serial per-candidate HTTP requests!
         alpaca_ready = hasattr(d.market_data, "has_credentials") and bool(
             getattr(d.market_data, "has_credentials")()
         )
-        vol_ratios = getattr(d.market_data, "sip_iex_vol_ratios", {})
+        bar_cache = getattr(d.market_data, "bar_cache", None)
+        wide_cached = bar_cache is not None and bar_cache.stats().get("distinct_symbols", 0) >= 20
+
         quotes: Dict[str, QuoteSnapshot] = {}
         if alpaca_ready and hasattr(d.market_data, "get_snapshots_batch"):
-            quotes = d.market_data.get_snapshots_batch(["QQQ", "SPY", *all_target_syms])  # type: ignore[attr-defined]
+            quotes = d.market_data.get_snapshots_batch(all_with_bench)  # type: ignore[attr-defined]
         else:
-            for s in ["QQQ", "SPY", *all_target_syms]:
+            for s in all_with_bench:
                 q_snap = d.market_data.get_quote(s)
                 if q_snap is not None:
                     quotes[s] = q_snap
 
+        batch_15m_map: Dict[str, List[Bar]] = {}
+        if hasattr(d.market_data, "get_bars_batch") and (alpaca_ready or wide_cached):
+            batch_15m_map = d.market_data.get_bars_batch(all_with_bench, timeframe="15m", days=2)  # type: ignore[attr-defined]
+
+        partial_memo: Dict[str, Optional[Bar]] = {}
+
         def _make_partial_bar(sym_key: str) -> Optional[Bar]:
-            b15 = d.market_data.get_bars(sym_key, timeframe="15m", days=2)
+            if sym_key in partial_memo:
+                return partial_memo[sym_key]
+            b15 = (
+                batch_15m_map[sym_key]
+                if sym_key in batch_15m_map
+                else d.market_data.get_bars(sym_key, timeframe="15m", days=2)
+            )
             v_mult = (
                 d.market_data.get_effective_15m_volume_scale(sym_key)  # type: ignore[attr-defined]
                 if hasattr(d.market_data, "get_effective_15m_volume_scale")
@@ -574,31 +635,20 @@ class DailySwingPipeline:
             )
             p_bar = build_causal_partial_1d_bar(sym_key, b15, decision_ts_utc=now_utc, volume_scale_mult=v_mult)
             if p_bar is not None:
+                partial_memo[sym_key] = p_bar
                 return p_bar
             q_s = quotes.get(sym_key)
             if q_s is not None:
                 anchor = datetime(session_date.year, session_date.month, session_date.day, 12, 0, tzinfo=timezone.utc)
-                return Bar(sym_key, anchor, q_s.last_price, q_s.last_price, q_s.last_price, q_s.last_price, max(1.0, q_s.avg_daily_dollar_vol / max(1.0, q_s.last_price)))
+                fb_bar = Bar(sym_key, anchor, q_s.last_price, q_s.last_price, q_s.last_price, q_s.last_price, max(1.0, q_s.avg_daily_dollar_vol / max(1.0, q_s.last_price)))
+                partial_memo[sym_key] = fb_bar
+                return fb_bar
+            partial_memo[sym_key] = None
             return None
 
         qqq_partial = _make_partial_bar("QQQ")
         spy_partial = _make_partial_bar("SPY")
-        uni_partials = {
-            s: (
-                Bar(
-                    s,
-                    datetime(session_date.year, session_date.month, session_date.day, 12, 0, tzinfo=timezone.utc),
-                    quotes[s].last_price,
-                    quotes[s].last_price,
-                    quotes[s].last_price,
-                    quotes[s].last_price,
-                    1.0,
-                )
-                if s in quotes
-                else None
-            )
-            for s in all_target_syms
-        }
+        uni_partials: Dict[str, Optional[Bar]] = {s: _make_partial_bar(s) for s in all_target_syms}
 
         # --- Step (a): Daily Macro & Breadth Regime ---
         regime = self.swing_engine.regime_detector.evaluate_daily(
@@ -634,9 +684,11 @@ class DailySwingPipeline:
 
         # --- Step (b): Step Open Positions (Pre-Earnings Cushion, Time Stop, Chandelier GTC Ratchet) ---
         exits_triggered: List[str] = []
+        has_unsettled_exits = False
         open_positions = d.store.get_positions()
         for sym, pos in list(open_positions.items()):
             if d.store.get_active_orders(side=OrderSide.SELL, symbol=sym):
+                has_unsettled_exits = True
                 continue
             p_bar = _make_partial_bar(sym)
             causal_d = build_strictly_causal_daily_series(
@@ -667,6 +719,7 @@ class DailySwingPipeline:
             if action.should_exit and action.shares_to_sell > 0:
                 is_partial_exit = action.shares_to_sell < pos.shares - 1e-5
                 post_scale_stop = pos.current_stop
+                applied_earn_date = pos.earnings_cushion_applied_date
                 cid = f"EXIT-{sym}-{now_utc.strftime('%Y%m%d%H%M%S')}-{action.reason.value if action.reason else 'X'}"
                 exit_plan_meta = {
                     "symbol": sym,
@@ -677,19 +730,21 @@ class DailySwingPipeline:
                     "exit_reason": action.reason.value if action.reason else "EXIT",
                     "is_scale_out": is_partial_exit,
                     "post_scale_stop": post_scale_stop,
-                    "earnings_cushion_date": pos.earnings_cushion_applied_date,
+                    "earnings_cushion_date": applied_earn_date,
                     "tier_key": tier_key,
                 }
                 if d.store.record_order_intent(
                     cid, sym, OrderSide.SELL, action.shares_to_sell, action.exit_price, action.note, plan_meta=exit_plan_meta, created_at=now_utc
                 ):
                     if has_acc:
+                        has_unsettled_exits = True
                         prior_stop_oid = pos.broker_stop_order_id
+                        # Never latch `earnings_cushion_applied_date` before the async SELL order actually fills!
+                        pos.earnings_cushion_applied_date = prev_earn_date
                         if is_partial_exit:
                             pos.scaled_out = prev_scaled
                             pos.current_stop = prev_stop
                             pos.breakeven_armed = prev_be
-                            pos.earnings_cushion_applied_date = prev_earn_date
                             if prior_stop_oid and d.settings.strategy_cfg.daemon.place_server_side_stop:
                                 rem_sh = round(pos.shares - action.shares_to_sell, 6)
                                 reduced_oid = d._place_stop_order(
@@ -778,13 +833,16 @@ class DailySwingPipeline:
             insiders=insiders,
             earnings_events=earn_events,
             qqq_partial_bar=qqq_partial,
+            partial_bars_map=uni_partials,
         )
         d.store.save_watchlist_scores(scored_candidates, prune_stale=True)
         top_candidates = self.swing_scorer.select_active_top_n(d.store.get_watchlist_scores())
 
         entries_placed: List[str] = []
+        entries_done_key = f"eod_entries_done_{session_date.isoformat()}"
+        should_eval_entries = force_rerun or not bool(d.store.get_flag(entries_done_key))
         open_positions = d.store.get_positions()
-        if regime.light != RegimeLight.RED:
+        if should_eval_entries and regime.light != RegimeLight.RED:
             trd_env_name = getattr(d.gateway, "trd_env_name", "SIMULATE")
             active_buys = d.store.get_active_orders(side=OrderSide.BUY)
             in_flight_cash = sum(
@@ -905,8 +963,17 @@ class DailySwingPipeline:
                     cash -= plan.notional_usd + est_buy_fee
                     entries_placed.append(f"{sym} x{plan.shares} @ ${plan.entry_price:.2f}")
 
+        if should_eval_entries:
+            d.store.set_flag(entries_done_key, {"done": True, "at": now_utc.isoformat()})
+
+        trd_env_now = getattr(d.gateway, "trd_env_name", "SIMULATE")
+        active_sells_after = d.store.get_active_orders(side=OrderSide.SELL)
+        eod_all_exits_settled = (not has_unsettled_exits) and (len(active_sells_after) == 0)
         in_flight = len(d.store.get_active_orders())
-        has_frac = any(p.shares < 1.0 for p in d.store.get_positions().values())
+        needs_watch = any(
+            self._needs_client_stop_watch(p, has_acc, trd_env_now)
+            for p in d.store.get_positions().values()
+        )
         return {
             "regime": regime.light.value,
             "reason": regime.reason,
@@ -914,9 +981,108 @@ class DailySwingPipeline:
             "watchlist_refreshed": True,
             "entries": entries_placed,
             "exits": exits_triggered,
+            "eod_all_exits_settled": eod_all_exits_settled,
             "in_flight_orders": in_flight,
             "next_sleep_minutes": _compute_phase_aware_sleep_minutes(
-                now_utc.astimezone(ET_TZ), PipelinePhase.EOD_DECISION_WINDOW, in_flight, has_frac
+                now_utc.astimezone(ET_TZ), PipelinePhase.EOD_DECISION_WINDOW, in_flight, needs_watch
+            ),
+        }
+
+    def run_readonly_scan(
+        self,
+        now_utc: Optional[datetime] = None,
+        check_edgar: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Read-only off-hours market regime + watchlist refresh (`POST /api/scan` & `daemon --once`
+        when `MARKET_CLOSED`): never increments `days_held`, never places BUY/SELL orders,
+        and never poisons today's `EOD_DECISION_WINDOW` checkpoint in `daily_pipeline_runs`!
+        """
+        d = self.daemon
+        now = now_utc or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
+        now_et = now.astimezone(ET_TZ)
+        session_date = now_et.date()
+
+        if not d.gateway.is_connected() and hasattr(d.gateway, "connect"):
+            d.gateway.connect()
+        order_events = d.reconcile_open_orders(now=now) if d.gateway.has_target_account() else []
+
+        scan_pool = d._select_quota_safe_universe()
+        pool_syms = [u.symbol for u in scan_pool]
+        daily_bars_map = self._fetch_260d_universe(pool_syms)
+        earn_events = d.earnings_feed.get_upcoming_events(
+            symbols=pool_syms, ref_day=session_date, allow_network=(d.bar_cache is not None)
+        )
+        insiders: Dict[str, InsiderActivity] = {}
+        if check_edgar:
+            for u in scan_pool[:16]:
+                insiders[u.symbol] = d.edgar_scanner.fetch_insider_activity(u.symbol, u.cik)
+
+        # Include completed `session_date` 1d bars post-close ONLY when today's 1d bars are already settled
+        q_bars_ro = daily_bars_map.get("QQQ", [])
+        has_today_1d = bool(q_bars_ro and daily_bar_session_date(q_bars_ro[-1].timestamp) == session_date)
+        include_completed = (
+            has_today_1d
+            and is_trading_day(session_date)
+            and (now_et.hour * 60 + now_et.minute)
+            >= (session_close_time(session_date).hour * 60 + session_close_time(session_date).minute)
+        )
+        regime = self.swing_engine.regime_detector.evaluate_daily(
+            qqq_daily=daily_bars_map.get("QQQ", []),
+            spy_daily=daily_bars_map.get("SPY", []),
+            universe_daily=daily_bars_map,
+            as_of_date=session_date,
+            include_completed_as_of=include_completed,
+        )
+        d.store.set_flag(
+            "latest_regime",
+            {
+                "light": regime.light.value,
+                "mode": "swing_1d",
+                "qqq_price": round(regime.qqq_price, 2),
+                "qqq_vwap": round(regime.qqq_vwap, 2),
+                "qqq_sma20": round(regime.qqq_sma20, 2),
+                "qqq_sma50": regime.qqq_sma50,
+                "qqq_sma200": regime.qqq_sma200,
+                "spy_price": round(regime.spy_price, 2),
+                "spy_sma50": regime.spy_sma50,
+                "spy_sma200": regime.spy_sma200,
+                "breadth_above_sma50_pct": regime.breadth_above_sma50_pct,
+                "qqq_intraday_return_pct": round(regime.qqq_intraday_return * 100.0, 2),
+                "vix_level": round(regime.vix_level, 2),
+                "recommended_scan_minutes": regime.recommended_scan_minutes,
+                "reason": regime.reason,
+                "evaluated_at": regime.evaluated_at.isoformat(),
+            },
+        )
+        scored = self.swing_scorer.rank_swing_universe(
+            quotes={},
+            daily_bars_map=daily_bars_map,
+            qqq_daily_bars=daily_bars_map.get("QQQ", []),
+            regime_light=regime.light,
+            as_of_date=session_date,
+            insiders=insiders,
+            earnings_events=earn_events,
+            include_completed_as_of=include_completed,
+        )
+        if scored:
+            d.store.save_watchlist_scores(scored, prune_stale=True)
+
+        return {
+            "trading_date": session_date.isoformat(),
+            "phase": PipelinePhase.MARKET_CLOSED.value,
+            "readonly_scan": True,
+            "regime": regime.light.value,
+            "reason": regime.reason,
+            "breadth_above_sma50_pct": regime.breadth_above_sma50_pct,
+            "watchlist_refreshed": True,
+            "order_events": order_events,
+            "entries": [],
+            "exits": [],
+            "next_sleep_minutes": _compute_phase_aware_sleep_minutes(
+                now_et, PipelinePhase.MARKET_CLOSED, len(d.store.get_active_orders()), False
             ),
         }
 
@@ -930,10 +1096,7 @@ class DailySwingPipeline:
         now = now_utc or datetime.now(timezone.utc)
         phase = resolve_swing_phase(now)
         if phase == PipelinePhase.MARKET_CLOSED and force_eod_when_closed:
-            phase = PipelinePhase.EOD_DECISION_WINDOW
-            return self.run_phase(
-                phase, now_utc=now, tier_override=tier_override, force_rerun=True, check_edgar=check_edgar
-            )
+            return self.run_readonly_scan(now_utc=now, check_edgar=check_edgar)
         return self.run_phase(
             phase, now_utc=now, tier_override=tier_override, force_rerun=False, check_edgar=check_edgar
         )

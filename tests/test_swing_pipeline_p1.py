@@ -1237,6 +1237,7 @@ def test_round3_filled_gtc_stop_guard_cancel_safety_and_phantom_position_guard(t
         "XOM": EarningsEvent("XOM", target_d, "AMC"),  # Triggers 100% full exit (< +1.0R)!
     }
     daemon.market_data.has_credentials = lambda: False  # type: ignore[method-assign]
+    daemon.market_data.bar_cache = None  # type: ignore[attr-defined]
     daemon.market_data.get_bars = lambda sym, timeframe="15m", days=2: []  # type: ignore[method-assign]
     daemon.market_data.get_quote = lambda sym: QuoteSnapshot(sym, 152.0, 151.9, 152.1, 900_000_000.0, now_eod)  # type: ignore[method-assign]
     daemon.gateway.trd_env_name = "REAL"
@@ -1395,6 +1396,7 @@ def test_round4_historical_gtc_rearm_zero_fill_stop_clear_partial_scale_out_and_
     pipe._fetch_260d_universe = lambda syms: d_map  # type: ignore[method-assign]
     daemon.earnings_feed.get_upcoming_events = lambda **kw: {"AVGO": EarningsEvent("AVGO", target_d, "AMC")}  # type: ignore[method-assign]
     daemon.market_data.has_credentials = lambda: False  # type: ignore[method-assign]
+    daemon.market_data.bar_cache = None  # type: ignore[attr-defined]
     daemon.market_data.get_bars = lambda sym, timeframe="15m", days=2: []  # type: ignore[method-assign]
     daemon.market_data.get_quote = lambda sym: QuoteSnapshot(sym, 218.0, 217.9, 218.1, 950_000_000.0, now_t)  # type: ignore[method-assign]
     daemon.gateway.trd_env_name = "REAL"
@@ -1448,3 +1450,239 @@ def test_round4_historical_gtc_rearm_zero_fill_stop_clear_partial_scale_out_and_
     pc_res = pipe_pc.run_phase(PipelinePhase.POST_CLOSE_SETTLEMENT, now_utc=pc_time)
     assert len(store_pc.query_closed_trades()) == 1  # Late closing stop fill WAS recorded in closed_trades!
     assert pc_res["ledger_reconciliation"]["ok"] is True
+
+
+def test_round5_sip_cache_isolation_scoped_stop_reconcile_eod_retry_readonly_scan_and_halted_guard(
+    tmp_path: Path,
+) -> None:
+    """
+    Regression tests for all 6 PR Review Comments (#1..#6):
+      1. `get_bars_batch(..., end_dt=None)` clamps `w_end <= now - 16m` on `1d` SIP (zero 403 -> IEX DB corruption),
+         never persists live `iex` `15m` bars into `HistoricalBarCache`, and tightens `min_required_max_ts` to exact
+         latest completed `15m` open (`15:30 ET` at `15:45 ET`, zero 50m lag)!
+      2. `stop_reconciled_*` metadata scopes by `broker_order_id` (`GTC-1` 6sh CANCELLED_PART -> `GTC-2` 4sh FILLED = 10sh closed!)
+      3. `EOD_DECISION_WINDOW` reverts `earnings_cushion_applied_date` until fill and retries unfilled/rejected exits
+         on subsequent ticks without double-firing entries before latching `COMPLETED`!
+      4. Off-hours `step_scheduled(force_when_closed=True)` when `MARKET_CLOSED` runs a read-only scan without
+         incrementing `days_held`, placing orders, or poisoning `EOD_DECISION_WINDOW` in `daily_pipeline_runs`!
+      5. `execute_fractional_client_stops` checks `min(b.low for b in today_15m)` across all session bars + unarmed/SIM lots,
+         and `_execute_eod_decision_dag` batch-fetches `15m` `uni_partials` passed to `rank_swing_universe`!
+      6. `include_completed_as_of=True` blocks ghost signals on halted/delisted stocks (`last_bar_date != as_of_date`),
+         Futu `15m` `time_key` converts `ET_TZ` bar-close -> bar-open UTC, and `build_causal_partial_1d_bar` filters `dec_et.date()` first!
+    """
+    from zy_quant.gateway.alpaca_adapter import latest_expected_rth_bar_utc
+
+    # --- Comment #1: SIP clamp with `end_dt=None`, zero IEX SQLite persistence, & exact 15:30 ET latest 15m open ---
+    at_1545_utc = datetime(2026, 11, 25, 15, 45, tzinfo=ET_TZ).astimezone(timezone.utc)
+    at_1530_utc = datetime(2026, 11, 25, 15, 30, tzinfo=ET_TZ).astimezone(timezone.utc)
+    assert latest_expected_rth_bar_utc(at_1545_utc) == at_1530_utc
+
+    cache_c1 = HistoricalBarCache(tmp_path / "c1_sip_only.db")
+    now_ref = datetime.now(timezone.utc)
+    seen_feeds_and_ends: List[tuple[str, str, str]] = []
+
+    def alpaca_c1_handler(req: httpx.Request) -> httpx.Response:
+        tf = str(req.url.params.get("timeframe") or "")
+        fd = str(req.url.params.get("feed") or "")
+        end_s = str(req.url.params.get("end") or "")
+        seen_feeds_and_ends.append((tf, fd, end_s))
+        end_parsed = datetime.fromisoformat(end_s.replace("Z", "+00:00"))
+        # Enforce real Alpaca Free Tier rule: 403 if feed == "sip" and end > now - 15m!
+        if fd == "sip" and end_parsed > (now_ref - timedelta(minutes=15)):
+            return httpx.Response(403, text="recent SIP forbidden on free tier")
+        if tf == "1Day":
+            return httpx.Response(
+                200,
+                json={"bars": {"NVDA": [{"t": "2026-11-25T05:00:00Z", "o": 148.0, "h": 153.0, "l": 147.0, "c": 152.0, "v": 45_000_000.0}]}, "next_page_token": None},
+            )
+        return httpx.Response(
+            200,
+            json={"bars": {"NVDA": [{"t": "2026-11-25T20:30:00Z", "o": 151.0, "h": 152.5, "l": 150.8, "c": 152.0, "v": 120_000.0}]}, "next_page_token": None},
+        )
+
+    ad_c1 = AlpacaMarketDataAdapter(
+        AlpacaDataConfig(api_key="PK", secret_key="SK", feed="iex"),
+        bar_cache=cache_c1,
+        http_client=httpx.Client(transport=httpx.MockTransport(alpaca_c1_handler)),
+    )
+    # 1a. `end_dt=None` on `1d` MUST clamp `w_end <= now - 16m`, succeeding on `sip` (45M vol) and caching to SQLite!
+    d1_out = ad_c1.get_bars_batch(["NVDA"], timeframe="1d", days=10)
+    assert d1_out["NVDA"][0].volume == 45_000_000.0
+    assert seen_feeds_and_ends[0][1] == "sip"
+    assert cache_c1.coverage_bounds("NVDA", "1d") is not None
+
+    # 1b. Live `end_dt=None` on `15m` fetches `iex` in memory WITHOUT writing ~2.5%-volume IEX bars into SQLite!
+    m15_out = ad_c1.get_bars_batch(["NVDA"], timeframe="15m", days=5)
+    assert len(m15_out["NVDA"]) == 1
+    assert ad_c1.get_effective_15m_volume_scale("NVDA") == 35.0
+    assert cache_c1.coverage_bounds("NVDA", "15m") is None  # SQLite BarCache unpolluted!
+
+    # 1c. Tight `min_required_max_ts == expected_latest` (`15:30 ET` at `15:45 ET`) triggers tail fetch when `15:00 ET` cached!
+    cache_c1.upsert_bars("15m", [Bar("NVDA", datetime(2026, 11, 25, 20, 0, tzinfo=timezone.utc), 150.0, 151.0, 149.5, 150.5, 1_500_000.0)])
+    seen_feeds_and_ends.clear()
+    m15_tail = ad_c1.get_bars_batch(["NVDA"], timeframe="15m", start_dt=datetime(2026, 11, 25, 14, 0, tzinfo=timezone.utc), end_dt=at_1545_utc)
+    assert len(seen_feeds_and_ends) == 1  # Tail fetch triggered for missing 15:15/15:30 ET bars!
+    assert len(m15_tail["NVDA"]) == 2
+
+    # --- Comment #2: Scoped `stop_reconciled_oid` across `CANCELLED_PART` (`GTC-1`) -> replacement `FILLED` (`GTC-2`) ---
+    settings = AppSettings.load()
+    store_c2 = StateStore(tmp_path / "c2_stop_oid.db")
+    daemon_c2 = TradingDaemon(settings, store=store_c2, notifier=AlertNotifier())
+    tier_10k = settings.tiers_cfg.get_active("tier_10k")
+    t_buy = datetime(2026, 11, 20, 20, 45, tzinfo=timezone.utc)
+    buy_fee_c2 = daemon_c2.fee_model.estimate_leg(10.0, 150.0, OrderSide.BUY).total_friction_usd
+    plan_c2 = PositionPlan("NVDA", "Semiconductors", 10.0, 150.0, 150.1, 140.0, 10.0, 100.0, 1500.0, 4.1, 2.5, 0.5, SetupType.VCP_PIVOT_BREAKOUT)
+    sig_c2 = EntrySignal("NVDA", "Semiconductors", SetupType.VCP_PIVOT_BREAKOUT, t_buy, 150.0, 4.5, 148.0, 1.5, 84.0, "test")
+    store_c2.record_order_intent("BUY-C2", "NVDA", OrderSide.BUY, 10.0, 150.1, "test", created_at=t_buy)
+    daemon_c2._settle_paper_local_buy("BUY-C2", "NVDA", plan_c2, sig_c2, buy_fee_c2, t_buy, "tier_10k", tier_10k)
+
+    p_c2 = store_c2.get_positions()["NVDA"]
+    p_c2.broker_stop_order_id = "GTC-1"
+    store_c2.upsert_position(p_c2)
+    daemon_c2.gateway.last_stop_sync_ok = True
+    daemon_c2._place_stop_order = lambda sym, sh, px, oid=None: "GTC-2"  # type: ignore[method-assign]
+
+    # Stop #1 (`GTC-1`) partially fills 6.0 sh @ $140 and terminates `CANCELLED` (`CANCELLED_PART`) -> re-arms `GTC-2` for 4 sh!
+    daemon_c2.on_broker_order_update(
+        BrokerOrderUpdate("GTC-1", "NVDA", OrderSide.SELL, "STOP", OrderStatus.CANCELLED, "CANCELLED_PART", 10.0, 140.0, 6.0, 140.0)
+    )
+    rem_after_1 = store_c2.get_positions()["NVDA"]
+    assert rem_after_1.shares == 4.0
+    assert rem_after_1.broker_stop_order_id == "GTC-2"
+
+    # Stop #2 (`GTC-2`, qty=4.0) fills all 4.0 sh @ $139 -> scoped `stop_reconciled_oid` MUST settle delta=4.0 (NOT 0.0)!
+    daemon_c2.on_broker_order_update(
+        BrokerOrderUpdate("GTC-2", "NVDA", OrderSide.SELL, "STOP", OrderStatus.FILLED, "FILLED_ALL", 4.0, 139.0, 4.0, 139.0)
+    )
+    assert "NVDA" not in store_c2.get_positions()
+    assert len(store_c2.query_closed_trades()) == 2
+    rec_c2 = store_c2.reconcile_stateful_ledger("tier_10k", tier_10k.reference_equity_usd)
+    assert rec_c2["ok"] is True and abs(rec_c2["drift_usd"]) <= 0.01
+
+    # --- Comment #3 & #4: Off-hours Read-Only Scan + EOD Exit Retry Before `COMPLETED` Latch ---
+    store_c3 = StateStore(tmp_path / "c3_eod_retry.db")
+    daemon_c3 = TradingDaemon(settings, store=store_c3, notifier=AlertNotifier())
+    pipe_c3 = DailySwingPipeline(daemon_c3)
+    target_d = date(2026, 11, 25)
+    d_map = {
+        sym: _make_daily_series(sym, n_days=120, end_d=date(2026, 11, 24), start_px=150.0, seed_offset=i * 3)
+        for i, sym in enumerate(["QQQ", "SPY", "XOM"])
+    }
+    pipe_c3._fetch_260d_universe = lambda syms: d_map  # type: ignore[method-assign]
+    daemon_c3.earnings_feed.get_upcoming_events = lambda **kw: {"XOM": EarningsEvent("XOM", target_d, "AMC")}  # type: ignore[method-assign]
+    daemon_c3.market_data.has_credentials = lambda: False  # type: ignore[method-assign]
+    daemon_c3.market_data.bar_cache = None  # type: ignore[attr-defined]
+    daemon_c3.market_data.get_bars = lambda sym, timeframe="15m", days=2: []  # type: ignore[method-assign]
+    daemon_c3.market_data.get_quote = lambda sym: QuoteSnapshot(sym, 152.0, 151.9, 152.1, 900_000_000.0, at_1545_utc)  # type: ignore[method-assign]
+
+    store_c3.upsert_position(
+        OpenPosition("XOM", "Energy", 10.0, 10.0, 150.0, at_1545_utc - timedelta(days=4), 140.0, 140.0, 153.0, 10.0, days_held=3, broker_stop_order_id="STOP-XOM-9")
+    )
+
+    # 4. Off-hours manual Web Scan at 08:00 ET (`MARKET_CLOSED`): read-only, `days_held` stays 3, EOD NOT marked COMPLETED!
+    off_hours_utc = datetime(2026, 11, 25, 8, 0, tzinfo=ET_TZ).astimezone(timezone.utc)
+    ro_res = daemon_c3.step_scheduled(force_when_closed=True, now_override=off_hours_utc)
+    assert ro_res.get("readonly_scan") is True
+    assert store_c3.get_positions()["XOM"].days_held == 3
+    assert store_c3.has_completed_pipeline_phase("2026-11-25", PipelinePhase.EOD_DECISION_WINDOW.value) is False
+
+    # 3. EOD Tick #1 (15:36 ET): XOM < +1.0R pre-earnings `place_limit_order` rejects -> `earnings_cushion_applied_date` stays None
+    #    and `EOD_DECISION_WINDOW` is NOT marked COMPLETED, so Tick #2 (15:37 ET) retries and submits cleanly!
+    daemon_c3.gateway.trd_env_name = "REAL"
+    daemon_c3.gateway.has_target_account = lambda: True  # type: ignore[method-assign]
+    daemon_c3.gateway.is_connected = lambda: True  # type: ignore[method-assign]
+    daemon_c3.gateway.last_stop_sync_ok = True
+    daemon_c3.gateway.cancel_order = lambda oid: True  # type: ignore[method-assign]
+    daemon_c3._place_stop_order = lambda sym, sh, px, oid=None: "REARM-XOM"  # type: ignore[method-assign]
+    daemon_c3.gateway.get_account_summary = lambda: {"equity_usd": 10000.0, "cash_usd": 0.0}  # type: ignore[method-assign]
+
+    sell_attempt = 0
+
+    def _flaky_sell(sym: str, side: OrderSide, qty: float, px: float, remark: str = "") -> Any:
+        nonlocal sell_attempt
+        sell_attempt += 1
+        return None if sell_attempt == 1 else "BRK-SELL-OK"
+
+    daemon_c3.gateway.place_limit_order = _flaky_sell  # type: ignore[method-assign]
+    t_1536 = datetime(2026, 11, 25, 15, 36, tzinfo=ET_TZ).astimezone(timezone.utc)
+    res_t1 = pipe_c3.run_phase(PipelinePhase.EOD_DECISION_WINDOW, now_utc=t_1536)
+    assert sell_attempt == 1
+    assert res_t1["eod_all_exits_settled"] is False
+    assert store_c3.get_positions()["XOM"].earnings_cushion_applied_date is None
+    assert store_c3.has_completed_pipeline_phase("2026-11-25", PipelinePhase.EOD_DECISION_WINDOW.value) is False
+
+    # Tick #2 (15:37 ET, normal scheduled tick without `force_rerun`!): retries XOM exit -> succeeds (`BRK-SELL-OK`)!
+    t_1537 = datetime(2026, 11, 25, 15, 37, tzinfo=ET_TZ).astimezone(timezone.utc)
+    res_t2 = pipe_c3.run_phase(PipelinePhase.EOD_DECISION_WINDOW, now_utc=t_1537)
+    assert sell_attempt == 2
+    assert len(res_t2["exits"]) == 1
+
+    # --- Comment #5: Full-session `min(b.low)` client stop on prior 15m bar + SIM/unarmed whole-share coverage ---
+    store_c5 = StateStore(tmp_path / "c5_min_low.db")
+    daemon_c5 = TradingDaemon(settings, store=store_c5, notifier=AlertNotifier())
+    pipe_c5 = DailySwingPipeline(daemon_c5)
+    t_ent = datetime(2026, 11, 24, 20, 0, tzinfo=timezone.utc)
+    # Whole-share position with `SIM-LOCAL-STOP-*` (no real broker GTC stop!)
+    store_c5.upsert_position(
+        OpenPosition("MSFT", "Technology", 5.0, 5.0, 420.0, t_ent, 405.0, 405.0, 425.0, 15.0, broker_stop_order_id="SIM-LOCAL-STOP-MSFT")
+    )
+    # Bar 1 (10:00 ET) breached $405 stop (`low=401.0`), Bar 2 (10:15 ET) bounced to `low=410.0`!
+    daemon_c5.market_data.get_bars = lambda sym, timeframe="15m", days=2: [  # type: ignore[method-assign]
+        Bar("MSFT", datetime(2026, 11, 25, 15, 0, tzinfo=timezone.utc), 412.0, 413.0, 401.0, 408.0, 200_000.0),
+        Bar("MSFT", datetime(2026, 11, 25, 15, 15, tzinfo=timezone.utc), 408.0, 414.0, 410.0, 413.0, 180_000.0),
+    ]
+    daemon_c5.market_data.get_quote = lambda sym: QuoteSnapshot("MSFT", 413.0, 412.9, 413.1, 900_000_000.0, datetime(2026, 11, 25, 15, 30, tzinfo=timezone.utc))  # type: ignore[method-assign]
+    c5_trig = pipe_c5.execute_fractional_client_stops(datetime(2026, 11, 25, 15, 30, tzinfo=timezone.utc))
+    assert len(c5_trig) == 1 and "MSFT" not in store_c5.get_positions()
+
+    # --- Comment #6: Halted/delisted `== as_of_date` guard, Futu 15m ET bar-open conversion, & day-filtered partial bar ---
+    halted_bars = _make_daily_series("NVDA", n_days=120, end_d=date(2026, 11, 20), start_px=140.0)
+    qqq_ok = _make_daily_series("QQQ", n_days=120, end_d=date(2026, 11, 25), start_px=500.0)
+    scorer_c6 = SwingWatchlistScorer(settings.watchlist_cfg, settings.strategy_cfg.swing)
+    swing_c6 = DailySwingSignalEngine(settings.strategy_cfg.entry, settings.strategy_cfg.regime, settings.strategy_cfg.swing)
+
+    ranked_c6 = scorer_c6.rank_swing_universe(
+        {}, {"NVDA": halted_bars}, qqq_ok, RegimeLight.GREEN, date(2026, 11, 25), include_completed_as_of=True
+    )
+    assert all(c.symbol != "NVDA" for c in ranked_c6)  # Halted stock excluded on 2026-11-25!
+    assert (
+        swing_c6.evaluate_entry(
+            "NVDA", "Semiconductors", RegimeLight.GREEN, 88.0, halted_bars, qqq_ok,
+            as_of_date=date(2026, 11, 25), include_completed_as_of=True,
+        )
+        is None
+    )
+
+    # Day-filtered `build_causal_partial_1d_bar` even when a trailing tomorrow bar exists in `bars_15m_session`:
+    mixed_days_15m = [
+        Bar("NVDA", datetime(2026, 11, 25, 15, 30, tzinfo=ET_TZ).astimezone(timezone.utc), 150.0, 155.0, 149.0, 154.0, 500_000.0),
+        Bar("NVDA", datetime(2026, 11, 25, 15, 45, tzinfo=ET_TZ).astimezone(timezone.utc), 154.0, 154.0, 0.01, 0.01, 999_999_999.0),  # Closing bar poison!
+        Bar("NVDA", datetime(2026, 11, 27, 9, 30, tzinfo=ET_TZ).astimezone(timezone.utc), 156.0, 158.0, 155.0, 157.0, 400_000.0),  # Trailing future day!
+    ]
+    p_mixed = build_causal_partial_1d_bar("NVDA", mixed_days_15m, decision_ts_utc=datetime(2026, 11, 25, 15, 55, tzinfo=ET_TZ).astimezone(timezone.utc))
+    assert p_mixed is not None and p_mixed.close == 154.0
+
+    # Futu `K_15M` `time_key="2026-11-25 09:45:00"` (bar close in ET) -> `2026-11-25 14:30:00+00:00` (`09:30 ET` bar open UTC)!
+    futu_15m = FutuGatewayAdapter(trd_env="SIMULATE")
+
+    class DummyFutuK:
+        RET_OK = 0
+
+        class KLType:
+            K_15M = "K_15M"
+            K_DAY = "K_DAY"
+
+    class DummyQuoteCtx:
+        def request_history_kline(self, *a: Any, **kw: Any) -> tuple[int, pd.DataFrame, None]:
+            return (
+                0,
+                pd.DataFrame([{"time_key": "2026-11-25 09:45:00", "open": 150.0, "high": 152.0, "low": 149.5, "close": 151.5, "volume": 300000}]),
+                None,
+            )
+
+    futu_15m._futu_mod = DummyFutuK
+    futu_15m._quote_ctx = DummyQuoteCtx()
+    futu_15m.is_connected = lambda: True  # type: ignore[method-assign]
+    k_bars = futu_15m.get_bars("NVDA", timeframe="15m", days=2)
+    assert len(k_bars) == 1
+    assert k_bars[0].timestamp == datetime(2026, 11, 25, 14, 30, tzinfo=timezone.utc)

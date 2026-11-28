@@ -55,7 +55,10 @@ def latest_expected_rth_bar_utc(ref_utc: datetime) -> datetime:
         if et >= close_dt:
             return (close_dt - timedelta(minutes=15)).astimezone(timezone.utc)
         if et >= open_dt + timedelta(minutes=15):
-            return (et - timedelta(minutes=20)).astimezone(timezone.utc)
+            elapsed_m = int((et - open_dt).total_seconds() // 60)
+            completed_bars = max(1, elapsed_m // 15)
+            latest_open_et = open_dt + timedelta(minutes=15 * (completed_bars - 1))
+            return latest_open_et.astimezone(timezone.utc)
         d = d - timedelta(days=1)
 
     for _ in range(10):
@@ -130,9 +133,10 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             "Accept": "application/json",
         }
 
-    def _request_json(
+    def _request_json_with_feed(
         self, path: str, params: Dict[str, Any], timeout: float = 15.0
-    ) -> Optional[Dict[str, Any]]:
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        req_feed = str(params.get("feed") or self.feed).lower()
         url = f"{self.base_url}{path}"
         client = self._get_http_client()
         try:
@@ -141,11 +145,11 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             if resp.status_code == 200:
                 self.last_error = ""
                 self.used_alpaca = True
-                self._last_http_feed_used = str(params.get("feed") or self.feed)
-                return resp.json()
+                self._last_http_feed_used = req_feed
+                return resp.json(), req_feed
 
             # Free tier restricts real-time (<15m) SIP; transparently retry with 'iex'
-            if resp.status_code in (403, 422) and params.get("feed") == "sip":
+            if resp.status_code in (403, 422) and req_feed == "sip":
                 retry_params = dict(params, feed="iex")
                 resp2 = client.get(
                     url, params=retry_params, headers=self._headers(), timeout=timeout
@@ -154,15 +158,21 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                     self.last_error = ""
                     self.used_alpaca = True
                     self._last_http_feed_used = "iex"
-                    return resp2.json()
+                    return resp2.json(), "iex"
 
             self.last_error = f"Alpaca HTTP {resp.status_code}: {resp.text[:180]}"
             logger.warning("[ALPACA API] %s on %s", self.last_error, path)
-            return None
+            return None, req_feed
         except Exception as exc:
             self.last_error = f"Alpaca network error: {exc}"
             logger.warning("[ALPACA API] Request failed on %s: %s", path, exc)
-            return None
+            return None, req_feed
+
+    def _request_json(
+        self, path: str, params: Dict[str, Any], timeout: float = 15.0
+    ) -> Optional[Dict[str, Any]]:
+        payload, _ = self._request_json_with_feed(path, params, timeout=timeout)
+        return payload
 
     def test_connection(self, sample_symbols: Sequence[str] = ("SPY", "QQQ", "NVDA")) -> Dict[str, Any]:
         """Verifies Alpaca credentials, endpoint reachability, batch snapshot latency, and bar retrieval."""
@@ -322,13 +332,14 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
 
         expected_latest = latest_expected_rth_bar_utc(eff_end)
         min_required_max_ts = (
-            expected_latest - timedelta(minutes=30)
+            expected_latest
             if timeframe == "15m"
             else expected_latest - timedelta(hours=26)
         )
 
         if self.bar_cache is not None:
             for sym in clean_syms:
+                self.last_bars_feed[(sym, timeframe)] = "sip"
                 bounds = self.bar_cache.coverage_bounds(sym, timeframe)
                 if bounds is None:
                     full_fetch_syms.append(sym)
@@ -350,19 +361,20 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             return {}
 
         alpaca_tf = "15Min" if timeframe == "15m" else "1Day"
+        live_unpersisted: Dict[str, List[Bar]] = {}
 
         def _download_window(
             target_syms: List[str], win_start: datetime, win_end: datetime
         ) -> Dict[str, List[Bar]]:
             if not target_syms or win_end <= win_start:
                 return {}
-            is_hist = win_end <= (now_utc - timedelta(minutes=17))
+            is_hist = win_end <= (now_utc - timedelta(minutes=16))
             pref_feed = "sip" if (timeframe == "1d" or is_hist) else self.feed
-            w_end = (
-                min(win_end, now_utc - timedelta(minutes=16))
-                if pref_feed == "sip" and end_dt is not None
-                else win_end
-            )
+            # Unconditionally clamp `w_end` when `pref_feed == "sip"` so Alpaca Free Tier never 403s
+            # onto IEX (~2.5% volume) when `end_dt` was omitted (`now_utc`)!
+            w_end = min(win_end, now_utc - timedelta(minutes=16)) if pref_feed == "sip" else win_end
+            if w_end <= win_start:
+                return {}
             s_iso = win_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             e_iso = w_end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             eff_chunk = 15 if (timeframe == "15m" and (w_end - win_start).days > 60) else chunk_size
@@ -371,9 +383,10 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                 for idx in range(0, len(target_syms), eff_chunk)
             ]
 
-            def _fetch_batch(batch: List[str]) -> Dict[str, List[Bar]]:
+            def _fetch_batch(batch: List[str]) -> tuple[Dict[str, List[Bar]], str]:
                 fetched_map: Dict[str, List[Bar]] = {s: [] for s in batch}
                 page_token: Optional[str] = None
+                batch_feed = pref_feed
                 for _ in range(500):
                     params: Dict[str, Any] = {
                         "symbols": ",".join(batch),
@@ -381,12 +394,13 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                         "start": s_iso,
                         "end": e_iso,
                         "adjustment": "all",
-                        "feed": pref_feed,
+                        "feed": batch_feed,
                         "limit": 10000,
                     }
                     if page_token:
                         params["page_token"] = page_token
-                    payload = self._request_json("/v2/stocks/bars", params=params, timeout=30.0)
+                    payload, used_f = self._request_json_with_feed("/v2/stocks/bars", params=params, timeout=30.0)
+                    batch_feed = used_f
                     if not payload:
                         break
                     bars_dict = payload.get("bars") or {}
@@ -412,7 +426,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                     page_token = payload.get("next_page_token")
                     if not page_token:
                         break
-                return fetched_map
+                return fetched_map, batch_feed
 
             if self._client is not None or len(batches) <= 1:
                 batch_outputs = [_fetch_batch(b) for b in batches]
@@ -421,17 +435,20 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                     batch_outputs = list(pool.map(_fetch_batch, batches))
 
             merged_out: Dict[str, List[Bar]] = {}
-            new_bars_flat: List[Bar] = []
-            actual_feed = self._last_http_feed_used if pref_feed == "sip" else pref_feed
-            for batch, fmap in zip(batches, batch_outputs):
+            sip_bars_flat: List[Bar] = []
+            for batch, (fmap, actual_feed) in zip(batches, batch_outputs):
                 for s in batch:
                     s_bars = sorted(fmap[s], key=lambda b: b.timestamp)
                     if s_bars:
                         merged_out[s] = s_bars
-                        new_bars_flat.extend(s_bars)
                         self.last_bars_feed[(s, timeframe)] = actual_feed
-            if new_bars_flat and self.bar_cache is not None:
-                self.bar_cache.upsert_bars(timeframe, new_bars_flat)
+                        if actual_feed == "sip":
+                            sip_bars_flat.extend(s_bars)
+                        else:
+                            # Never persist non-SIP (`iex`) ~2.5%-volume bars into `market_bars.db`; merge in memory only!
+                            live_unpersisted.setdefault(s, []).extend(s_bars)
+            if sip_bars_flat and self.bar_cache is not None:
+                self.bar_cache.upsert_bars(timeframe, sip_bars_flat)
             return merged_out
 
         # 2. Execute full fetch only for uncached symbols, and surgical delta fetches for head/tail gaps!
@@ -474,7 +491,20 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             return direct_fetched
 
         cached_merged = self.bar_cache.get_bars_batch(clean_syms, timeframe, eff_start, eff_end)
-        return {sym: blist for sym, blist in cached_merged.items() if blist}
+        final_out: Dict[str, List[Bar]] = {}
+        for sym in clean_syms:
+            c_list = cached_merged.get(sym, [])
+            m_list = live_unpersisted.get(sym, [])
+            if c_list and not m_list:
+                final_out[sym] = c_list
+            elif m_list:
+                by_ts: Dict[int, Bar] = {int(b.timestamp.timestamp()): b for b in c_list}
+                for lb in m_list:
+                    if eff_start <= lb.timestamp <= eff_end:
+                        by_ts[int(lb.timestamp.timestamp())] = lb
+                if by_ts:
+                    final_out[sym] = [by_ts[k] for k in sorted(by_ts.keys())]
+        return final_out
 
     # --- Single-Symbol MarketDataAdapter Contract ---
     def get_bars(
@@ -635,28 +665,24 @@ def build_causal_partial_1d_bar(
     if not bars_15m_session:
         return None
     if decision_ts_utc is not None:
-        # Enforce full 15m bar completion AND cap at `close - 15m` so the 15:45-16:00 closing bar never leaks
+        # Filter strictly to `dec_et.date()` FIRST, then enforce full 15m bar completion
+        # AND cap at `close - 15m` so the `15:45-16:00 ET` closing bar never leaks even if trailing bars exist!
         dec_et = decision_ts_utc.astimezone(ET_TZ)
-        close_t = session_close_time(dec_et.date())
+        session_d = dec_et.date()
+        day_bars = [b for b in bars_15m_session if b.timestamp.astimezone(ET_TZ).date() == session_d]
+        if not day_bars:
+            return None
+        close_t = session_close_time(session_d)
         max_eod_cutoff_utc = datetime(
             dec_et.year, dec_et.month, dec_et.day, close_t.hour, close_t.minute, 0, tzinfo=ET_TZ
         ).astimezone(timezone.utc) - timedelta(minutes=15)
-        # Note: at `15:45 ET` (`close - 15m`), the `15:30-15:45 ET` bar has just finished (`15:30 + 15m <= 15:45`),
-        # while the `15:45-16:00 ET` closing bar (`15:45 + 15m = 16:00 > 15:45`) is strictly excluded!
-        eff_cutoff = min(decision_ts_utc, max_eod_cutoff_utc) if dec_et.date() == bars_15m_session[-1].timestamp.astimezone(ET_TZ).date() else decision_ts_utc
-        sliced = [b for b in bars_15m_session if (b.timestamp + timedelta(minutes=15)) <= eff_cutoff]
+        eff_cutoff = min(decision_ts_utc, max_eod_cutoff_utc)
+        session_bars = [b for b in day_bars if (b.timestamp + timedelta(minutes=15)) <= eff_cutoff]
     else:
-        sliced = list(bars_15m_session)
+        last_ts = bars_15m_session[-1].timestamp
+        session_d = last_ts.astimezone(ET_TZ).date()
+        session_bars = [b for b in bars_15m_session if b.timestamp.astimezone(ET_TZ).date() == session_d]
 
-    if not sliced:
-        return None
-
-    last_ts = sliced[-1].timestamp
-    et_last = last_ts.astimezone(ET_TZ)
-    session_d = et_last.date()
-    if decision_ts_utc is not None and session_d != decision_ts_utc.astimezone(ET_TZ).date():
-        return None
-    session_bars = [b for b in sliced if b.timestamp.astimezone(ET_TZ).date() == session_d]
     if not session_bars:
         return None
 

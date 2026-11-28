@@ -58,7 +58,10 @@ open_guard_done = store.has_completed_pipeline_phase(today_iso, "OPEN_GAP_GUARD"
 settlement_done = store.has_completed_pipeline_phase(today_iso, "POST_CLOSE_SETTLEMENT")
 positions = store.get_positions()
 needs_rth_watch = is_early_close_day or any(
-    p.shares < 1.0 or not p.broker_stop_order_id for p in positions.values()
+    p.shares < 1.0
+    or not p.broker_stop_order_id
+    or str(p.broker_stop_order_id).startswith(("SIM-", "PAPER-"))
+    for p in positions.values()
 )
 missed_open_guard = s.is_open and not open_guard_done
 missed_settlement = (close_m < hm <= close_m + 35) and not settlement_done
@@ -153,7 +156,10 @@ if (
 ):
     positions = store.get_positions()
     all_gtc_protected = all(
-        p.shares >= 1.0 and bool(p.broker_stop_order_id) for p in positions.values()
+        p.shares >= 1.0
+        and bool(p.broker_stop_order_id)
+        and not str(p.broker_stop_order_id).startswith(("SIM-", "PAPER-"))
+        for p in positions.values()
     )
     if all_gtc_protected:
         print(f"EXIT_IDLE_MIDDAY_GTC_ARMED|{sess.et_now_str}|positions={len(positions)}")

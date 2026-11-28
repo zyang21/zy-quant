@@ -73,7 +73,14 @@ class PortfolioAnalyticsService:
                 if r_now >= 2.5
                 else ("HALF_SCALE (1.0..2.5R)" if r_now >= 1.0 else "NO_CUSHION (<1.0R)")
             )
-            gtc_healthy = (p.shares < 1.0 and p.stop_order_type == "CLIENT_FRAC_RTH") or bool(p.broker_stop_order_id)
+            stop_id_str = str(p.broker_stop_order_id or "")
+            gtc_healthy = (
+                (p.shares < 1.0 and p.stop_order_type == "CLIENT_FRAC_RTH")
+                or (
+                    bool(stop_id_str)
+                    and (not is_real or not stop_id_str.startswith(("SIM-", "PAPER-")))
+                )
+            )
 
             positions_out.append(
                 {

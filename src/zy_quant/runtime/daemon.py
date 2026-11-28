@@ -516,12 +516,14 @@ class TradingDaemon:
                             self.store.remove_position(sym)
                         else:
                             if self.settings.strategy_cfg.daemon.place_server_side_stop:
-                                pos.broker_stop_order_id = self._place_stop_order(
+                                new_st_oid = self._place_stop_order(
                                     sym,
                                     pos.shares,
                                     pos.current_stop,
                                     pos.broker_stop_order_id,
                                 )
+                                if new_st_oid and getattr(self.gateway, "last_stop_sync_ok", True):
+                                    pos.broker_stop_order_id = new_st_oid
                             self.store.upsert_position(pos)
 
                     self._sync_sim_virtual_cash(delta_notional - delta_fee, tier_hint)
@@ -589,7 +591,17 @@ class TradingDaemon:
     def _handle_protective_stop_update(
         self, pos: OpenPosition, update: BrokerOrderUpdate
     ) -> Optional[str]:
-        prev_stop_filled = float(pos.metadata.get("stop_reconciled_shares") or 0.0)
+        curr_oid = str(update.broker_order_id or "")
+        tracked_oid = str(pos.metadata.get("stop_reconciled_oid") or "")
+        if curr_oid and tracked_oid != curr_oid:
+            prev_stop_filled = 0.0
+            prev_notional = 0.0
+            prev_fee = 0.0
+        else:
+            prev_stop_filled = float(pos.metadata.get("stop_reconciled_shares") or 0.0)
+            prev_notional = float(pos.metadata.get("stop_reconciled_notional") or 0.0)
+            prev_fee = float(pos.metadata.get("stop_reconciled_fee") or 0.0)
+
         new_filled = max(prev_stop_filled, float(update.filled_shares or 0.0))
         delta = round(new_filled - prev_stop_filled, 6)
         if delta <= 1e-6:
@@ -608,7 +620,6 @@ class TradingDaemon:
             return None
 
         cum_avg_px = float(update.avg_fill_price or update.price or pos.current_stop)
-        prev_notional = float(pos.metadata.get("stop_reconciled_notional") or 0.0)
         new_notional = new_filled * cum_avg_px
         delta_notional = max(0.0, new_notional - prev_notional)
         slice_px = round(delta_notional / delta, 4) if delta_notional > 0 else cum_avg_px
@@ -622,7 +633,6 @@ class TradingDaemon:
         else:
             reason = ExitReason.INITIAL_ATR_STOP
 
-        prev_fee = float(pos.metadata.get("stop_reconciled_fee") or 0.0)
         exact_total_fee = (
             self.gateway.query_order_fee(update.broker_order_id)
             if (update.status.is_terminal and update.broker_order_id)
@@ -673,12 +683,20 @@ class TradingDaemon:
         )
 
         pos.shares = round(pos.shares - delta, 6)
+        pos.metadata["stop_reconciled_oid"] = curr_oid
         pos.metadata["stop_reconciled_shares"] = new_filled
         pos.metadata["stop_reconciled_notional"] = round(new_notional, 6)
         pos.metadata["stop_reconciled_fee"] = total_stop_fee
         if pos.shares <= 1e-5:
             self.store.remove_position(pos.symbol)
         else:
+            if update.status.is_terminal and pos.broker_stop_order_id == update.broker_order_id:
+                # Terminal partial stop (`CANCELLED_PART` / `EXPIRED`): clear dead stop ID and re-arm remaining shares!
+                pos.broker_stop_order_id = None
+                if self.settings.strategy_cfg.daemon.place_server_side_stop:
+                    rearmed_oid = self._place_stop_order(pos.symbol, pos.shares, pos.current_stop, None)
+                    if rearmed_oid and getattr(self.gateway, "last_stop_sync_ok", True):
+                        pos.broker_stop_order_id = rearmed_oid
             self.store.upsert_position(pos)
         self._sync_sim_virtual_cash(delta_notional - delta_fee, tier_hint)
 

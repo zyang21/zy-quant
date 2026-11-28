@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 from zy_quant.config import FutuConnectionConfig
 from zy_quant.gateway.base import BrokerExecutionAdapter, MarketDataAdapter
 from zy_quant.gateway.yfinance_adapter import YahooMarketDataAdapter
+from zy_quant.intel.market_hours import ET_TZ
 from zy_quant.models import (
     Bar,
     BrokerOrderUpdate,
@@ -344,11 +345,14 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                     for _, row in frame.iterrows():
                         ts_str = str(row["time_key"]).replace(" ", "T")
                         parsed_dt = datetime.fromisoformat(ts_str)
-                        if timeframe == "1d" and parsed_dt.hour == 0 and parsed_dt.minute == 0:
+                        if timeframe == "1d":
                             # Anchor daily bars at 12:00 UTC (07:00/08:00 ET) so UTC and ET_TZ dates match identically
-                            ts = parsed_dt.replace(hour=12, tzinfo=timezone.utc)
+                            ts = datetime(parsed_dt.year, parsed_dt.month, parsed_dt.day, 12, 0, tzinfo=timezone.utc)
                         else:
-                            ts = parsed_dt.replace(tzinfo=timezone.utc)
+                            # Futu US `K_15M` `time_key` is in `America/New_York` (`ET_TZ`) stamped at bar CLOSE
+                            # (`09:45..16:00 ET`); convert to canonical bar-OPEN UTC (`09:30..15:45 ET`)!
+                            et_close = parsed_dt.replace(tzinfo=ET_TZ) if parsed_dt.tzinfo is None else parsed_dt.astimezone(ET_TZ)
+                            ts = (et_close - timedelta(minutes=15)).astimezone(timezone.utc)
                         out.append(
                             Bar(
                                 symbol=symbol,

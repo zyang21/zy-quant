@@ -48,6 +48,8 @@ def build_strictly_causal_daily_series(
     """
     if include_completed_as_of:
         base = [b for b in daily_bars if _bar_et_date(b) <= as_of_date]
+        if not base or _bar_et_date(base[-1]) != as_of_date:
+            return []
     else:
         base = [b for b in daily_bars if _bar_et_date(b) < as_of_date]
         if partial_today_bar is not None and _bar_et_date(partial_today_bar) == as_of_date:

@@ -286,7 +286,7 @@ class SwingWatchlistScorer(ConservativeWatchlistScorer):
                 s_upto = [
                     b for b in s_all if daily_bar_session_date(b.timestamp) <= as_of_date
                 ]
-                if not s_upto:
+                if not s_upto or daily_bar_session_date(s_upto[-1].timestamp) != as_of_date:
                     continue
                 s_today = s_upto[-1]
                 s_causal = s_upto[:-1]
