@@ -112,8 +112,9 @@ def test_alpaca_adapter_batch_snapshots_pagination_sip_fallback_and_sqlite_cache
             )
 
         if request.url.path == "/v2/stocks/bars":
-            # Simulate Free Tier 403 on real-time SIP -> automatic retry on IEX!
-            if request.url.params.get("feed") == "sip":
+            # Simulate Free Tier 403 ONLY on recent (<15m) un-clamped SIP queries; historical SIP succeeds!
+            end_param = str(request.url.params.get("end") or "")
+            if request.url.params.get("feed") == "sip" and end_param >= "2026-11-28":
                 return httpx.Response(403, text="subscription does not permit querying recent SIP data")
 
             call_counter["bars"] += 1
@@ -197,10 +198,18 @@ def test_multi_month_backtest_above_58d_with_bar_cache_and_pit_filter(tmp_path: 
     pit = PointInTimeUniverseFilter.from_csv(pit_csv)
 
     bt = BacktestEngine(settings, adapter)
-    res = bt.run(tier_key="tier_10k", symbols=["NVDA", "JPM", "XOM"], days=110, pit_filter=pit)
-    assert (res.green_bars + res.rest_bars) > 1500  # > 60 trading days simulated cleanly!
-    # XOM must never be traded because PIT membership ended in 2020
-    assert all(t["symbol"] != "XOM" for t in res.trades)
+    res_15m = bt.run(
+        tier_key="tier_10k", symbols=["NVDA", "JPM", "XOM"], days=110, pit_filter=pit, mode="intraday_15m"
+    )
+    assert (res_15m.green_bars + res_15m.rest_bars) > 1500  # > 60 trading days of 15m bars simulated!
+    assert all(t["symbol"] != "XOM" for t in res_15m.trades)
+
+    res_1d = bt.run(
+        tier_key="tier_10k", symbols=["NVDA", "JPM", "XOM"], days=110, pit_filter=pit, mode="swing_1d", clock_mode="1d"
+    )
+    assert (res_1d.green_bars + res_1d.rest_bars) == 110
+    assert res_1d.data_source == "LOCAL_BAR_CACHE"
+    assert all(t["symbol"] != "XOM" for t in res_1d.trades)
 
 
 def test_universe_hysteresis_buffer_rebalance_and_earnings_disk_cache(tmp_path: Path) -> None:

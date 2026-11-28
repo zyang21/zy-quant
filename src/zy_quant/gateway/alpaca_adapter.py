@@ -55,7 +55,10 @@ def latest_expected_rth_bar_utc(ref_utc: datetime) -> datetime:
         if et >= close_dt:
             return (close_dt - timedelta(minutes=15)).astimezone(timezone.utc)
         if et >= open_dt + timedelta(minutes=15):
-            return (et - timedelta(minutes=20)).astimezone(timezone.utc)
+            elapsed_m = int((et - open_dt).total_seconds() // 60)
+            completed_bars = max(1, elapsed_m // 15)
+            latest_open_et = open_dt + timedelta(minutes=15 * (completed_bars - 1))
+            return latest_open_et.astimezone(timezone.utc)
         d = d - timedelta(days=1)
 
     for _ in range(10):
@@ -97,8 +100,28 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         self.bar_cache = bar_cache
         self.fallback = fallback
         self._client = http_client
+        self._owned_client: Optional[httpx.Client] = None
         self.last_error: str = ""
         self.used_alpaca: bool = False
+        self.last_prev_closes: Dict[str, float] = {}
+        self.sip_iex_vol_ratios: Dict[str, float] = {}
+        self.last_bars_feed: Dict[tuple[str, str], str] = {}
+        self._last_http_feed_used: str = self.feed
+
+    def _get_http_client(self) -> httpx.Client:
+        if self._client is not None:
+            return self._client
+        if self._owned_client is None or self._owned_client.is_closed:
+            self._owned_client = httpx.Client(
+                timeout=20.0,
+                limits=httpx.Limits(max_keepalive_connections=8, max_connections=12),
+            )
+        return self._owned_client
+
+    def close(self) -> None:
+        if self._owned_client is not None and not self._owned_client.is_closed:
+            self._owned_client.close()
+            self._owned_client = None
 
     def has_credentials(self) -> bool:
         return bool(self.enabled and self.api_key and self.secret_key)
@@ -110,44 +133,46 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             "Accept": "application/json",
         }
 
-    def _request_json(
+    def _request_json_with_feed(
         self, path: str, params: Dict[str, Any], timeout: float = 15.0
-    ) -> Optional[Dict[str, Any]]:
+    ) -> tuple[Optional[Dict[str, Any]], str]:
+        req_feed = str(params.get("feed") or self.feed).lower()
         url = f"{self.base_url}{path}"
+        client = self._get_http_client()
         try:
-            if self._client is not None:
-                resp = self._client.get(url, params=params, headers=self._headers(), timeout=timeout)
-            else:
-                with httpx.Client(timeout=timeout) as client:
-                    resp = client.get(url, params=params, headers=self._headers())
+            resp = client.get(url, params=params, headers=self._headers(), timeout=timeout)
 
             if resp.status_code == 200:
                 self.last_error = ""
                 self.used_alpaca = True
-                return resp.json()
+                self._last_http_feed_used = req_feed
+                return resp.json(), req_feed
 
             # Free tier restricts real-time (<15m) SIP; transparently retry with 'iex'
-            if resp.status_code in (403, 422) and params.get("feed") == "sip":
+            if resp.status_code in (403, 422) and req_feed == "sip":
                 retry_params = dict(params, feed="iex")
-                if self._client is not None:
-                    resp2 = self._client.get(
-                        url, params=retry_params, headers=self._headers(), timeout=timeout
-                    )
-                else:
-                    with httpx.Client(timeout=timeout) as client:
-                        resp2 = client.get(url, params=retry_params, headers=self._headers())
+                resp2 = client.get(
+                    url, params=retry_params, headers=self._headers(), timeout=timeout
+                )
                 if resp2.status_code == 200:
                     self.last_error = ""
                     self.used_alpaca = True
-                    return resp2.json()
+                    self._last_http_feed_used = "iex"
+                    return resp2.json(), "iex"
 
             self.last_error = f"Alpaca HTTP {resp.status_code}: {resp.text[:180]}"
             logger.warning("[ALPACA API] %s on %s", self.last_error, path)
-            return None
+            return None, req_feed
         except Exception as exc:
             self.last_error = f"Alpaca network error: {exc}"
             logger.warning("[ALPACA API] Request failed on %s: %s", path, exc)
-            return None
+            return None, req_feed
+
+    def _request_json(
+        self, path: str, params: Dict[str, Any], timeout: float = 15.0
+    ) -> Optional[Dict[str, Any]]:
+        payload, _ = self._request_json_with_feed(path, params, timeout=timeout)
+        return payload
 
     def test_connection(self, sample_symbols: Sequence[str] = ("SPY", "QQQ", "NVDA")) -> Dict[str, Any]:
         """Verifies Alpaca credentials, endpoint reachability, batch snapshot latency, and bar retrieval."""
@@ -234,6 +259,9 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                 )
                 if last_px <= 0:
                     continue
+                prev_c = float(p_bar.get("c") or 0.0)
+                if prev_c > 0:
+                    self.last_prev_closes[sym.upper()] = prev_c
 
                 raw_bid = float(quote.get("bp") or 0.0)
                 raw_ask = float(quote.get("ap") or 0.0)
@@ -304,13 +332,14 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
 
         expected_latest = latest_expected_rth_bar_utc(eff_end)
         min_required_max_ts = (
-            expected_latest - timedelta(minutes=30)
+            expected_latest
             if timeframe == "15m"
             else expected_latest - timedelta(hours=26)
         )
 
         if self.bar_cache is not None:
             for sym in clean_syms:
+                self.last_bars_feed[(sym, timeframe)] = "sip"
                 bounds = self.bar_cache.coverage_bounds(sym, timeframe)
                 if bounds is None:
                     full_fetch_syms.append(sym)
@@ -332,19 +361,20 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             return {}
 
         alpaca_tf = "15Min" if timeframe == "15m" else "1Day"
+        live_unpersisted: Dict[str, List[Bar]] = {}
 
         def _download_window(
             target_syms: List[str], win_start: datetime, win_end: datetime
         ) -> Dict[str, List[Bar]]:
             if not target_syms or win_end <= win_start:
                 return {}
-            is_hist = win_end <= (now_utc - timedelta(minutes=17))
+            is_hist = win_end <= (now_utc - timedelta(minutes=16))
             pref_feed = "sip" if (timeframe == "1d" or is_hist) else self.feed
-            w_end = (
-                min(win_end, now_utc - timedelta(minutes=16))
-                if pref_feed == "sip" and end_dt is not None
-                else win_end
-            )
+            # Unconditionally clamp `w_end` when `pref_feed == "sip"` so Alpaca Free Tier never 403s
+            # onto IEX (~2.5% volume) when `end_dt` was omitted (`now_utc`)!
+            w_end = min(win_end, now_utc - timedelta(minutes=16)) if pref_feed == "sip" else win_end
+            if w_end <= win_start:
+                return {}
             s_iso = win_start.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             e_iso = w_end.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             eff_chunk = 15 if (timeframe == "15m" and (w_end - win_start).days > 60) else chunk_size
@@ -353,9 +383,10 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                 for idx in range(0, len(target_syms), eff_chunk)
             ]
 
-            def _fetch_batch(batch: List[str]) -> Dict[str, List[Bar]]:
+            def _fetch_batch(batch: List[str]) -> tuple[Dict[str, List[Bar]], str]:
                 fetched_map: Dict[str, List[Bar]] = {s: [] for s in batch}
                 page_token: Optional[str] = None
+                batch_feed = pref_feed
                 for _ in range(500):
                     params: Dict[str, Any] = {
                         "symbols": ",".join(batch),
@@ -363,12 +394,13 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                         "start": s_iso,
                         "end": e_iso,
                         "adjustment": "all",
-                        "feed": pref_feed,
+                        "feed": batch_feed,
                         "limit": 10000,
                     }
                     if page_token:
                         params["page_token"] = page_token
-                    payload = self._request_json("/v2/stocks/bars", params=params, timeout=30.0)
+                    payload, used_f = self._request_json_with_feed("/v2/stocks/bars", params=params, timeout=30.0)
+                    batch_feed = used_f
                     if not payload:
                         break
                     bars_dict = payload.get("bars") or {}
@@ -394,7 +426,7 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                     page_token = payload.get("next_page_token")
                     if not page_token:
                         break
-                return fetched_map
+                return fetched_map, batch_feed
 
             if self._client is not None or len(batches) <= 1:
                 batch_outputs = [_fetch_batch(b) for b in batches]
@@ -403,15 +435,20 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                     batch_outputs = list(pool.map(_fetch_batch, batches))
 
             merged_out: Dict[str, List[Bar]] = {}
-            new_bars_flat: List[Bar] = []
-            for batch, fmap in zip(batches, batch_outputs):
+            sip_bars_flat: List[Bar] = []
+            for batch, (fmap, actual_feed) in zip(batches, batch_outputs):
                 for s in batch:
                     s_bars = sorted(fmap[s], key=lambda b: b.timestamp)
                     if s_bars:
                         merged_out[s] = s_bars
-                        new_bars_flat.extend(s_bars)
-            if new_bars_flat and self.bar_cache is not None:
-                self.bar_cache.upsert_bars(timeframe, new_bars_flat)
+                        self.last_bars_feed[(s, timeframe)] = actual_feed
+                        if actual_feed == "sip":
+                            sip_bars_flat.extend(s_bars)
+                        else:
+                            # Never persist non-SIP (`iex`) ~2.5%-volume bars into `market_bars.db`; merge in memory only!
+                            live_unpersisted.setdefault(s, []).extend(s_bars)
+            if sip_bars_flat and self.bar_cache is not None:
+                self.bar_cache.upsert_bars(timeframe, sip_bars_flat)
             return merged_out
 
         # 2. Execute full fetch only for uncached symbols, and surgical delta fetches for head/tail gaps!
@@ -419,13 +456,79 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         if head_gap_syms and head_gap_end is not None:
             _download_window(head_gap_syms, eff_start, head_gap_end)
         if tail_gap_syms and tail_gap_start is not None:
-            _download_window(tail_gap_syms, tail_gap_start - timedelta(minutes=15), eff_end)
+            # Overlap by 2 days on 1d / 30m on 15m to detect retroactive stock-split / dividend price cliffs!
+            overlap_pad = timedelta(days=3) if timeframe == "1d" else timedelta(minutes=30)
+            pre_closes: Dict[str, tuple[datetime, float]] = {}
+            if self.bar_cache is not None:
+                for s in tail_gap_syms:
+                    b_cov = self.bar_cache.coverage_bounds(s, timeframe)
+                    if b_cov is not None:
+                        c_old = self.bar_cache.get_close_at(s, timeframe, b_cov[1])
+                        if c_old is not None and c_old > 0:
+                            pre_closes[s] = (b_cov[1], c_old)
+
+            # For live non-SIP (`iex`) 15m tail fetches, pull from at least today's 09:30 ET open
+            # so today's intraday session bars are 100% feed-homogeneous (never mixing cached SIP + live IEX)!
+            tail_win_start = tail_gap_start - overlap_pad
+            if timeframe == "15m" and eff_end > (now_utc - timedelta(minutes=16)) and self.feed != "sip":
+                eff_et_d = eff_end.astimezone(ET_TZ).date()
+                today_open_utc = datetime(
+                    eff_et_d.year, eff_et_d.month, eff_et_d.day, 9, 30, tzinfo=ET_TZ
+                ).astimezone(timezone.utc)
+                tail_win_start = min(tail_win_start, today_open_utc)
+
+            tail_fetched = _download_window(tail_gap_syms, tail_win_start, eff_end)
+            if self.bar_cache is not None and pre_closes:
+                resync_syms: List[str] = []
+                for s, (anchor_ts, old_c) in pre_closes.items():
+                    # Strictly compare SIP vs SIP only: never trigger split-cliff cache purge on IEX vs SIP!
+                    if self.last_bars_feed.get((s, timeframe)) != "sip":
+                        continue
+                    s_bars = tail_fetched.get(s, [])
+                    for nb in s_bars:
+                        if int(nb.timestamp.timestamp()) == int(anchor_ts.timestamp()):
+                            if abs(nb.close - old_c) / old_c > 0.002:
+                                logger.warning(
+                                    "[SPLIT/DIVIDEND GUARD] Detected %.2f%% retroactive adjustment on %s (%s); re-syncing cached series",
+                                    ((nb.close - old_c) / old_c) * 100.0,
+                                    s,
+                                    timeframe,
+                                )
+                                self.bar_cache.delete_symbol(s, timeframe)
+                                resync_syms.append(s)
+                            break
+                if resync_syms:
+                    _download_window(resync_syms, eff_start, eff_end)
 
         if self.bar_cache is None:
             return direct_fetched
 
         cached_merged = self.bar_cache.get_bars_batch(clean_syms, timeframe, eff_start, eff_end)
-        return {sym: blist for sym, blist in cached_merged.items() if blist}
+        final_out: Dict[str, List[Bar]] = {}
+        for sym in clean_syms:
+            c_list = cached_merged.get(sym, [])
+            m_list = live_unpersisted.get(sym, [])
+            if c_list and not m_list:
+                final_out[sym] = c_list
+            elif m_list:
+                # Exclude same-day cached SIP 15m bars on days covered by live IEX `m_list` so a session's
+                # 15m volume is 100% homogeneous IEX before `get_effective_15m_volume_scale` is applied!
+                live_et_days = (
+                    {lb.timestamp.astimezone(ET_TZ).date() for lb in m_list}
+                    if timeframe == "15m"
+                    else set()
+                )
+                by_ts: Dict[int, Bar] = {
+                    int(b.timestamp.timestamp()): b
+                    for b in c_list
+                    if b.timestamp.astimezone(ET_TZ).date() not in live_et_days
+                }
+                for lb in m_list:
+                    if eff_start <= lb.timestamp <= eff_end:
+                        by_ts[int(lb.timestamp.timestamp())] = lb
+                if by_ts:
+                    final_out[sym] = [by_ts[k] for k in sorted(by_ts.keys())]
+        return final_out
 
     # --- Single-Symbol MarketDataAdapter Contract ---
     def get_bars(
@@ -446,8 +549,22 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         if bars:
             return bars
         if self.fallback is not None:
-            return self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
+            fb_bars = self.fallback.get_bars(symbol, timeframe=timeframe, days=days)
+            if fb_bars:
+                self.last_bars_feed[(symbol.upper(), timeframe)] = "sip_consolidated"
+            return fb_bars
         return []
+
+    def get_effective_15m_volume_scale(self, symbol: str) -> float:
+        """
+        Returns the SIP/IEX volume calibration factor ONLY when the latest 15m bars for `symbol`
+        actually came from live `iex` feed; returns `1.0` for cached `sip` or Futu fallback bars!
+        """
+        sym_u = symbol.upper()
+        src_feed = str(self.last_bars_feed.get((sym_u, "15m"), "sip")).lower()
+        if src_feed == "iex":
+            return float(self.sip_iex_vol_ratios.get(sym_u, 35.0))
+        return 1.0
 
     def get_quote(self, symbol: str) -> Optional[QuoteSnapshot]:
         snaps = self.get_snapshots_batch([symbol])
@@ -490,3 +607,123 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
         if self.fallback is not None:
             return self.fallback.get_vix_level()
         return 18.0
+
+    def calibrate_sip_iex_volume_ratios(self, symbols: Sequence[str]) -> Dict[str, float]:
+        """
+        Computes empirical 20-day consolidated SIP / IEX volume multipliers during PRE_OPEN_SYNC
+        by comparing historical `sip` 1d volume against `iex` 1d volume per symbol.
+        """
+        clean = [s.strip().upper() for s in symbols if s and not s.startswith("^")]
+        if not clean:
+            return {}
+        if self.feed != "iex":
+            for sym in clean:
+                self.sip_iex_vol_ratios[sym] = 1.0
+            return dict(self.sip_iex_vol_ratios)
+
+        start_35d = datetime.now(timezone.utc) - timedelta(days=35)
+        end_hist = datetime.now(timezone.utc) - timedelta(days=1)
+        sip_1d = (
+            self.bar_cache.get_bars_batch(clean, "1d", start_dt=start_35d)
+            if self.bar_cache is not None
+            else {}
+        )
+        iex_vols: Dict[str, Dict[str, float]] = {}
+        if self.has_credentials():
+            s_iso = start_35d.strftime("%Y-%m-%dT%H:%M:%SZ")
+            e_iso = end_hist.strftime("%Y-%m-%dT%H:%M:%SZ")
+            for idx in range(0, len(clean), 50):
+                batch = clean[idx : idx + 50]
+                payload = self._request_json(
+                    "/v2/stocks/bars",
+                    params={
+                        "symbols": ",".join(batch),
+                        "timeframe": "1Day",
+                        "start": s_iso,
+                        "end": e_iso,
+                        "adjustment": "all",
+                        "feed": "iex",
+                        "limit": 5000,
+                    },
+                )
+                if payload and isinstance(payload.get("bars"), dict):
+                    for sym_k, rlist in payload["bars"].items():
+                        dmap: Dict[str, float] = {}
+                        for item in rlist or []:
+                            v = float(item.get("v") or 0.0)
+                            if v > 0:
+                                dmap[str(item["t"])[:10]] = v
+                        iex_vols[sym_k.upper()] = dmap
+
+        for sym in clean:
+            s_bars = sip_1d.get(sym, [])
+            imap = iex_vols.get(sym, {})
+            ratios: List[float] = []
+            for b in s_bars[-20:]:
+                d_key = b.timestamp.astimezone(timezone.utc).strftime("%Y-%m-%d")
+                iv = imap.get(d_key, 0.0)
+                if iv > 0 and b.volume > 0:
+                    ratios.append(b.volume / iv)
+            if ratios:
+                ratios.sort()
+                med = ratios[len(ratios) // 2]
+                self.sip_iex_vol_ratios[sym] = round(max(10.0, min(65.0, med)), 2)
+            elif sym not in self.sip_iex_vol_ratios:
+                self.sip_iex_vol_ratios[sym] = 35.0
+        return dict(self.sip_iex_vol_ratios)
+
+
+def build_causal_partial_1d_bar(
+    symbol: str,
+    bars_15m_session: Sequence[Bar],
+    decision_ts_utc: Optional[datetime] = None,
+    volume_scale_mult: float = 1.0,
+) -> Optional[Bar]:
+    """
+    Constructs a strictly causal `partial_1d_bar` from completed `[09:30 ET .. decision_ts]` 15m bars:
+      - Zero intrabar look-ahead: 15m bars are stamped at bar OPEN (`09:30, ..., 15:30 ET`),
+        so only bars that have FULLY CLOSED (`b.timestamp + 15m <= decision_ts_utc`) and precede
+        the final 15-minute closing bar (`< close - 15m`) are admitted!
+      - Normalizes partial-day volume by intraday U-curve completion fraction and `volume_scale_mult`.
+    """
+    if not bars_15m_session:
+        return None
+    if decision_ts_utc is not None:
+        # Filter strictly to `dec_et.date()` FIRST, then enforce full 15m bar completion
+        # AND cap at `close - 15m` so the `15:45-16:00 ET` closing bar never leaks even if trailing bars exist!
+        dec_et = decision_ts_utc.astimezone(ET_TZ)
+        session_d = dec_et.date()
+        day_bars = [b for b in bars_15m_session if b.timestamp.astimezone(ET_TZ).date() == session_d]
+        if not day_bars:
+            return None
+        close_t = session_close_time(session_d)
+        max_eod_cutoff_utc = datetime(
+            dec_et.year, dec_et.month, dec_et.day, close_t.hour, close_t.minute, 0, tzinfo=ET_TZ
+        ).astimezone(timezone.utc) - timedelta(minutes=15)
+        eff_cutoff = min(decision_ts_utc, max_eod_cutoff_utc)
+        session_bars = [b for b in day_bars if (b.timestamp + timedelta(minutes=15)) <= eff_cutoff]
+    else:
+        last_ts = bars_15m_session[-1].timestamp
+        session_d = last_ts.astimezone(ET_TZ).date()
+        session_bars = [b for b in bars_15m_session if b.timestamp.astimezone(ET_TZ).date() == session_d]
+
+    if not session_bars:
+        return None
+
+    close_t = session_close_time(session_d)
+    total_expected_bars = max(1, ((close_t.hour * 60 + close_t.minute) - (9 * 60 + 30)) // 15)
+    elapsed_bars = len(session_bars)
+    progress_frac = min(1.0, max(0.20, (elapsed_bars / float(total_expected_bars)) * 0.85))
+    raw_vol = sum(max(0.0, b.volume) for b in session_bars)
+    projected_full_day_vol = (raw_vol * max(0.01, volume_scale_mult)) / progress_frac
+
+    day_anchor = datetime(session_d.year, session_d.month, session_d.day, 12, 0, tzinfo=timezone.utc)
+    return Bar(
+        symbol=symbol.upper(),
+        timestamp=day_anchor,
+        open=session_bars[0].open,
+        high=max(b.high for b in session_bars),
+        low=min(b.low for b in session_bars),
+        close=session_bars[-1].close,
+        volume=round(projected_full_day_vol, 2),
+    )

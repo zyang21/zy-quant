@@ -71,6 +71,10 @@ class StateStore:
                     highest_price REAL NOT NULL,
                     risk_per_share REAL NOT NULL,
                     bars_held_15m INTEGER NOT NULL DEFAULT 0,
+                    days_held INTEGER NOT NULL DEFAULT 0,
+                    entry_atr_1d REAL NOT NULL DEFAULT 0.0,
+                    stop_order_type TEXT NOT NULL DEFAULT 'GTC_STOP',
+                    earnings_cushion_applied_date TEXT,
                     breakeven_armed INTEGER NOT NULL DEFAULT 0,
                     scaled_out INTEGER NOT NULL DEFAULT 0,
                     broker_stop_order_id TEXT,
@@ -110,6 +114,28 @@ class StateStore:
                     big_order_net_usd REAL NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS daily_pipeline_runs (
+                    trading_date TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    summary_json TEXT NOT NULL DEFAULT '{}',
+                    completed_at TEXT NOT NULL,
+                    PRIMARY KEY (trading_date, phase)
+                );
+
+                CREATE TABLE IF NOT EXISTS daily_nav_snapshots (
+                    trading_date TEXT PRIMARY KEY,
+                    trd_env TEXT NOT NULL,
+                    tier_key TEXT NOT NULL,
+                    equity_usd REAL NOT NULL,
+                    cash_usd REAL NOT NULL,
+                    accrued_sweep_yield_usd REAL NOT NULL DEFAULT 0.0,
+                    principal_heat_pct REAL NOT NULL DEFAULT 0.0,
+                    open_drawdown_heat_pct REAL NOT NULL DEFAULT 0.0,
+                    open_positions_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
                 """
             )
             # Idempotent schema migration for pre-existing SQLite DBs
@@ -126,6 +152,20 @@ class StateStore:
             for col_name, col_def in migrations:
                 if col_name not in existing_cols:
                     conn.execute(f"ALTER TABLE orders ADD COLUMN {col_name} {col_def}")
+
+            existing_pos_cols = {
+                r["name"]
+                for r in conn.execute("PRAGMA table_info(positions)").fetchall()
+            }
+            pos_migrations = [
+                ("days_held", "INTEGER NOT NULL DEFAULT 0"),
+                ("entry_atr_1d", "REAL NOT NULL DEFAULT 0.0"),
+                ("stop_order_type", "TEXT NOT NULL DEFAULT 'GTC_STOP'"),
+                ("earnings_cushion_applied_date", "TEXT"),
+            ]
+            for col_name, col_def in pos_migrations:
+                if col_name not in existing_pos_cols:
+                    conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {col_def}")
 
     # --- Kill-Switch / Flags ---
     def set_halted(self, halted: bool, reason: str = "") -> None:
@@ -391,8 +431,10 @@ class StateStore:
                 INSERT INTO positions(
                     symbol, sector, shares, initial_shares, entry_price, entry_time,
                     initial_stop, current_stop, highest_price, risk_per_share,
-                    bars_held_15m, breakeven_armed, scaled_out, broker_stop_order_id, setup, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    bars_held_15m, days_held, entry_atr_1d, stop_order_type,
+                    earnings_cushion_applied_date, breakeven_armed, scaled_out,
+                    broker_stop_order_id, setup, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     shares=excluded.shares,
                     initial_shares=excluded.initial_shares,
@@ -401,6 +443,10 @@ class StateStore:
                     highest_price=excluded.highest_price,
                     risk_per_share=excluded.risk_per_share,
                     bars_held_15m=excluded.bars_held_15m,
+                    days_held=excluded.days_held,
+                    entry_atr_1d=excluded.entry_atr_1d,
+                    stop_order_type=excluded.stop_order_type,
+                    earnings_cushion_applied_date=excluded.earnings_cushion_applied_date,
                     breakeven_armed=excluded.breakeven_armed,
                     scaled_out=excluded.scaled_out,
                     broker_stop_order_id=excluded.broker_stop_order_id,
@@ -418,6 +464,10 @@ class StateStore:
                     pos.highest_price,
                     pos.risk_per_share,
                     pos.bars_held_15m,
+                    pos.days_held,
+                    pos.entry_atr_1d,
+                    pos.stop_order_type,
+                    pos.earnings_cushion_applied_date,
                     int(pos.breakeven_armed),
                     int(pos.scaled_out),
                     pos.broker_stop_order_id,
@@ -435,6 +485,7 @@ class StateStore:
             rows = conn.execute("SELECT * FROM positions").fetchall()
         out: Dict[str, OpenPosition] = {}
         for r in rows:
+            keys = r.keys()
             out[r["symbol"]] = OpenPosition(
                 symbol=r["symbol"],
                 sector=r["sector"],
@@ -447,6 +498,10 @@ class StateStore:
                 highest_price=float(r["highest_price"]),
                 risk_per_share=float(r["risk_per_share"]),
                 bars_held_15m=int(r["bars_held_15m"]),
+                days_held=int(r["days_held"] or 0) if "days_held" in keys else 0,
+                entry_atr_1d=float(r["entry_atr_1d"] or 0.0) if "entry_atr_1d" in keys else 0.0,
+                stop_order_type=str(r["stop_order_type"] or "GTC_STOP") if "stop_order_type" in keys else "GTC_STOP",
+                earnings_cushion_applied_date=r["earnings_cushion_applied_date"] if "earnings_cushion_applied_date" in keys else None,
                 breakeven_armed=bool(r["breakeven_armed"]),
                 scaled_out=bool(r["scaled_out"]),
                 broker_stop_order_id=r["broker_stop_order_id"],
@@ -597,8 +652,17 @@ class StateStore:
         return [dict(r) for r in rows]
 
     # --- Watchlist Persistence ---
-    def save_watchlist_scores(self, items: List[WatchlistCandidate]) -> None:
+    def save_watchlist_scores(
+        self, items: List[WatchlistCandidate], prune_stale: bool = True
+    ) -> None:
         with self._connect() as conn:
+            if prune_stale and items:
+                keep_syms = [item.symbol.upper() for item in items]
+                placeholders = ",".join("?" for _ in keep_syms)
+                conn.execute(
+                    f"DELETE FROM watchlist_scores WHERE UPPER(symbol) NOT IN ({placeholders})",
+                    keep_syms,
+                )
             for item in items:
                 conn.execute(
                     """
@@ -608,6 +672,7 @@ class StateStore:
                         rs_vs_qqq, big_order_net_usd, updated_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(symbol) DO UPDATE SET
+                        sector=excluded.sector,
                         price=excluded.price,
                         total_score=excluded.total_score,
                         passed_hard_filters=excluded.passed_hard_filters,
@@ -645,3 +710,182 @@ class StateStore:
                 "SELECT * FROM watchlist_scores ORDER BY passed_hard_filters DESC, total_score DESC"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # --- 4-Phase Daily Swing Pipeline Checkpoints & NAV Snapshots ---
+    def has_completed_pipeline_phase(self, trading_date_iso: str, phase: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT status FROM daily_pipeline_runs WHERE trading_date=? AND phase=?",
+                (trading_date_iso, phase),
+            ).fetchone()
+        return bool(row and row["status"] == "COMPLETED")
+
+    def record_pipeline_phase(
+        self,
+        trading_date_iso: str,
+        phase: str,
+        status: str,
+        summary: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO daily_pipeline_runs(trading_date, phase, status, summary_json, completed_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(trading_date, phase) DO UPDATE SET
+                    status=excluded.status,
+                    summary_json=excluded.summary_json,
+                    completed_at=excluded.completed_at
+                """,
+                (trading_date_iso, phase, status, json.dumps(summary or {}), now),
+            )
+
+    def list_pipeline_runs(self, trading_date_iso: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
+        with self._connect() as conn:
+            if trading_date_iso:
+                rows = conn.execute(
+                    "SELECT * FROM daily_pipeline_runs WHERE trading_date=? ORDER BY completed_at ASC",
+                    (trading_date_iso,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM daily_pipeline_runs ORDER BY completed_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def record_daily_nav_snapshot(
+        self,
+        trading_date_iso: str,
+        trd_env: str,
+        tier_key: str,
+        equity_usd: float,
+        cash_usd: float,
+        accrued_sweep_yield_usd: float = 0.0,
+        principal_heat_pct: float = 0.0,
+        open_drawdown_heat_pct: float = 0.0,
+        open_positions_count: int = 0,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO daily_nav_snapshots(
+                    trading_date, trd_env, tier_key, equity_usd, cash_usd,
+                    accrued_sweep_yield_usd, principal_heat_pct, open_drawdown_heat_pct,
+                    open_positions_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(trading_date) DO UPDATE SET
+                    trd_env=excluded.trd_env,
+                    tier_key=excluded.tier_key,
+                    equity_usd=excluded.equity_usd,
+                    cash_usd=excluded.cash_usd,
+                    accrued_sweep_yield_usd=excluded.accrued_sweep_yield_usd,
+                    principal_heat_pct=excluded.principal_heat_pct,
+                    open_drawdown_heat_pct=excluded.open_drawdown_heat_pct,
+                    open_positions_count=excluded.open_positions_count,
+                    created_at=excluded.created_at
+                """,
+                (
+                    trading_date_iso,
+                    trd_env,
+                    tier_key,
+                    round(equity_usd, 2),
+                    round(cash_usd, 2),
+                    round(accrued_sweep_yield_usd, 2),
+                    round(principal_heat_pct, 3),
+                    round(open_drawdown_heat_pct, 3),
+                    int(open_positions_count),
+                    now,
+                ),
+            )
+
+    # --- StoplossGuard Distinct Episode Query ---
+    def list_stop_out_episodes_since(self, after_iso: str = "") -> List[Dict[str, Any]]:
+        """
+        Groups INITIAL_ATR_STOP trades by `(symbol, entry_time)` so partial stop-fill prints
+        never multiply a single stopped-out position into multiple triggers, filtering strictly
+        after `after_iso` (`cooldown_triggered_at` watermark).
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol,
+                       entry_time,
+                       MAX(exit_time) AS exit_time,
+                       SUM(net_pnl_usd) AS net_pnl_usd,
+                       MIN(r_multiple) AS min_r_multiple
+                FROM closed_trades
+                WHERE exit_reason = 'INITIAL_ATR_STOP'
+                  AND exit_time > ?
+                GROUP BY symbol, entry_time
+                HAVING MIN(r_multiple) < -0.05
+                ORDER BY exit_time ASC
+                """,
+                (after_iso,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # --- Stateful Virtual Cash Ledger & Arithmetic Reconciliation (SIMULATE) ---
+    def _compute_open_cost_basis(self) -> float:
+        positions = self.get_positions()
+        return sum(
+            p.shares * p.entry_price
+            + float(p.metadata.get("buy_fee_usd") or 0.0)
+            * (p.shares / max(1e-6, p.initial_shares))
+            for p in positions.values()
+        )
+
+    def get_virtual_cash(self, tier_key: str, starting_equity_usd: float) -> float:
+        flag_key = f"virtual_cash_{tier_key}"
+        flag = self.get_flag(flag_key)
+        if flag is not None and "cash_usd" in flag:
+            return float(flag["cash_usd"])
+        # Bootstrap cleanly from existing realized PnL and open cost basis on first read
+        realized = self.realized_pnl_since("1970-01-01T00:00:00")
+        open_cost = self._compute_open_cost_basis()
+        init_cash = round(starting_equity_usd + realized - open_cost, 4)
+        self.set_flag(
+            flag_key,
+            {"cash_usd": init_cash, "starting_equity_usd": starting_equity_usd},
+        )
+        return init_cash
+
+    def adjust_virtual_cash(
+        self, tier_key: str, delta_usd: float, starting_equity_usd: float
+    ) -> float:
+        curr = self.get_virtual_cash(tier_key, starting_equity_usd)
+        updated = round(curr + delta_usd, 4)
+        self.set_flag(
+            f"virtual_cash_{tier_key}",
+            {"cash_usd": updated, "starting_equity_usd": starting_equity_usd},
+        )
+        return updated
+
+    def reconcile_stateful_ledger(
+        self,
+        tier_key: str,
+        starting_equity_usd: float,
+        tolerance_usd: float = 0.05,
+    ) -> Dict[str, Any]:
+        """
+        Independent arithmetic identity check (non-tautological):
+        Verifies `starting_equity + sum(realized_net_pnl) == stateful_virtual_cash + open_cost_basis`
+        (including unamortized `buy_fee_usd` on partially scaled-out positions) within `$0.05`.
+        """
+        v_cash = self.get_virtual_cash(tier_key, starting_equity_usd)
+        realized = self.realized_pnl_since("1970-01-01T00:00:00")
+        open_cost = self._compute_open_cost_basis()
+        expected_lhs = round(starting_equity_usd + realized, 4)
+        actual_rhs = round(v_cash + open_cost, 4)
+        drift = round(actual_rhs - expected_lhs, 4)
+        return {
+            "ok": abs(drift) <= tolerance_usd,
+            "starting_equity_usd": round(starting_equity_usd, 2),
+            "realized_net_pnl_usd": round(realized, 4),
+            "virtual_cash_usd": round(v_cash, 4),
+            "open_cost_basis_usd": round(open_cost, 4),
+            "drift_usd": drift,
+            "tolerance_usd": tolerance_usd,
+        }

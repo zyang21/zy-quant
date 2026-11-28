@@ -79,6 +79,12 @@ class TierProfile(BaseModel):
     friday_min_cushion_r: Optional[float] = None
     enable_index_hedge: bool = False
     max_sector_weight_pct: float = 1.0
+    max_single_equity_pct: float = 0.25
+    max_sector_etf_pct: float = 0.35
+    max_portfolio_heat_pct: float = 0.06
+    max_drawdown_heat_pct: float = 0.12
+    max_pair_corr: float = 0.75
+    enforce_swing_caps: bool = False
     order_protection_bps: float = 5.0
 
 
@@ -177,32 +183,58 @@ class EntryConfig(BaseModel):
 
 class ExitModelsConfig(BaseModel):
     atr_stop_multiplier: float = 2.8
+    initial_atr_1d_multiplier: float = 2.2
     min_stop_pct: float = 0.015
     max_hard_stop_pct: float = 0.040
+    swing_max_hard_stop_pct: float = 0.090
     breakeven_trigger_r: float = 1.5
     chandelier_atr_multiplier: float = 2.8
+    chandelier_atr_1d_multiplier: float = 4.0
     profit_lock_trigger_r: float = 1.8
     profit_lock_floor_ratio: float = 0.55
     time_stop_bars_15m: int = 52
+    time_stop_trading_days: int = 14
     time_stop_min_progress_r: float = 0.15
     assumed_base_win_rate: float = 0.48
     expected_reward_atr_multiple: float = 6.5
     min_expectancy_r: float = 0.25
 
 
+class StoplossGuardConfig(BaseModel):
+    enabled: bool = True
+    max_stops_in_window: int = 3
+    lookback_trading_days: int = 10
+    cooldown_trading_days: int = 5
+
+
 class DaemonConfig(BaseModel):
     heartbeat_timeout_seconds: int = 30
     max_orders_per_minute: int = 3
     place_server_side_stop: bool = True
+    server_stop_order_type: str = "STOP"  # 'STOP' (market-on-trigger GTC) | 'STOP_LIMIT'
     entry_order_ttl_seconds: int = 90
     exit_order_ttl_seconds: int = 60
+    stoploss_guard: StoplossGuardConfig = Field(default_factory=StoplossGuardConfig)
+
+
+class SwingPipelineConfig(BaseModel):
+    daily_sma_fast: int = 50
+    daily_sma_slow: int = 200
+    breadth_green_pct: float = 50.0
+    breadth_red_pct: float = 30.0
+    pre_earnings_buffer_trading_days: int = 10
+    pre_earnings_buffer_calendar_days: int = 14
+    correlation_lookback_days: int = 60
+    min_daily_history_bars: int = 260
 
 
 class StrategyConfig(BaseModel):
+    mode: str = "swing_1d"  # 'swing_1d' | 'intraday_15m'
     regime: RegimeConfig
     entry: EntryConfig
     exit_models: ExitModelsConfig
     daemon: DaemonConfig
+    swing: SwingPipelineConfig = Field(default_factory=SwingPipelineConfig)
 
 
 class AppSettings(BaseModel):

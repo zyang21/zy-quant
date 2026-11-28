@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 from zy_quant.config import FutuConnectionConfig
 from zy_quant.gateway.base import BrokerExecutionAdapter, MarketDataAdapter
 from zy_quant.gateway.yfinance_adapter import YahooMarketDataAdapter
+from zy_quant.intel.market_hours import ET_TZ
 from zy_quant.models import (
     Bar,
     BrokerOrderUpdate,
@@ -136,6 +137,10 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         self._order_handler: Any = None
         self._kline_cache: Dict[tuple[str, str], tuple[float, int, List[Bar]]] = {}
         self._last_kline_rpc_mono: float = 0.0
+        self._last_order_refresh_mono: float = 0.0
+        self.last_order_sync_ok: bool = False
+        self.last_position_sync_ok: bool = False
+        self.last_stop_sync_ok: bool = True
         self.last_error: str = "Not connected yet — paste Futubull OpenAPI Key (连接密钥) and click Connect"
 
     def register_order_callback(self, callback: Callable[[BrokerOrderUpdate], Any]) -> None:
@@ -339,7 +344,15 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
                 for frame in frames:
                     for _, row in frame.iterrows():
                         ts_str = str(row["time_key"]).replace(" ", "T")
-                        ts = datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+                        parsed_dt = datetime.fromisoformat(ts_str)
+                        if timeframe == "1d":
+                            # Anchor daily bars at 12:00 UTC (07:00/08:00 ET) so UTC and ET_TZ dates match identically
+                            ts = datetime(parsed_dt.year, parsed_dt.month, parsed_dt.day, 12, 0, tzinfo=timezone.utc)
+                        else:
+                            # Futu US `K_15M` `time_key` is in `America/New_York` (`ET_TZ`) stamped at bar CLOSE
+                            # (`09:45..16:00 ET`); convert to canonical bar-OPEN UTC (`09:30..15:45 ET`)!
+                            et_close = parsed_dt.replace(tzinfo=ET_TZ) if parsed_dt.tzinfo is None else parsed_dt.astimezone(ET_TZ)
+                            ts = (et_close - timedelta(minutes=15)).astimezone(timezone.utc)
                         out.append(
                             Bar(
                                 symbol=symbol,
@@ -469,21 +482,32 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
     def sync_open_orders(self, refresh_cache: bool = False) -> List[BrokerOrderUpdate]:
         """
         Pull-based order reconciliation fallback via Futu order_list_query().
-        Catches any order status transitions missed during brief socket drops.
+        Tracks `last_order_sync_ok` so callers never mistake an RPC/rate-limit error for an empty order book.
         """
         if not self.is_connected() or self._trade_ctx is None:
+            self.last_order_sync_ok = False
             return []
         acc_id = self._select_acc_id(self.trd_env_name)
         if acc_id == 0:
+            self.last_order_sync_ok = False
             return []
         ft = self._futu_mod
+        now_mono = time.monotonic()
+        eff_refresh = bool(refresh_cache and (now_mono - self._last_order_refresh_mono) >= 2.0)
         with self._rpc_lock:
             ret, df = self._trade_ctx.order_list_query(
                 trd_env=self._trd_env(),
                 acc_id=acc_id,
-                refresh_cache=refresh_cache,
+                refresh_cache=eff_refresh,
             )
-        if ret != ft.RET_OK or df is None or df.empty:
+        if ret != ft.RET_OK or df is None or isinstance(df, str):
+            self.last_order_sync_ok = False
+            logger.warning("Futu order_list_query failed (ret=%s): %s", ret, df)
+            return []
+        self.last_order_sync_ok = True
+        if eff_refresh:
+            self._last_order_refresh_mono = now_mono
+        if df.empty:
             return []
         updates: List[BrokerOrderUpdate] = []
         for _, row in df.iterrows():
@@ -559,9 +583,10 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             ret, df = self._trade_ctx.accinfo_query(
                 trd_env=query_env, acc_id=acc_id, currency=ft.Currency.USD
             )
-            if ret != ft.RET_OK or df is None or df.empty:
+            queried_usd_ok = ret == ft.RET_OK and df is not None and not isinstance(df, str) and not df.empty
+            if not queried_usd_ok:
                 ret, df = self._trade_ctx.accinfo_query(trd_env=query_env, acc_id=acc_id)
-        if ret != ft.RET_OK or df is None or df.empty:
+        if ret != ft.RET_OK or df is None or isinstance(df, str) or df.empty:
             return {
                 "equity_usd": 0.0,
                 "cash_usd": 0.0,
@@ -578,13 +603,37 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
             except (TypeError, ValueError):
                 return 0.0
 
-        equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
-        cash = _f(row.get("us_cash")) if _f(row.get("us_cash")) > 0 else _f(row.get("cash"))
+        row_ccy = str(row.get("currency") or "").strip().upper()
+        is_usd_denominated = (queried_usd_ok and row_ccy in ("", "USD")) or row_ccy == "USD"
+        if is_usd_denominated:
+            equity = _f(row.get("total_assets")) or _f(row.get("usd_assets"))
+            has_us_cash_field = "us_cash" in row and row.get("us_cash") not in (None, "N/A", "")
+            raw_cash = _f(row.get("us_cash")) if has_us_cash_field else _f(row.get("cash"))
+            fund_assets = _f(row.get("fund_assets"))
+            market_val = _f(row.get("market_val"))
+            buying_power = _f(row.get("power"))
+        else:
+            # Fallback non-USD row (e.g. HKD unified summary): strictly read explicit US-dollar columns only!
+            equity = _f(row.get("usd_assets"))
+            raw_cash = _f(row.get("us_cash"))
+            fund_assets = 0.0
+            market_val = _f(row.get("us_market_val"))
+            buying_power = 0.0
+
+        # Futu HK Cash Plus (USD MMF auto-sweep) parks idle USD in `fund_assets` with `us_cash == 0`;
+        # floor at $0 and cap at non-leveraged `equity - market_val` so MARGIN `power` never buys on leverage!
+        liquid_cash = max(0.0, raw_cash + fund_assets)
+        if equity > 0:
+            liquid_cash = min(liquid_cash, max(0.0, equity - market_val))
+        if buying_power > 0:
+            liquid_cash = min(liquid_cash, buying_power)
         return {
             "equity_usd": equity,
-            "cash_usd": cash,
-            "market_val_usd": _f(row.get("market_val")),
-            "buying_power_usd": _f(row.get("power")),
+            "cash_usd": liquid_cash,
+            "raw_cash_usd": raw_cash,
+            "fund_assets_usd": fund_assets,
+            "market_val_usd": market_val,
+            "buying_power_usd": buying_power,
             "connected": 1.0,
             "note": note,
         }
@@ -625,11 +674,21 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
 
     def get_open_positions(self) -> Dict[str, Dict[str, float]]:
         if not self.is_connected() or self._trade_ctx is None:
+            self.last_position_sync_ok = False
             return {}
         ft = self._futu_mod
         acc_id = self._select_acc_id()
-        ret, df = self._trade_ctx.position_list_query(trd_env=self._trd_env(), acc_id=acc_id)
-        if ret != ft.RET_OK or df is None or df.empty:
+        if acc_id == 0:
+            self.last_position_sync_ok = False
+            return {}
+        with self._rpc_lock:
+            ret, df = self._trade_ctx.position_list_query(trd_env=self._trd_env(), acc_id=acc_id)
+        if ret != ft.RET_OK or df is None or isinstance(df, str):
+            self.last_position_sync_ok = False
+            logger.warning("Futu position_list_query failed (ret=%s): %s", ret, df)
+            return {}
+        self.last_position_sync_ok = True
+        if df.empty:
             return {}
         holdings: Dict[str, Dict[str, float]] = {}
         for _, row in df.iterrows():
@@ -676,64 +735,149 @@ class FutuGatewayAdapter(MarketDataAdapter, BrokerExecutionAdapter):
         shares: float,
         stop_price: float,
         existing_order_id: Optional[str] = None,
+        order_mode: str = "STOP",
     ) -> Optional[str]:
         """
-        Server-Side Safety Net: Places or ratchets a native STOP order on Futu's servers
-        so downside risk is capped even if local network/host goes completely dark.
+        Server-Side Safety Net (`TimeInForce.GTC` + `fill_outside_rth=False`):
+        - Guards `< 1.0` fractional positions (`SIM-CLIENT-FRAC-STOP-{symbol}`), since Futu US
+          rejects server-side `STOP` and `GTC` orders on fractional lots.
+        - For whole-share (`>= 1.0`) positions in `REAL` mode, places/modifies a persistent
+          `TimeInForce.GTC` protective stop (`OrderType.STOP` default so overnight gap-downs never
+          leave `STOP_LIMIT` orders stranded unfilled; `OrderType.STOP_LIMIT` also supported).
         """
+        if shares <= 0:
+            self.last_stop_sync_ok = False
+            return None
+        # Fractional share guard (< 1.0 sh): route strictly through client-side RTH stop monitor
+        if shares < 1.0:
+            if (
+                existing_order_id
+                and not existing_order_id.startswith(("SIM-", "PAPER-"))
+                and self.is_connected()
+            ):
+                self.cancel_order(existing_order_id)
+            self.last_stop_sync_ok = True
+            return f"SIM-CLIENT-FRAC-STOP-{symbol}"
+
+        whole_shares = float(math.floor(shares)) if shares != math.floor(shares) else float(shares)
+
+        # Note: Futu SIMULATE / offline PAPER-LOCAL environment only supports NORMAL/MARKET orders;
+        # native GTC STOP orders are supported in REAL US trading.
+        if self.trd_env_name != "REAL":
+            self.last_stop_sync_ok = True
+            return existing_order_id or f"SIM-LOCAL-STOP-{symbol}"
+
         if not self.is_connected() or self._trade_ctx is None:
+            self.last_stop_sync_ok = False
             return existing_order_id
         ft = self._futu_mod
 
-        # Note: Futu SIMULATE paper environment only supports NORMAL/MARKET orders;
-        # native STOP orders are supported in REAL US trading.
-        if self.trd_env_name != "REAL":
-            return existing_order_id or f"SIM-LOCAL-STOP-{symbol}"
-
         acc_id = self._select_acc_id("REAL")
         if acc_id == 0:
+            self.last_stop_sync_ok = False
             return existing_order_id
 
-        if existing_order_id:
+        use_stop_market = order_mode.strip().upper() != "STOP_LIMIT"
+        ord_type = ft.OrderType.STOP if use_stop_market else ft.OrderType.STOP_LIMIT
+        lim_px = round(stop_price, 2) if use_stop_market else round(stop_price * 0.995, 2)
+        trig_px = round(stop_price, 2)
+
+        if existing_order_id and not existing_order_id.startswith(("SIM-", "PAPER-")):
             with self._rpc_lock:
                 ret, _ = self._trade_ctx.modify_order(
                     modify_order_op=ft.ModifyOrderOp.NORMAL,
                     order_id=existing_order_id,
-                    qty=shares,
-                    price=round(stop_price * 0.995, 2),
-                    aux_price=round(stop_price, 2),
+                    qty=whole_shares,
+                    price=lim_px,
+                    aux_price=trig_px,
                     trd_env=self._trd_env(),
                     acc_id=acc_id,
                 )
             if ret == ft.RET_OK:
+                self.last_stop_sync_ok = True
                 return existing_order_id
+
+            # Short-flip prevention: NEVER submit a second GTC STOP if `existing_order_id` already filled
+            # or partially filled, or if it may still be live and could not be cancelled!
+            open_map = {u.broker_order_id: u for u in self.sync_open_orders(refresh_cache=True)}
+            prev_ord = open_map.get(existing_order_id)
+            if not self.last_order_sync_ok:
+                if not self.cancel_order(existing_order_id):
+                    self.last_stop_sync_ok = False
+                    logger.error(
+                        "Refusing to place duplicate GTC STOP for %s while order_list_query failed and %s could not be cancelled",
+                        symbol,
+                        existing_order_id,
+                    )
+                    return existing_order_id
+            elif prev_ord is not None:
+                if prev_ord.status == OrderStatus.FILLED or prev_ord.filled_shares > 1e-6:
+                    self.last_stop_sync_ok = False
+                    logger.warning(
+                        "Existing GTC stop %s for %s already filled (%s sh, status=%s); dispatching fill and aborting replacement STOP",
+                        existing_order_id,
+                        symbol,
+                        prev_ord.filled_shares,
+                        prev_ord.status.value,
+                    )
+                    self._dispatch_order_update(prev_ord)
+                    return existing_order_id
+                if prev_ord.status.is_active and not self.cancel_order(existing_order_id):
+                    self.last_stop_sync_ok = False
+                    logger.error(
+                        "Refusing to place duplicate GTC STOP for %s while active stop %s could not be cancelled",
+                        symbol,
+                        existing_order_id,
+                    )
+                    return existing_order_id
+            else:
+                # `last_order_sync_ok` is True and `prev_ord` is None: `existing_order_id` is absent from
+                # Futu's active order book (e.g. prior-day 90-day expiry or ex-dividend cancellation).
+                # Verify broker still holds `>= whole_shares` before placing fresh GTC STOP!
+                if not self.cancel_order(existing_order_id):
+                    broker_pos = self.get_open_positions()
+                    held_qty = float((broker_pos.get(symbol.upper()) or {}).get("shares", 0.0))
+                    if not self.last_position_sync_ok or held_qty < whole_shares - 1e-5:
+                        self.last_stop_sync_ok = False
+                        logger.error(
+                            "Aborting GTC STOP re-arm for %s (historical oid=%s): position sync ok=%s, held_qty=%s < %s",
+                            symbol,
+                            existing_order_id,
+                            self.last_position_sync_ok,
+                            held_qty,
+                            whole_shares,
+                        )
+                        return existing_order_id
 
         with self._rpc_lock:
             ret, df = self._trade_ctx.place_order(
-                price=round(stop_price * 0.995, 2),
-                aux_price=round(stop_price, 2),
-                qty=shares,
+                price=lim_px,
+                aux_price=trig_px,
+                qty=whole_shares,
                 code=to_futu_us_code(symbol),
                 trd_side=ft.TrdSide.SELL,
-                order_type=ft.OrderType.STOP_LIMIT,
+                order_type=ord_type,
+                time_in_force=ft.TimeInForce.GTC,
+                fill_outside_rth=False,
                 trd_env=self._trd_env(),
                 acc_id=acc_id,
-                remark="zy-quant protective stop",
+                remark="zy-quant protective GTC stop",
             )
-        if ret != ft.RET_OK or df is None or df.empty:
-            logger.error("Failed placing server-side stop for %s: %s", symbol, df)
+        if ret != ft.RET_OK or df is None or isinstance(df, str) or df.empty:
+            self.last_stop_sync_ok = False
+            logger.error("Failed placing server-side GTC stop for %s: %s", symbol, df)
             return None
+        self.last_stop_sync_ok = True
         return str(df.iloc[0]["order_id"])
 
     def cancel_order(self, order_id: str) -> bool:
-        if (
-            not self.is_connected()
-            or self._trade_ctx is None
-            or not order_id
-            or order_id.startswith(("SIM-", "PAPER-"))
-        ):
+        if not order_id or order_id.startswith(("SIM-", "PAPER-")):
             return True
+        if not self.is_connected() or self._trade_ctx is None:
+            return False
         acc_id = self._select_acc_id(self.trd_env_name)
+        if acc_id == 0:
+            return False
         ft = self._futu_mod
         with self._rpc_lock:
             ret, _ = self._trade_ctx.modify_order(

@@ -37,7 +37,7 @@ export class BacktestLabView {
         <div class="panel-header">
           <div>
             <div class="panel-title">Historical Strategy Backtest</div>
-            <div class="panel-subtitle">Replay chronological 15-minute US market candles with exact 2026 Futu commission, platform, settlement, and spread deductions</div>
+            <div class="panel-subtitle">Dual-Clock replay (1d Primary Clock &amp; 15:45 ET Causal Hybrid Clock) with exact 2026 Futu HK fee floors and slippage</div>
           </div>
           <span class="txt-muted" id="btWindowLabel" style="font-family:var(--font-mono);font-size:12px;">—</span>
         </div>
@@ -57,7 +57,13 @@ export class BacktestLabView {
           <span class="txt-muted">→</span>
           <input type="date" id="btEnd" />
 
-          <input type="text" id="btSymbols" placeholder="Symbols (optional: NVDA,MSFT,META)" style="width:240px;" />
+          <input type="text" id="btSymbols" placeholder="Symbols (optional: NVDA,MSFT,META)" style="width:210px;" />
+          <select id="btClockMode" title="Simulation Clock Mode">
+            <option value="auto">Clock: Auto (1d / Hybrid)</option>
+            <option value="1d">Swing 1d Primary Clock</option>
+            <option value="hybrid_1545">Swing 1d + 15:45 ET Hybrid</option>
+            <option value="intraday_15m">Legacy Intraday 15m</option>
+          </select>
           <button class="btn btn-accent" id="btRunBtn">Run Backtest</button>
         </div>
 
@@ -146,11 +152,14 @@ export class BacktestLabView {
         ? symRaw.split(',').map((s) => s.trim().toUpperCase()).filter(Boolean)
         : null;
 
+      const clockEl = document.getElementById('btClockMode');
+      const clockMode = clockEl ? clockEl.value : 'auto';
       const bt = await this.api.runBacktest({
         days: this.days,
         startDate,
         endDate,
         symbols,
+        clockMode,
       });
 
       if (bt.strategy_summary) this.renderBlueprint(bt.strategy_summary);
@@ -160,7 +169,7 @@ export class BacktestLabView {
         FUTU_REALTIME: 'Verified Futu Real Historical Bars',
       };
       const isVerifiedSource = Boolean(sourceNames[bt.data_source]);
-      const srcLabel = sourceNames[bt.data_source] || bt.data_source;
+      const srcLabel = `${sourceNames[bt.data_source] || bt.data_source} [${bt.clock_mode || clockMode}]`;
       document.getElementById('btWindowLabel').textContent =
         bt.period_start && bt.period_end
           ? `${srcLabel} · ${bt.period_start} → ${bt.period_end}`

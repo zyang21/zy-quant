@@ -17,8 +17,8 @@ export class QuantApiClient {
     return res.json();
   }
 
-  async runBacktest({ days = 30, startDate = null, endDate = null, symbols = null } = {}) {
-    const payload = { days };
+  async runBacktest({ days = 30, startDate = null, endDate = null, symbols = null, clockMode = 'auto' } = {}) {
+    const payload = { days, clock_mode: clockMode };
     if (startDate) payload.start_date = startDate;
     if (endDate) payload.end_date = endDate;
     if (symbols && symbols.length) payload.symbols = symbols;

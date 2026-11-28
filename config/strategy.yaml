@@ -1,5 +1,18 @@
 # 4-Step Strategy, Graduated Regime Governance, and Scientific Swing Exit Formulas
 
+# Strategy Mode: "swing_1d" (4-Phase Multi-Week Swing Pipeline) | "intraday_15m" (Legacy 15m Loop)
+mode: "swing_1d"
+
+swing:
+  daily_sma_fast: 50
+  daily_sma_slow: 200
+  breadth_green_pct: 50.0               # % of 100-stock universe trading >= SMA50
+  breadth_red_pct: 30.0
+  pre_earnings_buffer_trading_days: 10
+  pre_earnings_buffer_calendar_days: 14
+  correlation_lookback_days: 60
+  min_daily_history_bars: 260
+
 # Step 1: Graduated Market Regime Traffic Light (SPY / QQQ + Realized Vol)
 regime:
   primary_benchmark: "QQQ"
@@ -39,21 +52,25 @@ entry:
     min_breakout_rvol: 1.8
     require_positive_big_order_flow: true
 
-# Step 4: Multi-Day Swing Exit & Expectancy Math
+# Step 4: Multi-Day / Multi-Week Swing Exit & Expectancy Math
 exit_models:
-  # 1. Wilder ATR Initial Stop with noise-band floor: S_init = P_entry - max(2.8*ATR_14, 1.5%*P)
+  # 1. Wilder ATR Initial Stop: Intraday 2.8x (4.0% cap) | Daily Swing 2.2x (9.0% cap)
   atr_stop_multiplier: 2.8
+  initial_atr_1d_multiplier: 2.2
   min_stop_pct: 0.015                   # Never place a hair-trigger <1.5% stop inside intraday noise
-  max_hard_stop_pct: 0.040              # Absolute safety cap (<= 4.0% price distance)
+  max_hard_stop_pct: 0.040              # Intraday hard stop cap (<= 4.0%)
+  swing_max_hard_stop_pct: 0.090        # Daily swing hard stop cap (<= 9.0% -> sizes ~25% notional @ 1.5% risk)
 
   # 2. Breakeven Ratchet + Progressive Profit-Lock Chandelier Exit
   breakeven_trigger_r: 1.5              # Lift stop above round-trip fees at +1.5R (avoids choking early swings while guarding winners)
-  chandelier_atr_multiplier: 2.8        # Tightened from 4.2x -> 2.8x ATR to eliminate 65% open-profit giveback
+  chandelier_atr_multiplier: 2.8        # Intraday 15m Chandelier
+  chandelier_atr_1d_multiplier: 4.0     # Multi-week 1d Chandelier trail
   profit_lock_trigger_r: 1.8            # Once peak reaches +1.8R, lock at least 55% of peak open gain
   profit_lock_floor_ratio: 0.55
 
-  # 3. Multi-Session Time Barrier
-  time_stop_bars_15m: 52                # ~2 trading sessions (52 x 15m bars) before cutting dead money
+  # 3. Time Barriers
+  time_stop_bars_15m: 52                # ~2 trading sessions (52 x 15m bars) in intraday_15m mode
+  time_stop_trading_days: 14            # ~3 weeks (14 trading days) in swing_1d mode if < +0.25R
   time_stop_min_progress_r: 0.15
 
   # 4. Positive Mathematical Expectancy Gate
@@ -66,5 +83,11 @@ daemon:
   heartbeat_timeout_seconds: 30
   max_orders_per_minute: 3
   place_server_side_stop: true
+  server_stop_order_type: "STOP"        # Persistent GTC market-on-trigger STOP on whole-share swings
   entry_order_ttl_seconds: 90           # Cancel unfilled/partial limit buy orders after 90s to avoid adverse chasing
   exit_order_ttl_seconds: 60            # Cancel stale limit sell orders after 60s so next tick re-prices cleanly
+  stoploss_guard:
+    enabled: true
+    max_stops_in_window: 3              # >= 3 distinct (symbol, entry_time) stops in 10 ET trading days
+    lookback_trading_days: 10
+    cooldown_trading_days: 5            # 5 ET trading-day hard entry cooldown

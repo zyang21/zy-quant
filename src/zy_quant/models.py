@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from typing import Optional
+
+
+class PipelinePhase(str, Enum):
+    PRE_OPEN_SYNC = "PRE_OPEN_SYNC"
+    OPEN_GAP_GUARD = "OPEN_GAP_GUARD"
+    IDLE_GTC_ARMED = "IDLE_GTC_ARMED"
+    EOD_DECISION_WINDOW = "EOD_DECISION_WINDOW"
+    POST_CLOSE_SETTLEMENT = "POST_CLOSE_SETTLEMENT"
+    MARKET_CLOSED = "MARKET_CLOSED"
 
 
 class RegimeLight(str, Enum):
@@ -44,6 +53,10 @@ class OrderStatus(str, Enum):
 class SetupType(str, Enum):
     VWAP_PULLBACK = "VWAP_PULLBACK"
     ORB_30M = "ORB_30M"
+    DAILY_PULLBACK_EMA21 = "DAILY_PULLBACK_EMA21"
+    VCP_PIVOT_BREAKOUT = "VCP_PIVOT_BREAKOUT"
+    DONCHIAN_20D_RS = "DONCHIAN_20D_RS"
+    PEAD_CONTINUATION = "PEAD_CONTINUATION"
 
 
 class ExitReason(str, Enum):
@@ -52,8 +65,16 @@ class ExitReason(str, Enum):
     CHANDELIER_TRAIL = "CHANDELIER_TRAIL"
     TIME_BARRIER = "TIME_BARRIER"
     EOD_T0_FLATTEN = "EOD_T0_FLATTEN"
+    PRE_EARNINGS_CUSHION = "PRE_EARNINGS_CUSHION"
     SCALE_OUT_2R = "SCALE_OUT_2R"
     KILL_SWITCH = "KILL_SWITCH"
+
+
+@dataclass(frozen=True)
+class EarningsEvent:
+    symbol: str
+    report_date: date
+    timing: str = "UNKNOWN"  # 'BMO' | 'AMC' | 'UNKNOWN'
 
 
 @dataclass
@@ -136,6 +157,11 @@ class RegimeSnapshot:
     recommended_scan_minutes: int
     reason: str
     evaluated_at: datetime
+    qqq_sma50: float = 0.0
+    qqq_sma200: float = 0.0
+    spy_sma50: float = 0.0
+    spy_sma200: float = 0.0
+    breadth_above_sma50_pct: float = 0.0
 
 
 @dataclass
@@ -219,6 +245,10 @@ class OpenPosition:
     highest_price: float
     risk_per_share: float
     bars_held_15m: int = 0
+    days_held: int = 0
+    entry_atr_1d: float = 0.0
+    stop_order_type: str = "GTC_STOP"
+    earnings_cushion_applied_date: Optional[str] = None
     breakeven_armed: bool = False
     scaled_out: bool = False
     broker_stop_order_id: Optional[str] = None

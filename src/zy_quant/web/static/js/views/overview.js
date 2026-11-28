@@ -205,39 +205,59 @@ export class OverviewView {
         hint: 'Peak-to-trough drop',
         tooltip: 'Largest percentage drop from a portfolio peak. Measures worst-case historical pain.',
       }),
+      metricTile({
+        label: 'Portfolio Heat',
+        value: `${Number(p.principal_heat_pct || 0).toFixed(2)}% / ${Number(p.max_portfolio_heat_pct || 6).toFixed(1)}%`,
+        valueClass: Number(p.principal_heat_pct || 0) >= Number(p.max_portfolio_heat_pct || 6) * 0.85 ? 'txt-warn' : 'txt-up',
+        hint: `${fmtUsd(p.principal_heat_usd || 0)} Principal · ${p.pipeline_phase || 'IDLE'}`,
+        tooltip: 'Total open principal at risk to current stops (drops to 0% per position once breakeven stop is armed). Includes 60d pairwise correlation & StoplossGuard gates.',
+      }),
     ].join('');
 
     // Market Regime Traffic Light
+    const isSwingMode = (reg.mode || p.strategy_mode || 'swing_1d') === 'swing_1d';
     const light = reg.light || 'YELLOW';
-    const lightMap = {
-      GREEN: { variant: 'up', label: 'GREEN · BULLISH TREND', guide: 'Broad Nasdaq (QQQ) is holding above both today’s volume-weighted average price (VWAP) and its 20-day trend with calm volatility. Intraday buy triggers are unlocked.' },
-      YELLOW: { variant: 'warn', label: 'YELLOW · CONSOLIDATION', guide: 'Market signals are mixed (QQQ split between intraday VWAP and 20-day trend, or moderate volatility). New buys are paused; existing positions remain protected.' },
-      RED: { variant: 'down', label: 'RED · DEFENSIVE LOCK', guide: 'Elevated market volatility or index downtrend detected. All new buy orders are locked ($0 fee churn) while the engine tracks relative-strength leaders.' },
-    };
+    const lightMap = isSwingMode
+      ? {
+          GREEN: { variant: 'up', label: 'GREEN · STAGE-2 BULLISH', guide: 'QQQ holds above its 50-day trend with healthy 100-stock breadth (≥50% > SMA50) and calm volatility. Daily swing entries are unlocked at 100% scale.' },
+          YELLOW: { variant: 'warn', label: 'YELLOW · SELECTIVE ALPHA', guide: 'Mixed macro trend or breadth consolidation. New swing entries are restricted to independent RS leaders at 0.65x position scale.' },
+          RED: { variant: 'down', label: 'RED · DEFENSIVE CASH', guide: 'Macro downtrend (QQQ & SPY < SMA200 with weak breadth) or panic volatility. New swing buys are locked ($0 churn) while GTC stops guard holdings.' },
+        }
+      : {
+          GREEN: { variant: 'up', label: 'GREEN · BULLISH TREND', guide: 'Broad Nasdaq (QQQ) is holding above both today’s volume-weighted average price (VWAP) and its 20-day trend with calm volatility. Intraday buy triggers are unlocked.' },
+          YELLOW: { variant: 'warn', label: 'YELLOW · CONSOLIDATION', guide: 'Market signals are mixed (QQQ split between intraday VWAP and 20-day trend, or moderate volatility). New buys are paused; existing positions remain protected.' },
+          RED: { variant: 'down', label: 'RED · DEFENSIVE LOCK', guide: 'Elevated market volatility or index downtrend detected. All new buy orders are locked ($0 fee churn) while the engine tracks relative-strength leaders.' },
+        };
     const lm = lightMap[light] || lightMap.YELLOW;
     document.getElementById('ovRegimeBadge').innerHTML = statusBadge(lm.label, lm.variant);
     document.getElementById('ovRegimeHeadline').textContent = reg.reason || 'Evaluating index conditions...';
     document.getElementById('ovRegimeGuide').textContent = lm.guide;
 
-    const qqqVsVwap = reg.qqq_price && reg.qqq_vwap ? (((reg.qqq_price - reg.qqq_vwap) / reg.qqq_vwap) * 100) : 0;
-    const qqqVsSma = reg.qqq_price && reg.qqq_sma20 ? (((reg.qqq_price - reg.qqq_sma20) / reg.qqq_sma20) * 100) : 0;
+    const qqqRefFast = isSwingMode && reg.qqq_sma50 ? reg.qqq_sma50 : reg.qqq_vwap;
+    const qqqRefSlow = isSwingMode && reg.qqq_sma200 ? reg.qqq_sma200 : reg.qqq_sma20;
+    const qqqVsFast = reg.qqq_price && qqqRefFast ? (((reg.qqq_price - qqqRefFast) / qqqRefFast) * 100) : 0;
+    const qqqVsSlow = reg.qqq_price && qqqRefSlow ? (((reg.qqq_price - qqqRefSlow) / qqqRefSlow) * 100) : 0;
 
     document.getElementById('ovMacroBenchmarks').innerHTML = `
       <div class="rule-item">
-        <div class="rk">QQQ vs Intraday VWAP ${infoTip('VWAP is the institutional average price paid today weighted by volume. Trading above VWAP indicates buyers are in control intraday.')}</div>
-        <div class="rv ${qqqVsVwap >= 0 ? 'txt-up' : 'txt-down'}">$${reg.qqq_price ?? '—'} vs $${reg.qqq_vwap ?? '—'} (${fmtPct(qqqVsVwap)})</div>
+        <div class="rk">${isSwingMode ? 'QQQ vs 50-Day Trend' : 'QQQ vs Intraday VWAP'} ${infoTip(isSwingMode ? '50-Day SMA anchors intermediate institutional Stage-2 swing trends.' : 'VWAP is the institutional average price paid today weighted by volume.')}</div>
+        <div class="rv ${qqqVsFast >= 0 ? 'txt-up' : 'txt-down'}">$${reg.qqq_price ?? '—'} vs $${qqqRefFast ?? '—'} (${fmtPct(qqqVsFast)})</div>
       </div>
       <div class="rule-item">
-        <div class="rk">QQQ vs 20-Day Trend ${infoTip('20-Day Simple Moving Average represents the ~1-month institutional trend baseline.')}</div>
-        <div class="rv ${qqqVsSma >= 0 ? 'txt-up' : 'txt-down'}">SMA20 $${reg.qqq_sma20 ?? '—'} (${fmtPct(qqqVsSma)})</div>
+        <div class="rk">${isSwingMode ? 'QQQ vs 200-Day Trend' : 'QQQ vs 20-Day Trend'} ${infoTip(isSwingMode ? '200-Day SMA separates secular bull trends from bear-market distribution.' : '20-Day Simple Moving Average represents the ~1-month institutional trend baseline.')}</div>
+        <div class="rv ${qqqVsSlow >= 0 ? 'txt-up' : 'txt-down'}">${isSwingMode ? 'SMA200' : 'SMA20'} $${qqqRefSlow ?? '—'} (${fmtPct(qqqVsSlow)})</div>
       </div>
       <div class="rule-item">
         <div class="rk">Market Volatility Index ${infoTip('Annualized volatility gauge. Above 24 signals caution (Yellow); above 30 signals panic whipsaw risk (Red).')}</div>
         <div class="rv ${reg.vix_level >= 30 ? 'txt-down' : (reg.vix_level >= 24 ? 'txt-warn' : 'txt-up')}">${reg.vix_level ?? '—'} ${reg.vix_level >= 30 ? '(Elevated Panic)' : '(Normal)'}</div>
       </div>
       <div class="rule-item">
-        <div class="rk">S&P 500 Benchmark (SPY)</div>
-        <div class="rv">$${reg.spy_price ?? '—'} · QQQ Day ${fmtPct(reg.qqq_intraday_return_pct || 0)}</div>
+        <div class="rk">S&P 500 & Breadth</div>
+        <div class="rv">$${reg.spy_price ?? '—'} · Breadth >SMA50: ${reg.breadth_above_sma50_pct != null ? `${reg.breadth_above_sma50_pct}%` : '—'}</div>
+      </div>
+      <div class="rule-item">
+        <div class="rk">Pipeline & Risk Guards</div>
+        <div class="rv">${esc(p.pipeline_phase || 'IDLE')} · Corr ≤ ${p.max_pair_corr_limit ?? 0.75} · ${(p.stoploss_guard && p.stoploss_guard.active) ? `Cooldown → ${esc(p.stoploss_guard.cooldown_until_date)}` : 'StoplossGuard OK'}</div>
       </div>
     `;
 
@@ -280,7 +300,7 @@ export class OverviewView {
       posBody.innerHTML = `
         <tr>
           <td colspan="10" style="text-align:center;padding:24px;color:var(--text-secondary);">
-            No open positions. Capital is held in cash until Market Regime is GREEN and an eligible leader triggers a 15m entry setup.
+            No open positions. Capital sits in USD Cash / Cash Plus until Market Regime allows entries and a top leader triggers a daily swing setup.
           </td>
         </tr>
       `;
@@ -289,9 +309,19 @@ export class OverviewView {
         .map((pos) => {
           const upnl = Number(pos.unrealized_pnl_usd || 0);
           const cls = upnl >= 0 ? 'txt-up' : 'txt-down';
-          const stateLabel = pos.breakeven_armed
-            ? 'Chandelier Trail Active (Risk-Free)'
-            : 'Initial ATR Stop Armed';
+          const stopTag = pos.stop_order_type || 'GTC_STOP';
+          const cushionShort = pos.earnings_cushion_tier
+            ? String(pos.earnings_cushion_tier).split(' ')[0]
+            : '';
+          const gtcBadge = pos.gtc_stop_healthy === false
+            ? 'STOP UNARMED'
+            : `${stopTag}${pos.breakeven_armed ? ' · BE+' : ''}${cushionShort ? ` · ${cushionShort}` : ''}`;
+          const earnHint = pos.earnings_countdown_td != null
+            ? ` · Earn T-${pos.earnings_countdown_td}d (${pos.earnings_timing || 'UNK'})`
+            : '';
+          const holdDisplay = pos.days_held > 0
+            ? `${pos.days_held}d${earnHint}`
+            : `${pos.hold_hours}h (${pos.bars_held_15m}b)${earnHint}`;
           return `
             <tr>
               <td><strong>${esc(pos.symbol)}</strong> <span class="txt-muted" style="font-size:11px;">${esc(pos.sector)}</span></td>
@@ -302,8 +332,8 @@ export class OverviewView {
               <td class="num ${cls}">${fmtUsd(upnl, true)} (${fmtPct(pos.unrealized_pnl_pct)})</td>
               <td class="num ${pos.current_r >= 0 ? 'txt-up' : 'txt-down'}">${pos.current_r >= 0 ? '+' : ''}${Number(pos.current_r).toFixed(2)}R</td>
               <td class="num txt-warn">${fmtUsd(pos.current_stop)}</td>
-              <td class="num">${pos.hold_hours}h <span class="txt-muted">(${pos.bars_held_15m}b)</span></td>
-              <td>${statusBadge(stateLabel, pos.breakeven_armed ? 'up' : 'neutral', false)}</td>
+              <td class="num">${esc(holdDisplay)}</td>
+              <td>${statusBadge(gtcBadge, pos.gtc_stop_healthy === false ? 'down' : (pos.breakeven_armed ? 'up' : 'neutral'), false)}</td>
             </tr>
           `;
         })

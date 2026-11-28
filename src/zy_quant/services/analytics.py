@@ -4,6 +4,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from zy_quant.config import AppSettings
+from zy_quant.intel.earnings_calendar import EarningsCalendarFeed
+from zy_quant.intel.market_hours import ET_TZ, count_trading_days_between
+from zy_quant.models import OrderSide
+from zy_quant.risk.mandate_gate import compute_portfolio_heat
+from zy_quant.runtime.pipeline import resolve_swing_phase
 from zy_quant.storage.state_store import StateStore
 
 
@@ -27,16 +32,26 @@ class PortfolioAnalyticsService:
 
         watchlist_rows = self.store.get_watchlist_scores()
         wl_prices = {w["symbol"]: float(w["price"]) for w in watchlist_rows}
+        open_map = self.store.get_positions()
+        now_utc = datetime.now(timezone.utc)
+        today_et = now_utc.astimezone(ET_TZ).date()
+        earn_feed = EarningsCalendarFeed(
+            cache_path=self.settings.root_dir / "data" / "cache" / "earnings_calendar.json"
+        )
+        earn_map = earn_feed.get_upcoming_events(
+            symbols=list(open_map.keys()), ref_day=today_et, allow_network=False
+        )
 
         positions_out: List[Dict[str, Any]] = []
         unrealized_total = 0.0
         invested_cost = 0.0
         mark_val_total = 0.0
 
-        for p in self.store.get_positions().values():
+        for p in open_map.values():
             mark_px = float(
                 p.metadata.get("last_mark_price") or wl_prices.get(p.symbol) or p.entry_price
             )
+            p.metadata["last_mark_price"] = mark_px
             unreal = (mark_px - p.entry_price) * p.shares
             unreal_pct = ((mark_px - p.entry_price) / p.entry_price * 100.0) if p.entry_price > 0 else 0.0
             r_now = (mark_px - p.entry_price) / max(0.01, p.risk_per_share)
@@ -46,6 +61,26 @@ class PortfolioAnalyticsService:
             )
             invested_cost += p.shares * p.entry_price + rem_buy_fee
             mark_val_total += p.shares * mark_px
+
+            ev = earn_map.get(p.symbol)
+            earn_days = (
+                count_trading_days_between(today_et, ev.report_date)
+                if (ev and ev.report_date >= today_et)
+                else None
+            )
+            cushion_tier = (
+                "HOUSE_MONEY_HOLD (>=2.5R)"
+                if r_now >= 2.5
+                else ("HALF_SCALE (1.0..2.5R)" if r_now >= 1.0 else "NO_CUSHION (<1.0R)")
+            )
+            stop_id_str = str(p.broker_stop_order_id or "")
+            gtc_healthy = (
+                (p.shares < 1.0 and p.stop_order_type == "CLIENT_FRAC_RTH")
+                or (
+                    bool(stop_id_str)
+                    and (not is_real or not stop_id_str.startswith(("SIM-", "PAPER-")))
+                )
+            )
 
             positions_out.append(
                 {
@@ -63,7 +98,13 @@ class PortfolioAnalyticsService:
                     "current_stop": round(p.current_stop, 2),
                     "highest_price": round(p.highest_price, 2),
                     "bars_held_15m": p.bars_held_15m,
+                    "days_held": p.days_held,
                     "hold_hours": round(p.bars_held_15m * 0.25, 2),
+                    "stop_order_type": p.stop_order_type,
+                    "gtc_stop_healthy": gtc_healthy,
+                    "earnings_countdown_td": earn_days,
+                    "earnings_timing": ev.timing if ev else None,
+                    "earnings_cushion_tier": cushion_tier,
                     "breakeven_armed": p.breakeven_armed,
                     "scaled_out": p.scaled_out,
                     "entry_time": p.entry_time.isoformat(),
@@ -121,14 +162,28 @@ class PortfolioAnalyticsService:
         )
 
         exposure_pct = (mark_val_total / max(1.0, equity_usd)) * 100.0
+        active_buys = self.store.get_active_orders(side=OrderSide.BUY)
+        heat = compute_portfolio_heat(open_map, active_buys, equity_usd)
+        sl_state = self.store.get_flag("stoploss_guard_state") or {"active": False}
+        cur_phase = resolve_swing_phase(now_utc).value
+
         return {
             "portfolio": {
                 "profile_label": tier.label,
+                "strategy_mode": self.settings.strategy_cfg.mode,
+                "pipeline_phase": cur_phase,
                 "starting_equity_usd": round(base_eq, 2),
                 "equity_usd": round(equity_usd, 2),
                 "cash_usd": round(cash_usd, 2),
                 "market_value_usd": round(mark_val_total, 2),
                 "exposure_pct": round(exposure_pct, 1),
+                "principal_heat_usd": heat.principal_heat_usd,
+                "principal_heat_pct": heat.principal_heat_pct,
+                "max_portfolio_heat_pct": round(tier.max_portfolio_heat_pct * 100.0, 1),
+                "open_drawdown_heat_usd": heat.open_drawdown_heat_usd,
+                "open_drawdown_heat_pct": heat.open_drawdown_heat_pct,
+                "max_pair_corr_limit": tier.max_pair_corr,
+                "stoploss_guard": sl_state,
                 "net_pnl_usd": round(net_pnl_usd, 2),
                 "net_return_pct": round(net_ret_pct, 2),
                 "gross_pnl_usd": round(closed_gross + unrealized_total, 2),

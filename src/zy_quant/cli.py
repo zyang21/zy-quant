@@ -76,24 +76,27 @@ class QuantCLI:
             return
 
         p = snap["portfolio"]
-        print("=" * 90)
-        print(f" zy-quant Status  |  {p['profile_label']}")
+        sl_g = p.get("stoploss_guard", {})
+        sl_txt = f"COOLDOWN->{sl_g.get('cooldown_until_date')}" if sl_g.get("active") else "OK"
+        print("=" * 94)
+        print(f" zy-quant Status  |  {p['profile_label']}  |  Mode: {p.get('strategy_mode', 'swing_1d')} [{p.get('pipeline_phase', 'IDLE')}]")
         print(f" Session : {session.message}")
         print(
             f" Regime  : {regime.get('light', 'UNKNOWN')}  |  "
-            f"QQQ ${regime.get('qqq_price', '—')} (VWAP ${regime.get('qqq_vwap', '—')}, "
-            f"SMA20 ${regime.get('qqq_sma20', '—')}, Vol {regime.get('vix_level', '—')})"
+            f"QQQ ${regime.get('qqq_price', '—')} (SMA50 ${regime.get('qqq_sma50') or regime.get('qqq_sma20', '—')}, "
+            f"Breadth {regime.get('breadth_above_sma50_pct', '—')}%, Vol {regime.get('vix_level', '—')})"
         )
-        print("-" * 90)
+        print("-" * 94)
         print(
             f" NAV: ${p['equity_usd']:,.2f} (Cash ${p['cash_usd']:,.2f}, Invested {p['exposure_pct']:.1f}%)  |  "
             f"Net Return: {p['net_return_pct']:+.2f}% (${p['net_pnl_usd']:+.2f})"
         )
         print(
-            f" Gross PnL: ${p['gross_pnl_usd']:+.2f}  |  Fees+Slip: -${p['total_fees_usd']:.2f}  |  "
-            f"Win Rate: {p['win_rate_pct']:.1f}% ({p['closed_trades_count']} trades)  |  Max DD: -{p['max_drawdown_pct']:.2f}%"
+            f" Heat: Principal {p.get('principal_heat_pct', 0):.2f}%/${p.get('principal_heat_usd', 0):.0f} "
+            f"(Cap {p.get('max_portfolio_heat_pct', 6):.1f}%)  |  StoplossGuard: {sl_txt}  |  "
+            f"Win: {p['win_rate_pct']:.1f}% ({p['closed_trades_count']} tr)  |  Max DD: -{p['max_drawdown_pct']:.2f}%"
         )
-        print("=" * 90)
+        print("=" * 94)
 
         print(f"\n[Watchlist Top Candidates]")
         for w in snap["watchlist"][:8]:
@@ -108,10 +111,18 @@ class QuantCLI:
             print("  (None)")
         else:
             for pos in snap["positions"]:
+                earn_txt = (
+                    f"  Earn=T-{pos['earnings_countdown_td']}d({pos.get('earnings_timing') or 'UNK'})"
+                    if pos.get("earnings_countdown_td") is not None
+                    else ""
+                )
+                cush_txt = pos.get("earnings_cushion_tier", "—")
                 print(
-                    f"  {pos['symbol']:<6} {pos['setup']:<16} qty={pos['shares']:>6.2f}  "
+                    f"  {pos['symbol']:<6} {pos['setup']:<20} qty={pos['shares']:>6.2f}  "
                     f"${pos['entry_price']:.2f} -> ${pos['mark_price']:.2f}  "
-                    f"PnL ${pos['unrealized_pnl_usd']:+.2f} ({pos['current_r']:+.2f}R)  Stop ${pos['current_stop']:.2f}"
+                    f"PnL ${pos['unrealized_pnl_usd']:+.2f} ({pos['current_r']:+.2f}R)  "
+                    f"Stop ${pos['current_stop']:.2f} [{pos.get('stop_order_type', 'GTC')}] "
+                    f"days={pos.get('days_held', 0)}  Cushion={cush_txt}{earn_txt}"
                 )
 
     def run_history(
@@ -199,6 +210,8 @@ class QuantCLI:
         symbols_csv: Optional[str],
         as_json: bool,
         pit_csv: Optional[str] = None,
+        mode: Optional[str] = None,
+        clock_mode: str = "auto",
     ) -> None:
         bar_cache = HistoricalBarCache(self.settings.resolve_bar_cache_path())
         alpaca_cfg = self.settings.runtime_cfg.alpaca
@@ -233,6 +246,8 @@ class QuantCLI:
                 start_date=start_date,
                 end_date=end_date,
                 pit_filter=pit_filter,
+                mode=mode,
+                clock_mode=clock_mode,
             )
         finally:
             if gw is not None:
@@ -270,15 +285,27 @@ class QuantCLI:
         env_path = self.settings.root_dir / ".env"
         if consolidate_local:
             futu_cfg = self.settings.runtime_cfg.futu
-            local_payload = {
-                "futu": {
-                    "trd_env": futu_cfg.trd_env,
-                    "api_token": futu_cfg.api_token,
-                    "trade_pwd_md5": futu_cfg.trade_pwd_md5,
-                }
+            alpaca_cfg = self.settings.runtime_cfg.alpaca
+            existing_local: dict = {}
+            if local_path.exists():
+                try:
+                    existing_local = json.loads(local_path.read_text(encoding="utf-8"))
+                except Exception:
+                    existing_local = {}
+            existing_local["futu"] = {
+                **dict(existing_local.get("futu") or {}),
+                "trd_env": futu_cfg.trd_env,
+                "api_token": futu_cfg.api_token,
+                "trade_pwd_md5": futu_cfg.trade_pwd_md5,
             }
+            if alpaca_cfg.api_key or alpaca_cfg.secret_key or "alpaca" in existing_local:
+                existing_local["alpaca"] = {
+                    **dict(existing_local.get("alpaca") or {}),
+                    "api_key": alpaca_cfg.api_key,
+                    "secret_key": alpaca_cfg.secret_key,
+                }
             local_path.write_text(
-                json.dumps(local_payload, indent=2) + "\n", encoding="utf-8"
+                json.dumps(existing_local, indent=2) + "\n", encoding="utf-8"
             )
             local_path.chmod(0o600)
             if env_path.exists():
@@ -436,6 +463,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_bt.add_argument("--to", dest="end_date", default=None, help="End date YYYY-MM-DD")
     p_bt.add_argument("--symbols", default=None, help="Comma-separated symbols (e.g. NVDA,MSFT)")
     p_bt.add_argument("--pit-csv", dest="pit_csv", default=None, help="Point-in-Time constituent CSV (symbol,start_date,end_date)")
+    p_bt.add_argument("--mode", default=None, choices=["swing_1d", "intraday_15m"], help="Strategy mode override")
+    p_bt.add_argument("--clock", dest="clock_mode", default="auto", choices=["auto", "1d", "hybrid_1545", "intraday_15m"], help="Backtest clock mode")
     p_bt.add_argument("--json", action="store_true")
 
     p_alpaca = sub.add_parser("test-alpaca", help="Verify Alpaca Market Data API v2 connection, batch latency & earnings feed")
@@ -485,7 +514,7 @@ def main() -> None:
         daemon = TradingDaemon(cli.settings)
         if args.once:
             daemon.startup_reconcile()
-            out = daemon.run_cycle(tier_override=args.tier, check_edgar=args.edgar, force_when_closed=True)
+            out = daemon.step_scheduled(tier_override=args.tier, check_edgar=args.edgar, force_when_closed=True)
             print(json.dumps(out, indent=2, ensure_ascii=False))
             daemon.gateway.close()
         else:
@@ -511,6 +540,8 @@ def main() -> None:
             symbols_csv=args.symbols,
             as_json=args.json,
             pit_csv=args.pit_csv,
+            mode=args.mode,
+            clock_mode=args.clock_mode,
         )
     elif args.cmd == "test-alpaca":
         cli.run_test_alpaca(full_universe=args.full)

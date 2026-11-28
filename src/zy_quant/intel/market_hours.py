@@ -7,8 +7,26 @@ from zoneinfo import ZoneInfo
 
 ET_TZ = ZoneInfo("America/New_York")
 
-# Official NYSE / NASDAQ full-day closures (2026 - 2027)
+# Official NYSE / NASDAQ full-day closures (2021 - 2027)
 NYSE_HOLIDAYS = {
+    # 2021
+    date(2021, 1, 1), date(2021, 1, 18), date(2021, 2, 15), date(2021, 4, 2),
+    date(2021, 5, 31), date(2021, 7, 5), date(2021, 9, 6), date(2021, 11, 25), date(2021, 12, 24),
+    # 2022
+    date(2022, 1, 17), date(2022, 2, 21), date(2022, 4, 15), date(2022, 5, 30),
+    date(2022, 6, 20), date(2022, 7, 4), date(2022, 9, 5), date(2022, 11, 24), date(2022, 12, 26),
+    # 2023
+    date(2023, 1, 2), date(2023, 1, 16), date(2023, 2, 20), date(2023, 4, 7),
+    date(2023, 5, 29), date(2023, 6, 19), date(2023, 7, 4), date(2023, 9, 4),
+    date(2023, 11, 23), date(2023, 12, 25),
+    # 2024
+    date(2024, 1, 1), date(2024, 1, 15), date(2024, 2, 19), date(2024, 3, 29),
+    date(2024, 5, 27), date(2024, 6, 19), date(2024, 7, 4), date(2024, 9, 2),
+    date(2024, 11, 28), date(2024, 12, 25),
+    # 2025
+    date(2025, 1, 1), date(2025, 1, 9), date(2025, 1, 20), date(2025, 2, 17),
+    date(2025, 4, 18), date(2025, 5, 26), date(2025, 6, 19), date(2025, 7, 4),
+    date(2025, 9, 1), date(2025, 11, 27), date(2025, 12, 25),
     # 2026
     date(2026, 1, 1),   # New Year's Day
     date(2026, 1, 19),  # MLK Jr. Day
@@ -33,8 +51,13 @@ NYSE_HOLIDAYS = {
     date(2027, 12, 24),
 }
 
-# Official NYSE 13:00 ET early-close sessions (Black Friday & Dec 24)
+# Official NYSE 13:00 ET early-close sessions (2021 - 2027)
 NYSE_EARLY_CLOSE_DATES = {
+    date(2021, 11, 26),
+    date(2022, 11, 25),
+    date(2023, 7, 3), date(2023, 11, 24),
+    date(2024, 7, 3), date(2024, 11, 29), date(2024, 12, 24),
+    date(2025, 7, 3), date(2025, 11, 28), date(2025, 12, 24),
     date(2026, 11, 27), # Day after Thanksgiving (closes 13:00 ET)
     date(2026, 12, 24), # Christmas Eve (closes 13:00 ET)
     date(2027, 11, 26),
@@ -58,6 +81,50 @@ def is_trading_day(d: date) -> bool:
 
 def session_close_time(d: date) -> time:
     return time(13, 0) if d in NYSE_EARLY_CLOSE_DATES else time(16, 0)
+
+
+def add_trading_days(start_d: date, trading_days: int) -> date:
+    """Advances (or steps back if negative) strictly by NYSE `is_trading_day()` sessions."""
+    if trading_days == 0:
+        return start_d
+    step = 1 if trading_days > 0 else -1
+    remaining = abs(trading_days)
+    cur = start_d
+    while remaining > 0:
+        cur = cur + timedelta(days=step)
+        if is_trading_day(cur):
+            remaining -= 1
+    return cur
+
+
+def count_trading_days_between(start_d: date, end_d: date) -> int:
+    """Counts NYSE trading sessions in `(start_d, end_d]` (0 when `end_d <= start_d`)."""
+    if end_d <= start_d:
+        return 0
+    cnt = 0
+    cur = start_d + timedelta(days=1)
+    while cur <= end_d:
+        if is_trading_day(cur):
+            cnt += 1
+        cur += timedelta(days=1)
+    return cnt
+
+
+def daily_bar_session_date(bar_ts: datetime) -> date:
+    """
+    Canonical US session-date extractor for `1d` daily bars across all providers:
+      - Futu (`YYYY-MM-DD 00:00:00Z`), Alpaca (`04:00Z`/`05:00Z`), and Noon-UTC (`12:00Z`) daily
+        bars encode the exact session calendar date in UTC (`hour < 17`) — converting `00:00Z`
+        via `.astimezone(ET_TZ)` would erroneously roll back `-1` day to `19:00/20:00 ET`!
+      - Timestamps at or after `17:00 UTC` (e.g. EOD snapshots stamped at `20:00/21:00 UTC`)
+        are converted via `ET_TZ`.
+    """
+    if bar_ts.tzinfo is None:
+        return bar_ts.date()
+    utc_dt = bar_ts.astimezone(timezone.utc)
+    if utc_dt.hour < 17:
+        return utc_dt.date()
+    return utc_dt.astimezone(ET_TZ).date()
 
 
 def next_regular_open(now_et: datetime) -> datetime:

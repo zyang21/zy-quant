@@ -1,13 +1,17 @@
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from datetime import date
+from typing import Mapping, Optional, Sequence
 
-from zy_quant.config import EntryConfig
+from zy_quant.config import EntryConfig, RegimeConfig
+from zy_quant.intel.market_hours import ET_TZ, daily_bar_session_date
 from zy_quant.models import (
     Bar,
     CapitalFlowSnapshot,
+    EarningsEvent,
     EntrySignal,
     RegimeLight,
+    RegimeSnapshot,
     SetupType,
 )
 from zy_quant.strategy.indicators import (
@@ -29,8 +33,13 @@ class IntradaySignalEngine:
     - Prime Window Filter: Blocks late-afternoon (>14:30 ET) entries to avoid overnight gap traps.
     """
 
-    def __init__(self, cfg: EntryConfig) -> None:
+    mode = "intraday_15m"
+
+    def __init__(self, cfg: EntryConfig, regime_cfg: Optional[RegimeConfig] = None) -> None:
+        from zy_quant.intel.regime import MarketRegimeDetector
+
         self.cfg = cfg
+        self._regime_detector = MarketRegimeDetector(regime_cfg or RegimeConfig())
 
     def _passes_daily_trend_and_regime(
         self,
@@ -45,12 +54,12 @@ class IntradaySignalEngine:
             return False
 
         prior_stock_d = (
-            [b for b in stock_daily_bars if b.timestamp.date() < session_day]  # type: ignore[operator]
+            [b for b in stock_daily_bars if daily_bar_session_date(b.timestamp) < session_day]  # type: ignore[operator]
             if stock_daily_bars
             else []
         )
         prior_qqq_d = (
-            [b for b in qqq_daily_bars if b.timestamp.date() < session_day]  # type: ignore[operator]
+            [b for b in qqq_daily_bars if daily_bar_session_date(b.timestamp) < session_day]  # type: ignore[operator]
             if qqq_daily_bars
             else []
         )
@@ -94,9 +103,10 @@ class IntradaySignalEngine:
             return None
 
         curr = bars_15m[-1]
+        curr_et_day = curr.timestamp.date() if curr.timestamp.tzinfo is None else curr.timestamp.astimezone(ET_TZ).date()
         if not self._passes_daily_trend_and_regime(
             curr.close,
-            curr.timestamp.date(),
+            curr_et_day,
             regime_light,
             stock_daily_bars,
             qqq_daily_bars,
@@ -208,3 +218,49 @@ class IntradaySignalEngine:
                     )
 
         return None
+
+    # --- StrategyPipelineProtocol Adapter ---
+    def evaluate_regime(
+        self,
+        qqq_daily: Sequence[Bar],
+        spy_daily: Sequence[Bar],
+        universe_daily: Optional[Mapping[str, Sequence[Bar]]] = None,
+        qqq_intraday_15m: Optional[Sequence[Bar]] = None,
+        as_of_date: Optional[date] = None,
+        qqq_partial_bar: Optional[Bar] = None,
+        spy_partial_bar: Optional[Bar] = None,
+        vix_level: Optional[float] = None,
+    ) -> RegimeSnapshot:
+        return self._regime_detector.evaluate(
+            qqq_intraday_15m=qqq_intraday_15m or [],
+            qqq_daily=qqq_daily,
+            spy_daily=spy_daily,
+            vix_level=vix_level or 18.0,
+        )
+
+    def evaluate_entry(
+        self,
+        symbol: str,
+        sector: str,
+        regime_light: RegimeLight,
+        watchlist_score: float,
+        stock_daily_bars: Sequence[Bar],
+        qqq_daily_bars: Sequence[Bar],
+        as_of_date: date,
+        partial_today_bar: Optional[Bar] = None,
+        bars_15m: Optional[Sequence[Bar]] = None,
+        capital_flow: Optional[CapitalFlowSnapshot] = None,
+        recent_earnings: Optional[EarningsEvent] = None,
+    ) -> Optional[EntrySignal]:
+        if not bars_15m:
+            return None
+        return self.evaluate_15m(
+            symbol=symbol,
+            sector=sector,
+            bars_15m=bars_15m,
+            regime_light=regime_light,
+            watchlist_score=watchlist_score,
+            capital_flow=capital_flow,
+            stock_daily_bars=stock_daily_bars,
+            qqq_daily_bars=qqq_daily_bars,
+        )

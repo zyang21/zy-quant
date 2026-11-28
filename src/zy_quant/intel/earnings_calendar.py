@@ -9,17 +9,34 @@ from typing import Dict, Iterable, Optional
 import httpx
 
 from zy_quant.intel.market_hours import ET_TZ
+from zy_quant.models import EarningsEvent
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_nasdaq_earnings_timing(raw_time: str) -> str:
+    """
+    Maps Nasdaq calendar `time` strings into canonical timing buckets:
+      - 'time-pre-market' -> 'BMO' (act on T-1 close)
+      - 'time-after-hours' -> 'AMC' (act on T-0 close)
+      - 'time-not-supplied' / unknown -> 'UNKNOWN' (fail-safe treated as T-1 close!)
+    """
+    t = (raw_time or "").strip().lower()
+    if "pre-market" in t or t == "bmo":
+        return "BMO"
+    if "after-hours" in t or t == "amc":
+        return "AMC"
+    return "UNKNOWN"
 
 
 class EarningsCalendarFeed:
     """
     Zero-key US Equities Earnings Blackout Calendar (`data/cache/earnings_calendar.json`):
-      - Queries Nasdaq public earnings calendar JSON across `[today - 2d .. today + 5d]`
-      - Caches locally for 12 hours so intraday cycles read in O(1) memory/disk
-      - Feeds `next_earnings_date` into `ConservativeWatchlistScorer` to hard-veto entries
-        within `+-2` trading days of quarterly earnings announcements
+      - Queries Nasdaq public earnings calendar JSON across `[today - 2d .. today + 16d]`
+        (covering the full +14 calendar-day / 10 trading-day swing entry buffer!)
+      - Preserves `BMO` vs `AMC` timing so `PRE_EARNINGS_CUSHION` acts on `T-1` close for BMO/UNKNOWN
+        and `T-0` close for AMC
+      - Caches locally for 12 hours so intraday/EOD cycles read in O(1) memory/disk
     """
 
     NASDAQ_URL = "https://api.nasdaq.com/api/calendar/earnings"
@@ -30,17 +47,25 @@ class EarningsCalendarFeed:
         "Referer": "https://www.nasdaq.com/",
     }
 
-    def __init__(self, cache_path: Optional[Path] = None, ttl_hours: int = 12) -> None:
+    def __init__(
+        self,
+        cache_path: Optional[Path] = None,
+        ttl_hours: int = 12,
+        lookahead_days: int = 16,
+        http_client: Optional[httpx.Client] = None,
+    ) -> None:
         self.cache_path = cache_path
         self.ttl = timedelta(hours=ttl_hours)
-        self._mem_cache: Optional[tuple[datetime, Dict[str, date]]] = None
+        self.lookahead_days = lookahead_days
+        self._http_client = http_client
+        self._mem_cache: Optional[tuple[datetime, Dict[str, EarningsEvent]]] = None
 
-    def get_upcoming_earnings(
+    def get_upcoming_events(
         self,
         symbols: Optional[Iterable[str]] = None,
         ref_day: Optional[date] = None,
         allow_network: bool = True,
-    ) -> Dict[str, date]:
+    ) -> Dict[str, EarningsEvent]:
         now = datetime.now(timezone.utc)
         target_set = {s.upper() for s in symbols} if symbols is not None else None
 
@@ -56,59 +81,124 @@ class EarningsCalendarFeed:
             return {}
 
         today = ref_day or now.astimezone(ET_TZ).date()
-        fetched: Dict[str, date] = {}
+        stale_disk = self._read_disk_cache(now, ignore_ttl=True)
+        merged: Dict[str, EarningsEvent] = dict(stale_disk) if stale_disk else {}
+        forward_expected = 0
+        forward_ok = 0
+        any_http_ok = False
+        transport_failed = False
+
         try:
-            with httpx.Client(timeout=6.0, headers=self.HEADERS) as client:
-                for offset in range(-2, 6):
+            owned = self._http_client is None
+            client = self._http_client or httpx.Client(timeout=6.0, headers=self.HEADERS)
+            try:
+                # Look back 10 calendar days (~7 trading days) so PEAD T+1..T+5 is reachable!
+                for offset in range(-10, self.lookahead_days + 1):
                     q_day = today + timedelta(days=offset)
                     if q_day.weekday() >= 5:
                         continue
+                    if q_day >= today:
+                        forward_expected += 1
                     resp = client.get(self.NASDAQ_URL, params={"date": q_day.isoformat()})
                     if resp.status_code != 200:
                         continue
+                    any_http_ok = True
+                    if q_day >= today:
+                        forward_ok += 1
+                    # Only replace cached entries belonging to this confirmed HTTP-200 date!
+                    merged = {k: v for k, v in merged.items() if v.report_date != q_day}
                     rows = ((resp.json().get("data") or {}).get("rows")) or []
                     for r in rows:
                         sym = str(r.get("symbol") or "").strip().upper()
-                        if sym:
-                            # Keep closest earnings date to `today`
-                            if sym not in fetched or abs((q_day - today).days) < abs((fetched[sym] - today).days):
-                                fetched[sym] = q_day
+                        if not sym:
+                            continue
+                        timing = normalize_nasdaq_earnings_timing(str(r.get("time") or ""))
+                        ev = EarningsEvent(symbol=sym, report_date=q_day, timing=timing)
+                        if sym not in merged:
+                            merged[sym] = ev
+                        else:
+                            prev_d = merged[sym].report_date
+                            if (q_day >= today and prev_d < today) or (
+                                abs((q_day - today).days) < abs((prev_d - today).days)
+                            ):
+                                merged[sym] = ev
+            finally:
+                if owned:
+                    client.close()
         except Exception as exc:
-            logger.debug("Earnings calendar network refresh skipped: %s", exc)
+            transport_failed = True
+            logger.debug("Earnings calendar network refresh interrupted: %s", exc)
 
-        self._mem_cache = (now, fetched)
-        self._write_disk_cache(now, fetched)
-        return self._filter(fetched, target_set)
+        # Only persist refreshed TTL when forward window succeeded without mid-loop transport truncation!
+        forward_complete = (forward_expected == 0) or (forward_ok == forward_expected)
+        if any_http_ok and not transport_failed and forward_complete:
+            self._mem_cache = (now, merged)
+            self._write_disk_cache(now, merged)
+            return self._filter(merged, target_set)
+
+        if merged:
+            return self._filter(merged, target_set)
+        return {}
+
+    def get_upcoming_earnings(
+        self,
+        symbols: Optional[Iterable[str]] = None,
+        ref_day: Optional[date] = None,
+        allow_network: bool = True,
+    ) -> Dict[str, date]:
+        """Backward-compatible helper returning `symbol -> report_date`."""
+        events = self.get_upcoming_events(symbols=symbols, ref_day=ref_day, allow_network=allow_network)
+        return {sym: ev.report_date for sym, ev in events.items()}
 
     @staticmethod
-    def _filter(full_map: Dict[str, date], target_set: Optional[set[str]]) -> Dict[str, date]:
+    def _filter(
+        full_map: Dict[str, EarningsEvent], target_set: Optional[set[str]]
+    ) -> Dict[str, EarningsEvent]:
         if target_set is None:
             return dict(full_map)
         return {k: v for k, v in full_map.items() if k in target_set}
 
-    def _read_disk_cache(self, now: datetime) -> Optional[Dict[str, date]]:
+    def _read_disk_cache(
+        self, now: datetime, ignore_ttl: bool = False
+    ) -> Optional[Dict[str, EarningsEvent]]:
         if self.cache_path is None or not self.cache_path.exists():
             return None
         try:
             raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
             updated_at = datetime.fromisoformat(str(raw["updated_at"]))
-            if (now - updated_at) >= self.ttl:
+            if not ignore_ttl and (now - updated_at) >= self.ttl:
                 return None
-            return {
-                str(k).upper(): date.fromisoformat(str(v))
-                for k, v in (raw.get("dates") or {}).items()
-            }
+            out: Dict[str, EarningsEvent] = {}
+            events_raw = raw.get("events")
+            if isinstance(events_raw, dict):
+                for k, info in events_raw.items():
+                    sym = str(k).upper()
+                    out[sym] = EarningsEvent(
+                        symbol=sym,
+                        report_date=date.fromisoformat(str(info["date"])),
+                        timing=str(info.get("timing") or "UNKNOWN").upper(),
+                    )
+                return out
+            # Backward compatibility with legacy {"dates": {"NVDA": "2026-11-20"}} cache files
+            for k, v in (raw.get("dates") or {}).items():
+                sym = str(k).upper()
+                out[sym] = EarningsEvent(symbol=sym, report_date=date.fromisoformat(str(v)), timing="UNKNOWN")
+            return out
         except Exception:
             return None
 
-    def _write_disk_cache(self, now: datetime, mapping: Dict[str, date]) -> None:
+    def _write_disk_cache(self, now: datetime, mapping: Dict[str, EarningsEvent]) -> None:
         if self.cache_path is None:
             return
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             payload = {
                 "updated_at": now.isoformat(),
-                "dates": {k: v.isoformat() for k, v in mapping.items()},
+                "dates": {k: v.report_date.isoformat() for k, v in mapping.items()},
+                "events": {
+                    k: {"date": v.report_date.isoformat(), "timing": v.timing}
+                    for k, v in mapping.items()
+                },
             }
             self.cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         except Exception:

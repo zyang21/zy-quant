@@ -53,8 +53,9 @@ export function humanizeExitReason(code) {
     INITIAL_ATR_STOP: 'Initial Volatility Stop (ATR)',
     BREAKEVEN_STOP: 'Breakeven Capital Guard',
     CHANDELIER_TRAIL: 'Chandelier Trailing Profit Lock',
-    TIME_BARRIER: '4h Stagnation Time Exit',
+    TIME_BARRIER: 'Stagnation Time Exit',
     EOD_T0_FLATTEN: 'Futu HK T+0 EOD Shield',
+    PRE_EARNINGS_CUSHION: 'Pre-Earnings Cushion Rule',
     SCALE_OUT_2R: 'Partial Profit Scale-Out',
     KILL_SWITCH: 'Emergency Kill-Switch',
   };
@@ -65,6 +66,10 @@ export function humanizeSetup(code) {
   const map = {
     VWAP_PULLBACK: 'VWAP Institutional Pullback',
     ORB_30M: '30m Opening Range Breakout',
+    DAILY_PULLBACK_EMA21: 'Daily EMA21 Pullback Reclaim',
+    VCP_PIVOT_BREAKOUT: 'Daily VCP 20d Pivot Breakout',
+    DONCHIAN_20D_RS: '20d Donchian RS Breakout',
+    PEAD_CONTINUATION: 'Post-Earnings Drift (PEAD)',
     RECONCILED_ADOPTED: 'Broker Synced Position',
   };
   return map[code] || code || 'Trend';

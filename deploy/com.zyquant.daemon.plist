@@ -15,10 +15,15 @@
     <key>RunAtLoad</key>
     <false/>
     <!--
-      Mon-Fri pre-market auto-start check (UTC+8 local time):
-      - 21:20 covers US Daylight Saving Time (09:20 EDT)
-      - 22:20 covers US Standard Time (09:20 EST)
-      run_daemon.sh validates get_us_market_session() to handle DST and skip NYSE holidays.
+      Two-Window Scheduled Wake (UTC+8 local time -> America/New_York):
+      Window 1 (Pre-Market & Open Gap Guard, ~09:20 ET Mon-Fri):
+        - 21:20 Mon-Fri covers US Daylight Saving Time (09:20 EDT)
+        - 22:20 Mon-Fri covers US Standard Time (09:20 EST)
+      Window 2 (EOD Decision & Post-Close Settlement, ~15:25 ET Mon-Fri):
+        - 03:25 Tue-Sat covers US Daylight Saving Time (15:25 EDT)
+        - 04:25 Tue-Sat covers US Standard Time (15:25 EST)
+      run_daemon.sh validates ET_TZ session windows, stays awake continuously 09:20-13:10 ET
+      on 13:00 ET NYSE early-close half-days or when <1 sh fractional lots are open, and skips holidays.
     -->
     <key>StartCalendarInterval</key>
     <array>
@@ -32,6 +37,16 @@
         <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
         <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
         <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>22</integer><key>Minute</key><integer>20</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>3</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>2</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>3</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>4</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>5</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>25</integer></dict>
+        <dict><key>Weekday</key><integer>6</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>25</integer></dict>
     </array>
     <key>StandardOutPath</key>
     <string>/tmp/zy-quant-daemon.out.log</string>
