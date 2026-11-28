@@ -1686,3 +1686,69 @@ def test_round5_sip_cache_isolation_scoped_stop_reconcile_eod_retry_readonly_sca
     k_bars = futu_15m.get_bars("NVDA", timeframe="15m", days=2)
     assert len(k_bars) == 1
     assert k_bars[0].timestamp == datetime(2026, 11, 25, 14, 30, tzinfo=timezone.utc)
+
+    # --- Verify live IEX tail does NOT trigger false split-cliff wipe & keeps same-day session volume homogeneous ---
+    cache_hom = HistoricalBarCache(tmp_path / "c1_homog.db")
+    anchor_sip_ts = datetime(2026, 11, 24, 20, 45, tzinfo=timezone.utc)
+    same_day_sip_ts = datetime(2026, 11, 25, 15, 0, tzinfo=timezone.utc)
+    cache_hom.upsert_bars(
+        "15m",
+        [
+            Bar("NVDA", anchor_sip_ts, 150.0, 151.0, 149.5, 150.0, 2_000_000.0),
+            Bar("NVDA", same_day_sip_ts, 151.0, 152.0, 150.5, 151.5, 2_200_000.0),  # Cached SIP earlier today!
+        ],
+    )
+
+    def live_iex_drift_handler(_req: httpx.Request) -> httpx.Response:
+        # IEX close on anchor_sip_ts differs by 0.67% ($149.0 vs $150.0 SIP closing auction) -> MUST NOT wipe SQLite!
+        return httpx.Response(
+            200,
+            json={
+                "bars": {
+                    "NVDA": [
+                        {"t": "2026-11-24T20:45:00Z", "o": 150.0, "h": 150.5, "l": 148.8, "c": 149.0, "v": 60_000.0},
+                        {"t": "2026-11-25T15:00:00Z", "o": 151.0, "h": 152.0, "l": 150.5, "c": 151.4, "v": 70_000.0},
+                        {"t": "2026-11-25T20:30:00Z", "o": 152.0, "h": 153.0, "l": 151.8, "c": 152.8, "v": 80_000.0},
+                    ]
+                },
+                "next_page_token": None,
+            },
+        )
+
+    ad_hom = AlpacaMarketDataAdapter(
+        AlpacaDataConfig(api_key="PK", secret_key="SK", feed="iex"),
+        bar_cache=cache_hom,
+        http_client=httpx.Client(transport=httpx.MockTransport(live_iex_drift_handler)),
+    )
+    hom_bars = ad_hom.get_bars_batch(["NVDA"], timeframe="15m", days=3)["NVDA"]
+    # SQLite SIP cache WAS NOT WIPED by IEX vs SIP 0.67% closing-auction difference!
+    assert cache_hom.coverage_bounds("NVDA", "15m") is not None
+    # And Nov 25 bars in `hom_bars` are 100% homogeneous IEX (`70k + 80k`, zero `2.2M` SIP bar mixed in)!
+    nov25_vols = [b.volume for b in hom_bars if b.timestamp.astimezone(ET_TZ).date() == date(2026, 11, 25)]
+    assert nov25_vols == [70_000.0, 80_000.0]
+
+    # --- Verify failed Chandelier ratchet RPC reverts `pos.current_stop` & `pos.breakeven_armed` ---
+    store_rat = StateStore(tmp_path / "ratchet_revert.db")
+    daemon_rat = TradingDaemon(settings, store=store_rat, notifier=AlertNotifier())
+    pipe_rat = DailySwingPipeline(daemon_rat)
+    pipe_rat._fetch_260d_universe = lambda syms: d_map  # type: ignore[method-assign]
+    daemon_rat.earnings_feed.get_upcoming_events = lambda **kw: {}  # type: ignore[method-assign]
+    daemon_rat.market_data.has_credentials = lambda: False  # type: ignore[method-assign]
+    daemon_rat.market_data.bar_cache = None  # type: ignore[attr-defined]
+    daemon_rat.market_data.get_bars = lambda sym, timeframe="15m", days=2: []  # type: ignore[method-assign]
+    # Quote at $170 on $150 entry ($10 risk = +2.0R -> triggers Breakeven + Chandelier ratchet!)
+    daemon_rat.market_data.get_quote = lambda sym: QuoteSnapshot(sym, 170.0, 169.9, 170.1, 900_000_000.0, at_1545_utc)  # type: ignore[method-assign]
+    daemon_rat.gateway.trd_env_name = "REAL"
+    daemon_rat.gateway.has_target_account = lambda: True  # type: ignore[method-assign]
+    daemon_rat.gateway.is_connected = lambda: True  # type: ignore[method-assign]
+    daemon_rat.gateway.get_account_summary = lambda: {"equity_usd": 10000.0, "cash_usd": 0.0}  # type: ignore[method-assign]
+    daemon_rat.gateway.last_stop_sync_ok = False  # Simulate Futu modify_order RPC failure!
+    daemon_rat._place_stop_order = lambda sym, sh, px, oid=None: oid  # type: ignore[method-assign]
+
+    store_rat.upsert_position(
+        OpenPosition("XOM", "Energy", 10.0, 10.0, 150.0, at_1545_utc - timedelta(days=5), 140.0, 140.0, 152.0, 10.0, broker_stop_order_id="GTC-OLD-140")
+    )
+    pipe_rat._execute_eod_decision_dag(at_1545_utc, target_d, "tier_10k", tier_10k, ["XOM"], check_edgar=False)
+    p_rat = store_rat.get_positions()["XOM"]
+    assert p_rat.current_stop == 140.0  # Reverted because broker GTC stop modify RPC failed!
+    assert p_rat.breakeven_armed is False

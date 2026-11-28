@@ -1117,9 +1117,15 @@ class TradingDaemon:
                             pos.current_stop > prev_stop
                             and self.settings.strategy_cfg.daemon.place_server_side_stop
                         ):
-                            pos.broker_stop_order_id = self._place_stop_order(
+                            new_st_oid = self._place_stop_order(
                                 sym, pos.shares, pos.current_stop, live_p.broker_stop_order_id
                             )
+                            if new_st_oid and getattr(self.gateway, "last_stop_sync_ok", True):
+                                pos.broker_stop_order_id = new_st_oid
+                            else:
+                                pos.current_stop = prev_stop
+                                pos.breakeven_armed = prev_be_armed
+                                pos.broker_stop_order_id = live_p.broker_stop_order_id
                         self.store.upsert_position(pos)
 
         # Refresh open_positions snapshot in case push callback settled an exit immediately

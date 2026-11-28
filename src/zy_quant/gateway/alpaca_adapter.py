@@ -467,10 +467,23 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
                         if c_old is not None and c_old > 0:
                             pre_closes[s] = (b_cov[1], c_old)
 
-            tail_fetched = _download_window(tail_gap_syms, tail_gap_start - overlap_pad, eff_end)
+            # For live non-SIP (`iex`) 15m tail fetches, pull from at least today's 09:30 ET open
+            # so today's intraday session bars are 100% feed-homogeneous (never mixing cached SIP + live IEX)!
+            tail_win_start = tail_gap_start - overlap_pad
+            if timeframe == "15m" and eff_end > (now_utc - timedelta(minutes=16)) and self.feed != "sip":
+                eff_et_d = eff_end.astimezone(ET_TZ).date()
+                today_open_utc = datetime(
+                    eff_et_d.year, eff_et_d.month, eff_et_d.day, 9, 30, tzinfo=ET_TZ
+                ).astimezone(timezone.utc)
+                tail_win_start = min(tail_win_start, today_open_utc)
+
+            tail_fetched = _download_window(tail_gap_syms, tail_win_start, eff_end)
             if self.bar_cache is not None and pre_closes:
                 resync_syms: List[str] = []
                 for s, (anchor_ts, old_c) in pre_closes.items():
+                    # Strictly compare SIP vs SIP only: never trigger split-cliff cache purge on IEX vs SIP!
+                    if self.last_bars_feed.get((s, timeframe)) != "sip":
+                        continue
                     s_bars = tail_fetched.get(s, [])
                     for nb in s_bars:
                         if int(nb.timestamp.timestamp()) == int(anchor_ts.timestamp()):
@@ -498,7 +511,18 @@ class AlpacaMarketDataAdapter(MarketDataAdapter):
             if c_list and not m_list:
                 final_out[sym] = c_list
             elif m_list:
-                by_ts: Dict[int, Bar] = {int(b.timestamp.timestamp()): b for b in c_list}
+                # Exclude same-day cached SIP 15m bars on days covered by live IEX `m_list` so a session's
+                # 15m volume is 100% homogeneous IEX before `get_effective_15m_volume_scale` is applied!
+                live_et_days = (
+                    {lb.timestamp.astimezone(ET_TZ).date() for lb in m_list}
+                    if timeframe == "15m"
+                    else set()
+                )
+                by_ts: Dict[int, Bar] = {
+                    int(b.timestamp.timestamp()): b
+                    for b in c_list
+                    if b.timestamp.astimezone(ET_TZ).date() not in live_et_days
+                }
                 for lb in m_list:
                     if eff_start <= lb.timestamp <= eff_end:
                         by_ts[int(lb.timestamp.timestamp())] = lb

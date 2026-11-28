@@ -184,14 +184,16 @@ class DailySwingPipeline:
                 elif b_upd.status in (OrderStatus.CANCELLED, OrderStatus.EXPIRED, OrderStatus.FAILED):
                     needs_rearm = True
                     prior_confirmed_terminal = True
-                elif abs(b_upd.qty - expected_whole_qty) > 1e-5:
+                elif abs(b_upd.qty - expected_whole_qty) > 1e-5 or (
+                    b_upd.price > 0 and abs(b_upd.price - round(pos.current_stop, 2)) > max(0.03, pos.current_stop * 0.006)
+                ):
                     new_oid = d._place_stop_order(sym, pos.shares, pos.current_stop, oid)
                     stop_ok = bool(getattr(d.gateway, "last_stop_sync_ok", True))
                     if new_oid and stop_ok:
                         pos.broker_stop_order_id = new_oid
                         pos.stop_order_type = f"GTC_{daemon_cfg.server_stop_order_type}"
                         d.store.upsert_position(pos)
-                        healed.append(f"{sym}: synced GTC stop qty -> {expected_whole_qty:.0f} sh @ ${pos.current_stop:.2f}")
+                        healed.append(f"{sym}: synced GTC stop -> {expected_whole_qty:.0f} sh @ ${pos.current_stop:.2f}")
                     continue
 
             if needs_rearm:
@@ -811,9 +813,15 @@ class DailySwingPipeline:
                     live_p = d.store.get_positions().get(sym)
                     if live_p is not None and abs(live_p.shares - pos.shares) <= 1e-5:
                         if pos.current_stop > prev_stop and d.settings.strategy_cfg.daemon.place_server_side_stop:
-                            pos.broker_stop_order_id = d._place_stop_order(
+                            new_st_oid = d._place_stop_order(
                                 sym, pos.shares, pos.current_stop, live_p.broker_stop_order_id
                             )
+                            if new_st_oid and getattr(d.gateway, "last_stop_sync_ok", True):
+                                pos.broker_stop_order_id = new_st_oid
+                            else:
+                                pos.current_stop = prev_stop
+                                pos.breakeven_armed = prev_be
+                                pos.broker_stop_order_id = live_p.broker_stop_order_id
                         d.store.upsert_position(pos)
 
         # --- Step (c): 100-Stock Daily RS Ranking & Swing Entry Signals ---
